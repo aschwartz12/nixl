@@ -22,8 +22,11 @@ ARG DEFAULT_PYTHON_VERSION="3.14"
 ARG ARCH="x86_64"
 ARG UCX_REF="v1.20.x"
 ARG LIBFABRIC_VERSION="v1.21.0"
+ARG HWLOC_VERSION="2.12.2"
 ARG BUILD_TYPE="release"
 ARG URING_TAG="liburing-2.13"
+ARG ABSL_TAG="lts_2025_08_14"
+ARG GRPC_TAG="v1.73.0"
 
 RUN yum groupinstall -y 'Development Tools' &&  \
     dnf install -y almalinux-release-synergy && \
@@ -56,11 +59,21 @@ RUN yum groupinstall -y 'Development Tools' &&  \
     libibumad-devel \
     numactl-devel \
     librdmacm-devel \
-    hwloc \
-    hwloc-devel \
-    libxml2-devel \
+    pciutils-devel \
     wget \
     zlib
+
+# Build latest hwloc from source to avoid older RHEL8 API limitations.
+RUN cd /tmp && \
+    HWLOC_SERIES="$(echo ${HWLOC_VERSION} | cut -d. -f1,2)" && \
+    wget -q "https://download.open-mpi.org/release/hwloc/v${HWLOC_SERIES}/hwloc-${HWLOC_VERSION}.tar.gz" && \
+    tar -xzf "hwloc-${HWLOC_VERSION}.tar.gz" && \
+    cd "hwloc-${HWLOC_VERSION}" && \
+    ./configure --prefix=/usr/local --disable-nvml && \
+    make -j"$(nproc)" && \
+    make install && \
+    ldconfig && \
+    rm -rf "/tmp/hwloc-${HWLOC_VERSION}" "/tmp/hwloc-${HWLOC_VERSION}.tar.gz"
 
 # Build OpenSSL 3.x
 RUN yum install -y perl-IPC-Cmd perl-Test-Simple perl-Data-Dumper
@@ -86,19 +99,43 @@ ENV OPENSSL_INCLUDE_DIR="/usr/local/openssl3/include"
 
 WORKDIR /workspace
 
-RUN git clone --recurse-submodules -b v1.73.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc && \
+# Build Abseil from source (required for absl/log).
+RUN git clone https://github.com/abseil/abseil-cpp.git && \
+    cd abseil-cpp && \
+    git fetch --depth 1 origin ${ABSL_TAG} && \
+    git checkout ${ABSL_TAG} && \
+    mkdir -p build && cd build && \
+    cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DABSL_PROPAGATE_CXX_STD=ON \
+        -DABSL_ENABLE_INSTALL=ON && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
+RUN git clone --recurse-submodules -b ${GRPC_TAG} --depth 1 --shallow-submodules https://github.com/grpc/grpc && \
     cd grpc && \
     mkdir -p cmake/build && \
     cd cmake/build && \
+    export CMAKE_PREFIX_PATH="/usr/local${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}" && \
+    export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib/${ARCH}-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" && \
     cmake -DgRPC_INSTALL=ON \
     -DgRPC_BUILD_TESTS=OFF \
     -DBUILD_SHARED_LIBS=ON \
     -DCMAKE_CXX_STANDARD=17 \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
-    -DgRPC_SSL_PROVIDER=package ../.. && \
+    -DCMAKE_PREFIX_PATH=/usr/local \
+    -Dabsl_DIR=/usr/local/lib/cmake/absl \
+    -DgRPC_SSL_PROVIDER=package \
+    -DgRPC_ABSL_PROVIDER=package \
+    -DgRPC_PROTOBUF_PROVIDER=module \
+    -DgRPC_ZLIB_PROVIDER=package ../.. && \
     make -j$(nproc) && \
-    make install
+    make install && \
+    ldconfig
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:$LD_LIBRARY_PATH
 
@@ -117,7 +154,7 @@ RUN wget https://curl.se/download/curl-8.5.0.tar.gz && \
     ./configure --prefix=/usr/local --with-ssl=/usr/local/openssl3 --enable-shared && \
     make -j$(nproc) && make install
 
-RUN git clone --recurse-submodules --depth 1 --shallow-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1.11.581
+RUN git clone --recurse-submodules --depth 1 --shallow-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1.11.760
 RUN mkdir aws_sdk_build && cd aws_sdk_build && \
     export LDFLAGS="-L/usr/local/openssl3/lib64 -L/usr/local/openssl3/lib" && \
     export CFLAGS="-I/usr/local/openssl3/include" && \
@@ -144,6 +181,12 @@ RUN git clone https://github.com/nvidia/gusli.git && \
      sed -i '/^LFLAGS_ALL =/{/-lrt/ b; s/$/ -lrt/}' Makefile && \
      make all BUILD_RELEASE=1 BUILD_FOR_UNITEST=0 VERBOSE=1 ALLOW_USE_URING=0 && \
      cd ..
+
+# Required for Azure SDK
+RUN git clone --depth 1 https://gitlab.gnome.org/GNOME/libxml2.git --branch 2.15 && \
+    cd libxml2 && \
+    ACLOCAL_PATH=/usr/share/aclocal ./autogen.sh && make -j && \
+    make install
 
 RUN git clone --depth 1 https://github.com/Azure/azure-sdk-for-cpp.git --branch azure-storage-blobs_12.15.0 && \
     cd azure-sdk-for-cpp/ && \
@@ -229,7 +272,7 @@ RUN cd /usr/local/src && \
          --with-cuda=/usr/local/cuda \
          --with-verbs                \
          --with-dm                   \
-         --with-gdrcopy=/usr/local   \
+         --without-gdrcopy           \
          --with-efa  &&              \
      make -j &&                      \
      make -j install-strip &&        \

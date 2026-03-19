@@ -19,7 +19,6 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include "common/nixl_log.h"
-#include "gpu_xfer_req_h.h"
 
 #include <optional>
 #include <limits>
@@ -29,6 +28,7 @@
 #include <unistd.h>
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include <asio.hpp>
 namespace {
     void moveNotifList(notif_list_t &src, notif_list_t &tgt)
@@ -826,7 +826,7 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
     nixl_b_params_t *custom_params = init_params.customParams;
 
     if (custom_params->count("device_list")!=0)
-        devs = str_split((*custom_params)["device_list"], ", ");
+        devs = absl::StrSplit((*custom_params)["device_list"], ", ");
 
     size_t num_workers = nixl_b_params_get(custom_params, "num_workers", 1);
     size_t num_threads = nixl_b_params_get(custom_params, "num_threads", 0);
@@ -1367,103 +1367,6 @@ nixl_status_t nixlUcxEngine::releaseReqH(nixlBackendReqH* handle) const
     return status;
 }
 
-nixl_status_t
-nixlUcxEngine::createGpuXferReq(const nixlBackendReqH &req_hndl,
-                                const nixl_meta_dlist_t &local_descs,
-                                const nixl_meta_dlist_t &remote_descs,
-                                nixlGpuXferReqH &gpu_req_hndl) const {
-    auto intHandle = static_cast<const nixlUcxBackendH *>(&req_hndl);
-
-    if (local_descs.descCount() != remote_descs.descCount()) {
-        NIXL_ERROR << "Mismatch between local and remote descriptor counts";
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
-    if (local_descs.descCount() == 0) {
-        NIXL_ERROR << "Empty descriptor lists";
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
-    if (!progressThreadEnabled_) {
-        NIXL_WARN << "Progress thread must be enabled for GPU transfer requests";
-    }
-
-    auto remoteMd = static_cast<nixlUcxPublicMetadata *>(remote_descs[0].metadataP);
-    if (!remoteMd || !remoteMd->conn) {
-        NIXL_ERROR << "No connection found in remote metadata";
-        return NIXL_ERR_NOT_FOUND;
-    }
-
-    size_t workerId = intHandle->getWorkerId();
-    nixlUcxEp *ep = remoteMd->conn->getEp(workerId).get();
-
-    std::vector<nixlUcxMem> local_mems;
-    std::vector<const nixl::ucx::rkey *> remote_rkeys;
-    std::vector<uint64_t> remote_addrs;
-    local_mems.reserve(local_descs.descCount());
-    remote_rkeys.reserve(remote_descs.descCount());
-    remote_addrs.reserve(remote_descs.descCount());
-
-    for (size_t i = 0; i < static_cast<size_t>(local_descs.descCount()); i++) {
-        auto localMd = static_cast<nixlUcxPrivateMetadata *>(local_descs[i].metadataP);
-        auto remoteMdDesc = static_cast<nixlUcxPublicMetadata *>(remote_descs[i].metadataP);
-
-        local_mems.push_back(localMd->mem);
-        remote_rkeys.push_back(&remoteMdDesc->getRkey(workerId));
-        remote_addrs.push_back(static_cast<uint64_t>(remote_descs[i].addr));
-    }
-
-    try {
-        gpu_req_hndl = nixl::ucx::createGpuXferReq(
-            *ep, *getWorker(workerId), local_mems, remote_rkeys, remote_addrs);
-        NIXL_TRACE << "Created device memory list: ep=" << ep->getEp() << " handle=" << gpu_req_hndl
-                   << " worker_id=" << workerId << " num_elements=" << local_mems.size();
-        return NIXL_SUCCESS;
-    }
-    catch (const std::exception &e) {
-        NIXL_ERROR << "Failed to create device memory list for GPU transfer: " << e.what();
-        return NIXL_ERR_BACKEND;
-    }
-}
-
-void
-nixlUcxEngine::releaseGpuXferReq(nixlGpuXferReqH gpu_req_hndl) const {
-    nixl::ucx::releaseGpuXferReq(gpu_req_hndl);
-}
-
-nixl_status_t
-nixlUcxEngine::getGpuSignalSize(size_t &signal_size) const {
-    if (gpuSignalSize_) {
-        signal_size = *gpuSignalSize_;
-        return NIXL_SUCCESS;
-    }
-
-    try {
-        gpuSignalSize_ = signal_size = uc->getGpuSignalSize();
-        return NIXL_SUCCESS;
-    }
-    catch (const std::exception &e) {
-        NIXL_ERROR << e.what();
-        return NIXL_ERR_BACKEND;
-    }
-}
-
-nixl_status_t
-nixlUcxEngine::prepGpuSignal(const nixlBackendMD &meta,
-                             void *signal,
-                             const nixl_opt_b_args_t *opt_args) const {
-    try {
-        auto ucx_meta = static_cast<const nixlUcxPrivateMetadata *>(&meta);
-        const auto worker_id = getWorkerId(opt_args);
-        getWorker(worker_id)->prepGpuSignal(ucx_meta->mem, signal);
-        return NIXL_SUCCESS;
-    }
-    catch (const std::exception &e) {
-        NIXL_ERROR << e.what();
-        return NIXL_ERR_BACKEND;
-    }
-}
-
 int nixlUcxEngine::progress() {
     // TODO: add listen for connection handling if necessary
     int ret = 0;
@@ -1571,9 +1474,9 @@ nixlUcxEngine::genNotif(const std::string &remote_agent, const std::string &msg)
 }
 
 nixl_status_t
-nixlUcxEngine::prepMemoryView(const nixl_remote_meta_dlist_t &dlist,
-                              nixlMemoryViewH &mvh,
-                              const nixl_opt_b_args_t *opt_args) const {
+nixlUcxEngine::prepMemView(const nixl_remote_meta_dlist_t &dlist,
+                           nixlMemViewH &mvh,
+                           const nixl_opt_b_args_t *opt_args) const {
     const size_t worker_id = getWorkerId(opt_args);
     try {
         mvh = nixl::ucx::createMemList(dlist, worker_id, *getWorker(worker_id));
@@ -1586,9 +1489,9 @@ nixlUcxEngine::prepMemoryView(const nixl_remote_meta_dlist_t &dlist,
 }
 
 nixl_status_t
-nixlUcxEngine::prepMemoryView(const nixl_meta_dlist_t &dlist,
-                              nixlMemoryViewH &mvh,
-                              const nixl_opt_b_args_t *opt_args) const {
+nixlUcxEngine::prepMemView(const nixl_meta_dlist_t &dlist,
+                           nixlMemViewH &mvh,
+                           const nixl_opt_b_args_t *opt_args) const {
     const size_t worker_id = getWorkerId(opt_args);
     try {
         mvh = nixl::ucx::createMemList(dlist, *getWorker(worker_id));
@@ -1601,6 +1504,6 @@ nixlUcxEngine::prepMemoryView(const nixl_meta_dlist_t &dlist,
 }
 
 void
-nixlUcxEngine::releaseMemoryView(nixlMemoryViewH mvh) const {
-    nixl::ucx::releaseMemList(mvh);
+nixlUcxEngine::releaseMemView(nixlMemViewH mem_view) const {
+    nixl::ucx::releaseMemList(mem_view);
 }

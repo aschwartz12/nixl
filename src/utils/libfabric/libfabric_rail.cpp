@@ -1057,17 +1057,12 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
                            << ", retrying (attempt " << attempt << ")";
             }
 
-            // Exponential backoff with cap to avoid overwhelming the system
-            int delay_us = std::min(NIXL_LIBFABRIC_BASE_RETRY_DELAY_US * (1 + attempt / 10),
-                                    NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
-
             // Progress completion queue to drain pending completions before retry
             nixl_status_t progress_status = progressCompletionQueue();
             if (progress_status == NIXL_SUCCESS) {
                 NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
             }
 
-            usleep(delay_us);
             continue;
         } else {
             // Other error - don't retry, fail immediately
@@ -1136,17 +1131,12 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                            << ", retrying (attempt " << attempt << ")";
             }
 
-            // Exponential backoff with cap to avoid overwhelming the system
-            int delay_us = std::min(NIXL_LIBFABRIC_BASE_RETRY_DELAY_US * (1 + attempt / 10),
-                                    NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
-
             // Progress completion queue to drain pending completions before retry
             nixl_status_t progress_status = progressCompletionQueue();
             if (progress_status == NIXL_SUCCESS) {
                 NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
             }
 
-            usleep(delay_us);
             continue;
         } else {
             // Other error - don't retry, fail immediately
@@ -1213,17 +1203,12 @@ nixlLibfabricRail::postRead(void *local_buffer,
                            << ", retrying (attempt " << attempt << ")";
             }
 
-            // Exponential backoff with cap to avoid overwhelming the system
-            int delay_us = std::min(NIXL_LIBFABRIC_BASE_RETRY_DELAY_US * (1 + attempt / 10),
-                                    NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
-
             // Progress completion queue to drain pending completions before retry
             nixl_status_t progress_status = progressCompletionQueue();
             if (progress_status == NIXL_SUCCESS) {
                 NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
             }
 
-            usleep(delay_us);
             continue;
         } else {
             // Other error - don't retry, fail immediately
@@ -1267,16 +1252,15 @@ nixlLibfabricRail::registerMemory(void *buffer,
 
     struct fid_mr *mr;
 
-    // For TCP providers, use a unique key to avoid conflicts
-    // TCP provider assigns key 0 by default, but we need unique keys for multiple registrations
     uint64_t requested_key = 0;
     if (provider_name == "tcp" || provider_name == "sockets") {
-        // Generate a unique key based on buffer address to avoid collisions
-        // Use the lower bits of the buffer address as a simple unique identifier
-        requested_key = reinterpret_cast<uintptr_t>(buffer) & 0xFFFFFFFF;
+        // For providers that lack FI_MR_PROV_KEY, use a unique key to avoid conflicts.
+        // Under FI_MR_PROV_KEY, requested_key param will be ignored; otherwise, not.
+        requested_key = reinterpret_cast<uint64_t>(buffer);
 
-        NIXL_DEBUG << "TCP provider=using requested key " << requested_key << " for buffer "
-                   << buffer << " on rail " << rail_id;
+        NIXL_DEBUG << provider_name << " provider=using requested key " << requested_key << " ("
+                   << std::hex << requested_key << std::dec << ") for buffer " << buffer
+                   << " on rail " << rail_id;
     }
 
     NIXL_TRACE << "Memory Registration: rail=" << rail_id << " provider=" << provider_name
@@ -1352,8 +1336,16 @@ nixlLibfabricRail::registerMemory(void *buffer,
         }
     }
 
+    uint64_t key = fi_mr_key(mr);
+    if (key == FI_KEY_NOTAVAIL) {
+        NIXL_ERROR << "fi_mr_key returned FI_KEY_NOTAVAIL on rail " << rail_id;
+        fi_close(&mr->fid);
+        return NIXL_ERR_BACKEND;
+    } else {
+        NIXL_TRACE << "MR key obtained: " << key << " (" << std::hex << key << std::dec << ")";
+    }
     *mr_out = mr;
-    *key_out = fi_mr_key(mr);
+    *key_out = key;
 
     NIXL_TRACE << "Memory Registration SUCCESS: rail=" << rail_id << " provider=" << provider_name
                << " buffer=" << buffer << " length=" << length << " mr=" << mr
