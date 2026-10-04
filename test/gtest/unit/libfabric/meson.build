@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-subdir('nixl')
-subdir('unit')
-
-subdir('gtest')
-
-if cuda_dep.found()
-    subdir('efa_proxy')
-endif
-
-# Standalone DOCA telemetry exporter test (self-contained; only built when the
-# DOCA telemetry headers are present). Kept out of the main gtest target so the
-# DOCA/CollectX gRPC stack is not linked into every test.
-subdir('doca-telemetry')
+# EFA device proxy logic that needs no fabric: the connection-info trailer and
+# the per-ring fence (header-only in the plugin).
+libfabric_unit_test_dep = declare_dependency(
+    sources: ['proxy_conninfo.cpp', 'proxy_fence.cpp'],
+    include_directories: [
+        nixl_inc_dirs,
+        utils_inc_dirs,
+        include_directories('../../../../src/plugins/libfabric'),
+    ],
+    dependencies: [libfabric_dep, serdes_interface],
+)

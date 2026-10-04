@@ -17,7 +17,8 @@
 # GPU support: HIP/ROCm when rocm_path is set, CUDA otherwise. The test uses the
 # gpu_utils.h abstraction (HAVE_CUDA / HAVE_ROCM), so no hipify translation is
 # needed here -- the HIP headers are consumed directly via rocm_dep.
-libfabric_utils_dep = [ libfabric_dep, nixl_common_deps, serdes_interface ]
+# libfabric_topology.h includes hwloc.h.
+libfabric_utils_dep = [ libfabric_dep, nixl_common_deps, serdes_interface, hwloc_dep ]
 libfabric_test_cpp_args = []
 
 if rocm_dep.found()

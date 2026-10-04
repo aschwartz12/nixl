@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Proxy tests also run without UCX's direct GPU API.
-proxy_device_api_test_sources = files(
+# Built whenever CUDA is available. The backend is a test parameter: cases
+# whose plugin is not loaded skip at runtime, and the UCX direct-mode cases also
+# skip without UCX's GPU device API.
+device_api_test_sources = files(
+    'proxy_ordering_test.cu',
     'proxy_write_test.cu',
-)
-
-ucx_device_api_test_sources = files(
     'single_write_test.cu',
     'utils.cu',
 )

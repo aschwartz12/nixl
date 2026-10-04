@@ -25,13 +25,16 @@
 namespace {
 
 nixl_status_t
-parse(nixl_b_params_t params, nixlProxyConfig &config, bool enable_prog_th = false) {
+parse(nixl_b_params_t params,
+      nixlProxyConfig &config,
+      bool enable_prog_th = false,
+      bool allow_prog_th = false) {
     nixlBackendInitParams init_params;
     init_params.localAgent = "test-agent";
     init_params.type = "UCX";
     init_params.customParams = &params;
     init_params.enableProgTh = enable_prog_th;
-    return nixlParseProxyConfig(init_params, config);
+    return nixlParseProxyConfig(init_params, config, allow_prog_th);
 }
 
 TEST(ProxyConfigTest, AcceptsParameters) {
@@ -89,6 +92,12 @@ TEST(ProxyConfigTest, RejectsParameters) {
         nixlProxyConfig config;
         EXPECT_EQ(parse(row.params, config, row.enable_prog_th), row.expected) << row.name;
     }
+}
+
+TEST(ProxyConfigTest, BackendMayKeepItsProgressThread) {
+    nixlProxyConfig config;
+    ASSERT_EQ(parse({{"device_proxy", "true"}}, config, true, true), NIXL_SUCCESS);
+    EXPECT_TRUE(config.enabled);
 }
 
 } // namespace

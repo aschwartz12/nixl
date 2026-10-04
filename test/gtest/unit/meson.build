@@ -45,6 +45,11 @@ unit_test_deps += [tracing_unit_test_dep]
 subdir('telemetry')
 unit_test_deps += [telemetry_unit_test_dep]
 
+if enabled_plugins.get('LIBFABRIC') and libfabric_dep.found()
+    subdir('libfabric')
+    unit_test_deps += [libfabric_unit_test_dep]
+endif
+
 cpp = meson.get_compiler('cpp')
 azure_storage_blobs = cpp.find_library('azure-storage-blobs', required: false)
 if enabled_plugins.get('AZURE_BLOB') and azure_storage_blobs.found()

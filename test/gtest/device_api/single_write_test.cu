@@ -18,7 +18,9 @@
 #include "utils.cuh"
 #include "common.h"
 
+#include <algorithm>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <gtest/gtest.h>
 
@@ -160,34 +162,53 @@ launchPutKernel(const putParams &put_params,
     return *kernel_error;
 }
 
-using TestParams = std::tuple<bool, nixl_gpu_level_t>;
+/** Backend plugin, proxy (true) or direct GPU mode, and GPU cooperation level. */
+using TestParams = std::tuple<std::string, bool, nixl_gpu_level_t>;
 
 class SingleWriteTest : public testing::TestWithParam<TestParams> {
 protected:
-    std::string getBackendName() const { return "UCX"; }
+    std::string
+    getBackendName() const {
+        return std::get<0>(GetParam());
+    }
 
     bool
     isProxy() const {
-        return std::get<0>(GetParam());
+        return std::get<1>(GetParam());
+    }
+
+    /** Whether nixlGetPtr() resolves a same-node remote (cuda_ipc / NVLink). */
+    bool
+    mapsLocalRemote() const {
+        return getBackendName() == "UCX";
     }
 
     nixlAgentConfig
     getConfig() {
         nixlAgentConfig cfg;
-        cfg.useProgThread = !isProxy();
+        // UCX proxy threads own the UCX workers, so its progress thread must be off.
+        // LIBFABRIC keeps it: both agents share this thread, and each one's connection
+        // setup waits for the other's rail to be progressed.
+        cfg.useProgThread = !isProxy() || getBackendName() == "LIBFABRIC";
         cfg.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
-        cfg.pthrDelay = 100000;
+        // A LIBFABRIC handshake still unprocessed at disconnect re-creates the
+        // connection and logs an error at the peer (engine race), so let the
+        // progress thread handle handshakes promptly.
+        cfg.pthrDelay = getBackendName() == "LIBFABRIC" ? 1000 : 100000;
         return cfg;
     }
 
     nixl_b_params_t
     getBackendParams() {
         if (isProxy()) {
-            return {{"device_proxy", "true"},
-                    {"proxy_channel_count", std::to_string(numWorkers)},
-                    {"proxy_thread_count", "4"},
-                    {"proxy_max_peers", "2"},
-                    {"ucx_error_handling_mode", "none"}};
+            nixl_b_params_t params = {{"device_proxy", "true"},
+                                      {"proxy_channel_count", std::to_string(numWorkers)},
+                                      {"proxy_thread_count", "4"},
+                                      {"proxy_max_peers", "2"}};
+            if (getBackendName() == "UCX") {
+                params["ucx_error_handling_mode"] = "none";
+            }
+            return params;
         }
         return {{"num_workers", std::to_string(numWorkers)}};
     }
@@ -211,6 +232,13 @@ protected:
 
         for (size_t i = 0; i < 2; i++) {
             agents.emplace_back(std::make_unique<nixlAgent>(getAgentName(i), getConfig()));
+            if (i == 0) {
+                std::vector<nixl_backend_t> plugins;
+                ASSERT_EQ(agents.back()->getAvailPlugins(plugins), NIXL_SUCCESS);
+                if (std::find(plugins.begin(), plugins.end(), getBackendName()) == plugins.end()) {
+                    GTEST_SKIP() << getBackendName() << " plugin is unavailable";
+                }
+            }
             nixlBackendH *backend_handle = nullptr;
             nixl_status_t status =
                 agents.back()->createBackend(getBackendName(), getBackendParams(), backend_handle);
@@ -310,7 +338,7 @@ protected:
                             const putParams &put_params,
                             size_t num_iters,
                             gpuTimer *gpu_timer = nullptr) {
-        const auto level = std::get<1>(params);
+        const auto level = std::get<2>(params);
         switch (level) {
         case nixl_gpu_level_t::BLOCK:
             return launchPutKernel<nixl_gpu_level_t::BLOCK>(put_params, num_iters, gpu_timer);
@@ -557,8 +585,12 @@ TEST_P(SingleWriteTest, SingleWorkerPutGap) {
     getPtrKernel<<<1, 1>>>(dst_mvh, 0, ptr.get());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-    EXPECT_NE(*ptr, nullptr) << "nixlGetPtr is null unless the remote is locally mapped "
-                                "(cuda_ipc / NVLink)";
+    if (mapsLocalRemote()) {
+        EXPECT_NE(*ptr, nullptr) << "nixlGetPtr is null unless the remote is locally mapped "
+                                    "(cuda_ipc / NVLink)";
+    } else {
+        EXPECT_EQ(*ptr, nullptr) << getBackendName() << " has no direct remote mapping";
+    }
 
     logResultsPublic(size, count, num_iters, *gpu_timer.start_, *gpu_timer.end_);
 
@@ -578,11 +610,26 @@ TEST_P(SingleWriteTest, SingleWorkerPutGap) {
 
 using gtest::nixl::gpu::single_write::SingleWriteTest;
 
-INSTANTIATE_TEST_SUITE_P(
-    ucxDeviceApi,
-    SingleWriteTest,
-    testing::Combine(testing::Bool(), testing::ValuesIn(gtest::gpu::_test_levels)),
-    [](const testing::TestParamInfo<gtest::nixl::gpu::single_write::TestParams> &info) {
-        return std::string(std::get<0>(info.param) ? "PROXY_" : "UCX_") +
-            gtest::gpu::GetGpuXferLevelStr(std::get<1>(info.param));
-    });
+namespace {
+std::string
+singleWriteTestName(
+    const testing::TestParamInfo<gtest::nixl::gpu::single_write::TestParams> &info) {
+    return std::string(std::get<1>(info.param) ? "PROXY_" : "UCX_") +
+        gtest::gpu::GetGpuXferLevelStr(std::get<2>(info.param));
+}
+} // namespace
+
+INSTANTIATE_TEST_SUITE_P(ucxDeviceApi,
+                         SingleWriteTest,
+                         testing::Combine(testing::Values(std::string("UCX")),
+                                          testing::Bool(),
+                                          testing::ValuesIn(gtest::gpu::_test_levels)),
+                         singleWriteTestName);
+
+// LIBFABRIC has no direct GPU mode; its device API runs only through the proxy.
+INSTANTIATE_TEST_SUITE_P(libfabricDeviceApi,
+                         SingleWriteTest,
+                         testing::Combine(testing::Values(std::string("LIBFABRIC")),
+                                          testing::Values(true),
+                                          testing::ValuesIn(gtest::gpu::_test_levels)),
+                         singleWriteTestName);
