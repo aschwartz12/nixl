@@ -407,7 +407,8 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
-                                     enum fi_hmem_iface runtime)
+                                     enum fi_hmem_iface runtime,
+                                     enum fi_threading threading)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
@@ -455,7 +456,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         hints->domain_attr->mr_key_size = 2;
     }
     hints->domain_attr->name = strdup(device_name.c_str());
-    hints->domain_attr->threading = FI_THREAD_COMPLETION;
+    hints->domain_attr->threading = threading;
 
     try {
         // Get fabric info for this specific device - first try with FI_HMEM
@@ -1824,4 +1825,47 @@ nixlLibfabricRail::findRequestFromContext(void *context) const {
 fi_info *
 nixlLibfabricRail::getRailInfo() const {
     return info;
+}
+
+nixl_status_t
+nixlLibfabricRail::configureProxyEndpoint(struct fid_ep *ep) const {
+    // Always keep proxy traffic on the NIC, even to same-host peers: shm emulates
+    // RMA and completes only when the target endpoint is progressed, and a
+    // peer's engine rail EP (the put target) may not be progressed at all.
+    const bool shared_memory_permitted = false;
+    int ret = fi_setopt(&ep->fid,
+                        FI_OPT_ENDPOINT,
+                        FI_OPT_SHARED_MEMORY_PERMITTED,
+                        &shared_memory_permitted,
+                        sizeof(shared_memory_permitted));
+    if (ret && ret != -FI_ENOPROTOOPT) { // providers without an shm path lack the option
+        NIXL_ERROR << "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED failed for proxy EP on rail "
+                   << rail_id << ": " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+    if (provider_name == "efa") {
+        size_t rnr_retry = 7; // EFA_RNR_INFINITE_RETRY, as on the rail's own endpoint
+        ret = fi_setopt(
+            &ep->fid, FI_OPT_ENDPOINT, FI_OPT_EFA_RNR_RETRY, &rnr_retry, sizeof(rnr_retry));
+        if (ret) {
+            NIXL_WARN << "fi_setopt FI_OPT_EFA_RNR_RETRY failed for proxy EP on rail " << rail_id
+                      << ": " << fi_strerror(-ret) << " - continuing with default";
+        }
+#ifdef HAVE_FI_OPT_EFA_HOMOGENEOUS_PEERS
+        // Without this, the first write to a peer waits for that peer's engine
+        // rail EP to answer the EFA handshake, i.e. for its rails to be progressed.
+        const bool homogeneous_peers = true;
+        ret = fi_setopt(&ep->fid,
+                        FI_OPT_ENDPOINT,
+                        FI_OPT_EFA_HOMOGENEOUS_PEERS,
+                        &homogeneous_peers,
+                        sizeof(homogeneous_peers));
+        if (ret) {
+            NIXL_WARN << "fi_setopt FI_OPT_EFA_HOMOGENEOUS_PEERS failed for proxy EP on rail "
+                      << rail_id << ": " << fi_strerror(-ret)
+                      << " - puts to a peer wait for its rails to be progressed";
+        }
+#endif
+    }
+    return NIXL_SUCCESS;
 }

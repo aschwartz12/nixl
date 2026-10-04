@@ -399,11 +399,12 @@ public:
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
-    /** Initialize libfabric rail with all resources */
+    /** Initialize libfabric rail with all resources; threading is the domain's model */
     nixlLibfabricRail(const std::string &device,
                       const std::string &provider,
                       uint16_t id,
-                      enum fi_hmem_iface runtime);
+                      enum fi_hmem_iface runtime,
+                      enum fi_threading threading = FI_THREAD_COMPLETION);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -575,6 +576,16 @@ public:
 
     fi_info *
     getRailInfo() const;
+
+    /** Domain that owns this rail's memory registrations (the proxy creates EPs in it). */
+    struct fid_domain *
+    getDomain() const {
+        return domain;
+    }
+
+    /** Apply this rail's endpoint options (shm policy, EFA RNR retry) to another EP. */
+    nixl_status_t
+    configureProxyEndpoint(struct fid_ep *ep) const;
 
 private:
     // Core libfabric resources

@@ -192,9 +192,11 @@ private:
     buildNumaDistanceMap();
 };
 
-nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
+nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
+                                                   enum fi_threading domain_threading)
     : striping_threshold_(striping_threshold),
-      runtime_(FI_HMEM_CUDA) {
+      runtime_(FI_HMEM_CUDA),
+      domain_threading_(domain_threading) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
                << " bytes";
 
@@ -353,8 +355,11 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
         rails_.reserve(num_rails_);
 
         for (size_t i = 0; i < num_rails_; ++i) {
-            rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i), runtime_));
+            rails_.emplace_back(std::make_unique<nixlLibfabricRail>(efa_devices[i],
+                                                                    provider_name,
+                                                                    static_cast<uint16_t>(i),
+                                                                    runtime_,
+                                                                    domain_threading_));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -733,6 +738,21 @@ nixlLibfabricRailManager::getDramRailLimit(const nixl_b_params_t &custom_params,
     }
     NIXL_TRACE << "Setting DRAM rail limitation to " << max_rails << " per NUMA node";
     return true;
+}
+
+std::vector<size_t>
+nixlLibfabricRailManager::railsForAccelerator(const std::string &pci_bus_id) const {
+    std::vector<size_t> rails;
+    if (!topology || pci_bus_id.empty()) {
+        return rails;
+    }
+    for (const std::string &efa_device : topology->getEfaDevicesForPci(pci_bus_id)) {
+        auto it = efa_device_to_rail_map.find(efa_device);
+        if (it != efa_device_to_rail_map.end() && it->second < rails_.size()) {
+            rails.push_back(it->second);
+        }
+    }
+    return rails;
 }
 
 std::vector<size_t>

@@ -76,9 +76,11 @@ public:
     /** Initialize rail manager with topology discovery and create rails based on available
      * network devices
      * @param striping_threshold Size threshold for enabling multi-rail striping
+     * @param domain_threading Threading model requested for every rail's domain
      * @throws std::runtime_error if initialization fails
      */
-    nixlLibfabricRailManager(size_t striping_threshold);
+    nixlLibfabricRailManager(size_t striping_threshold,
+                             enum fi_threading domain_threading = FI_THREAD_COMPLETION);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
@@ -135,6 +137,10 @@ public:
     getNumRails() const {
         return rails_.size();
     }
+
+    /** Rails of the EFA devices closest to the accelerator at @p pci_bus_id; empty if unknown. */
+    std::vector<size_t>
+    railsForAccelerator(const std::string &pci_bus_id) const;
 
     /** Round-robin index of a descriptor into a selection array of `count` entries.
      * batch_write groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
@@ -391,6 +397,7 @@ private:
 
     // System runtime type (determined once at initialization)
     fi_hmem_iface runtime_;
+    enum fi_threading domain_threading_;
 
     // Rail allocation
     std::vector<std::unique_ptr<nixlLibfabricRail>> rails_;

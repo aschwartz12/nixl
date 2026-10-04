@@ -63,8 +63,16 @@ struct nixlProxyConfig {
     }
 };
 
-/** Parse proxy parameters; reject invalid tuning and conflicting backend progress. */
+/**
+ * Parse proxy parameters; reject invalid tuning and conflicting backend progress.
+ *
+ * @param allow_backend_progress_thread Set by backends whose proxy threads use
+ *        transport resources separate from the ones the backend progress thread
+ *        drives, so both may run; otherwise enableProgTh is rejected.
+ */
 [[nodiscard]] nixl_status_t
-nixlParseProxyConfig(const nixlBackendInitParams &init_params, nixlProxyConfig &config) noexcept;
+nixlParseProxyConfig(const nixlBackendInitParams &init_params,
+                     nixlProxyConfig &config,
+                     bool allow_backend_progress_thread = false) noexcept;
 
 #endif // NIXL_SRC_UTILS_DEVICE_PROXY_PROXY_CONFIG_H

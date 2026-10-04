@@ -50,6 +50,27 @@ elif cuda_dep.found()
 endif
 
 # Build as static or shared library based on configuration
+# Device API: engine-owned CPU proxy over EFA (needs the CUDA device utilities).
+libfabric_proxy_srcs = []
+libfabric_inc_dirs = [nixl_inc_dirs, utils_inc_dirs]
+if cuda_dep.found() and not rocm_dep.found()
+    libfabric_proxy_srcs += [
+        'libfabric_proxy.cpp',
+        'libfabric_proxy.h',
+        'libfabric_proxy_conninfo.h',
+        'libfabric_proxy_fence.h',
+        'libfabric_proxy_profile.h',
+    ]
+    libfabric_plugin_deps += [device_utils_interface, device_proxy_interface]
+    libfabric_inc_dirs += [nixl_device_inc_dirs]
+    # GDRCopy applies target-side atomicAdd to VRAM counters; cudaMemcpy otherwise.
+    libfabric_gdrcopy = cpp.find_library('gdrapi', required: false)
+    if libfabric_gdrcopy.found() and cpp.has_header('gdrapi.h')
+        compile_flags += ['-DHAVE_GDRCOPY']
+        libfabric_plugin_deps += [libfabric_gdrcopy]
+    endif
+endif
+
 if 'LIBFABRIC' in static_plugins
     libfabric_backend_lib = static_library(
         'LIBFABRIC',
@@ -59,8 +80,9 @@ if 'LIBFABRIC' in static_plugins
         'libfabric_connection.h',
         'libfabric_handshake.cpp',
         'libfabric_plugin.cpp',
+        libfabric_proxy_srcs,
         dependencies: libfabric_plugin_deps,
-        include_directories: [nixl_inc_dirs, utils_inc_dirs],
+        include_directories: libfabric_inc_dirs,
         install: false,
         cpp_args: compile_flags,
         name_prefix: 'libplugin_',
@@ -74,8 +96,9 @@ else
         'libfabric_connection.h',
         'libfabric_handshake.cpp',
         'libfabric_plugin.cpp',
+        libfabric_proxy_srcs,
         dependencies: libfabric_plugin_deps,
-        include_directories: [nixl_inc_dirs, utils_inc_dirs],
+        include_directories: libfabric_inc_dirs,
         install: true,
         cpp_args: compile_flags + ['-fPIC'],
         name_prefix: 'libplugin_',

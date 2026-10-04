@@ -108,6 +108,33 @@ The following table summarizes briefly the plugin's runtime configuration:
 | num_threads | Enables a thread pool for parallel descriptor posting in postXfer | Backend init param | integer | 4, 8 | Default 0 keeps the serial posting path |
 | split_batch_size | Minimum descriptor count before postXfer uses the posting thread pool | Backend init param | integer | 1024, 4096 | Default 1024; only applies when num_threads is greater than 0 |
 
+## Device API (GPU-initiated transfers through the CPU proxy)
+
+With the `device_proxy=true` backend parameter, the engine owns a device proxy
+runtime, so GPU kernels can call the NIXL device API (`put()`, `atomicAdd()`) on
+memory views prepared by this backend. Requires a CUDA-enabled build.
+
+- **Parameters** (shared with the UCX proxy): `device_proxy`, `proxy_channel_count`,
+  `proxy_thread_count`, `proxy_max_peers`, `proxy_ring_depth`, `proxy_pthr_delay_us`.
+  EFA-specific: `efa_proxy_delivery_complete` (default `true`) requests
+  `FI_DELIVERY_COMPLETE` on proxy writes and sends; set `false` only for experiments.
+- **Endpoints:** each proxy thread has its own EP, CQ and AV on every rail, created in
+  the rail's domain (registrations and keys are shared with the host path). Thread
+  `t` serves channels with `channel_id % threads == t`.
+- **Progress thread:** unlike UCX, the backend progress thread may stay enabled, since
+  proxy threads never touch the engine's rail EPs. When it is off, the first proxy thread
+  also progresses the engine's rails periodically, so peers can connect and endpoints
+  close even if the application never calls a host API. Proxy puts themselves need no
+  target-side progress (`FI_OPT_EFA_HOMOGENEOUS_PEERS`).
+- **put():** one RDMA write per fragment; puts at or above the striping threshold are
+  split across rails (up to 8).
+- **atomicAdd():** held until every earlier put on the same (channel, peer) ring has
+  completed, then sent to the counter's owner proxy thread at the target, which
+  applies it through GDRCopy (VRAM; `cudaMemcpy` fallback without GDRCopy) or a CPU
+  atomic (DRAM). Both sides must run the device proxy for atomicAdd.
+- **Connection info:** a proxy section (thread count and home-EP names) is appended
+  after the rail endpoints; peers without it still interoperate for host transfers.
+
 ## API Reference
 
 ### Core Classes

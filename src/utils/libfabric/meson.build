@@ -72,6 +72,13 @@ if libfabric_dep.found()
     else
         message('libfabric does not support FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV')
     endif
+    # FI_OPT_EFA_HOMOGENEOUS_PEERS lets device-proxy endpoints skip the per-peer
+    # handshake, so a target's rails need not be progressed for proxy puts.
+    if cpp.has_header_symbol('rdma/fi_ext.h',
+                             'FI_OPT_EFA_HOMOGENEOUS_PEERS',
+                             dependencies: libfabric_dep)
+        libfabric_utils_cpp_args += ['-DHAVE_FI_OPT_EFA_HOMOGENEOUS_PEERS']
+    endif
 endif
 
 # Add GPU support: HIP/ROCm when rocm_path is set, CUDA otherwise.

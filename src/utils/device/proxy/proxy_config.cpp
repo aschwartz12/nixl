@@ -49,7 +49,9 @@ isProxyParamKey(const std::string &key) {
 } // namespace
 
 nixl_status_t
-nixlParseProxyConfig(const nixlBackendInitParams &init_params, nixlProxyConfig &config) noexcept {
+nixlParseProxyConfig(const nixlBackendInitParams &init_params,
+                     nixlProxyConfig &config,
+                     bool allow_backend_progress_thread) noexcept {
     config = nixlProxyConfig{};
     const nixl_b_params_t *params = init_params.customParams;
 
@@ -123,7 +125,7 @@ nixlParseProxyConfig(const nixlBackendInitParams &init_params, nixlProxyConfig &
                   << " thread(s) will be started (channels are striped across threads)";
     }
 
-    if (init_params.enableProgTh) {
+    if (init_params.enableProgTh && !allow_backend_progress_thread) {
         NIXL_ERROR << "Device proxy progress threads own the backend workers; the backend "
                       "progress thread (enableProgTh) is not allowed with "
                    << kProxyEnabledParam << "=true";
