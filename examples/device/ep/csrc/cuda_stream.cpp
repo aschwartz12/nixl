@@ -17,15 +17,17 @@
 
 #include "cuda_stream.hpp"
 
-#include <torch/csrc/inductor/aoti_torch/c/shim.h>
-#include <torch/csrc/stable/accelerator.h>
-#include <torch/csrc/stable/c/shim.h>
-#include <torch/headeronly/util/shim_utils.h>
 #include <torch/version.h>
 
 #if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 10)
 #error "nixl_ep requires PyTorch >=2.10 for torch_set_current_cuda_stream"
 #endif
+
+#if __has_include(<torch/csrc/stable/c/shim.h>)
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/c/shim.h>
+#include <torch/headeronly/util/shim_utils.h>
 
 namespace nixl_ep::cuda_stream {
 cudaStream_t
@@ -41,3 +43,22 @@ set_current(cudaStream_t stream) {
     TORCH_ERROR_CODE_CHECK(torch_set_current_cuda_stream(stream, device_index));
 }
 } // namespace nixl_ep::cuda_stream
+#else
+// PyTorch 2.10 pre-releases (for example the NGC 25.11 container's 2.10.0a0)
+// predate the stable stream shim; use the ATen API there.
+#include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAStream.h>
+
+namespace nixl_ep::cuda_stream {
+cudaStream_t
+get_current() {
+    return c10::cuda::getCurrentCUDAStream().stream();
+}
+
+void
+set_current(cudaStream_t stream) {
+    c10::cuda::setCurrentCUDAStream(
+        c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
+}
+} // namespace nixl_ep::cuda_stream
+#endif

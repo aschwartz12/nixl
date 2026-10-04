@@ -77,6 +77,25 @@ There is no library-level environment override for this. Outside EP, the proxy
 is enabled by passing `device_proxy=true`, plus any `proxy_*` parameters, to
 `createBackend("UCX", ...)`.
 
+### Backend
+
+`NIXL_EP_BACKEND` selects the backend that carries the device API: `UCX` (the
+default) or `LIBFABRIC` (for example, AWS EFA). LIBFABRIC has no direct GPU
+path, so it always runs in proxy mode: `NIXL_EP_DEVICE_MODE` may be unset or
+`proxy`, and `direct` is rejected. The same `NIXL_EP_PROXY_*` variables apply;
+the UCX-only parameters are not passed. Both sides of every connection must run
+the same backend with the proxy enabled, because the target's proxy threads
+apply each `nixlAtomicAdd`. LIBFABRIC returns no direct pointer for peer memory
+(`nixlGetPtr` is null), so same-node peers are also reached over the network.
+
+`NIXL_EP_BACKEND_PARAMS="key=value,..."` passes extra backend parameters,
+applied after EP's own (for example `proxy_ring_depth=64` or, on LIBFABRIC,
+`efa_proxy_rail_policy=ring`).
+
+The low-latency kernels pick the proxy channel as the destination's local
+expert index modulo the channel count, so channels beyond the number of local
+experts per rank stay idle.
+
 ## Testing
 
 The elastic test suite in `tests/elastic/` validates dynamic scaling capabilities:

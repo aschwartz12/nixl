@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <sstream>
 #include <unordered_set>
 
 #define NIXL_ETCD_WATCH_TIMEOUT std::chrono::microseconds(1000000000) // 1000 seconds
@@ -1412,10 +1413,22 @@ void Buffer::_nixl_ep_destroy(void) {
 void Buffer::_nixl_agent_init() {
     std::string agent_name = std::to_string(rank);
 
+    // Backend that carries the device API. LIBFABRIC has no direct GPU path;
+    // its device API always runs through the engine-owned CPU proxy.
+    std::string backend_name = "UCX";
+    if (const char *backend_override = std::getenv("NIXL_EP_BACKEND")) {
+        backend_name = backend_override;
+        if (backend_name != "UCX" && backend_name != "LIBFABRIC") {
+            throw std::runtime_error("NIXL_EP_BACKEND must be exactly 'UCX' or 'LIBFABRIC'; got '" +
+                                     backend_name + "'");
+        }
+    }
+    const bool is_libfabric = backend_name == "LIBFABRIC";
+
     // Device API mode. NIXL itself has no such switch - the proxy is enabled
-    // by UCX backend parameters below - so this is purely an EP-level knob for
+    // by backend parameters below - so this is purely an EP-level knob for
     // running the same binary either way.
-    bool enable_device_proxy = false;
+    bool enable_device_proxy = is_libfabric;
     if (const char *mode_override = std::getenv("NIXL_EP_DEVICE_MODE")) {
         const std::string mode(mode_override);
         if (mode == "proxy") {
@@ -1423,6 +1436,9 @@ void Buffer::_nixl_agent_init() {
         } else if (mode != "direct") {
             throw std::runtime_error(
                 "NIXL_EP_DEVICE_MODE must be exactly 'direct' or 'proxy'; got '" + mode + "'");
+        } else if (is_libfabric) {
+            throw std::runtime_error("NIXL_EP_BACKEND=LIBFABRIC supports only "
+                                     "NIXL_EP_DEVICE_MODE=proxy");
         }
     }
 
@@ -1437,50 +1453,69 @@ void Buffer::_nixl_agent_init() {
                                                        proxy_channels;
 
     nixlAgentConfig cfg;
-    // The proxy's own threads drive UCX progress, one per ring, so a progress
-    // thread would only contend with them.
+    // The proxy's own threads drive backend progress (UCX: one per ring;
+    // LIBFABRIC: the engine's rails too, when nothing else does), so a
+    // progress thread would only contend with them.
     cfg.useProgThread = !enable_device_proxy;
     cfg.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
     cfg.etcdWatchTimeout = NIXL_ETCD_WATCH_TIMEOUT;
     auto agent = std::make_shared<nixlAgent>(agent_name, cfg);
 
-    // Create UCX backend
     nixl_mem_list_t mems;
     nixl_b_params_t init_params;
 
-    nixl_status_t status = agent->getPluginParams("UCX", mems, init_params);
+    nixl_status_t status = agent->getPluginParams(backend_name, mems, init_params);
     if (status != NIXL_SUCCESS) {
-        throw std::runtime_error("Failed to get UCX plugin parameters for agent " + agent_name +
-                                ", status: " + std::to_string(status));
+        throw std::runtime_error("Failed to get " + backend_name + " plugin parameters for agent " +
+                                 agent_name + ", status: " + std::to_string(status));
     }
 
-    init_params["ucx_error_handling_mode"] = "none";
+    if (!is_libfabric) {
+        init_params["ucx_error_handling_mode"] = "none";
+    }
     if (enable_device_proxy) {
         init_params["device_proxy"] = "true";
         init_params["proxy_channel_count"] = std::to_string(proxy_channels);
         init_params["proxy_thread_count"] = std::to_string(proxy_workers);
         init_params["proxy_max_peers"] = std::to_string(max_num_ranks);
-        // The engine derives num_workers from channels x peers and rejects an
-        // explicit value that disagrees. getPluginParams() seeded the plugin
-        // default of 1, so it has to be erased rather than merely left unset.
-        init_params.erase("num_workers");
-        init_params["ucx_num_device_channels"] = "1";
-        init_params["engine_config"] = "FENCE_MODE=ep_based";
+        if (!is_libfabric) {
+            // The engine derives num_workers from channels x peers and rejects an
+            // explicit value that disagrees. getPluginParams() seeded the plugin
+            // default of 1, so it has to be erased rather than merely left unset.
+            init_params.erase("num_workers");
+            init_params["ucx_num_device_channels"] = "1";
+            init_params["engine_config"] = "FENCE_MODE=ep_based";
+        }
     } else {
         const char *num_channels_env = std::getenv("NIXL_EP_NUM_CHANNELS");
         init_params["ucx_num_device_channels"] = num_channels_env ? num_channels_env : "4";
         init_params["num_workers"] = std::to_string(1);
     }
 
-    nixlBackendH* ucx_backend = nullptr;
-    status = agent->createBackend("UCX", init_params, ucx_backend);
-    if (status != NIXL_SUCCESS || !ucx_backend) {
-        throw std::runtime_error("Failed to create UCX backend for agent " + agent_name +
-                                ", status: " + std::to_string(status));
+    // Extra backend parameters, "key=value,key=value", applied last (tuning and
+    // experiments, e.g. efa_proxy_rail_policy=ring or proxy_ring_depth=64).
+    if (const char *extra = std::getenv("NIXL_EP_BACKEND_PARAMS")) {
+        std::stringstream items(extra);
+        std::string item;
+        while (std::getline(items, item, ',')) {
+            const size_t eq = item.find('=');
+            if (eq == std::string::npos || eq == 0) {
+                throw std::runtime_error("NIXL_EP_BACKEND_PARAMS items must be key=value; got '" +
+                                         item + "'");
+            }
+            init_params[item.substr(0, eq)] = item.substr(eq + 1);
+        }
     }
 
-    nixl_agent_info = std::make_unique<NixlAgentInfo>(agent, ucx_backend, max_num_ranks);
-    nixl_agent_info->extra_params.backends.push_back(ucx_backend);
+    nixlBackendH *backend = nullptr;
+    status = agent->createBackend(backend_name, init_params, backend);
+    if (status != NIXL_SUCCESS || !backend) {
+        throw std::runtime_error("Failed to create " + backend_name + " backend for agent " +
+                                 agent_name + ", status: " + std::to_string(status));
+    }
+
+    nixl_agent_info = std::make_unique<NixlAgentInfo>(agent, backend, max_num_ranks);
+    nixl_agent_info->extra_params.backends.push_back(backend);
     nixl_agent_info->agent_name = agent_name;
 
     nixl_agent_info->rdma_reg_descs.clear();
