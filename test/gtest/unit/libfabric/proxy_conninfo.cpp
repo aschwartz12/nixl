@@ -26,6 +26,15 @@ namespace {
 
 namespace ci = nixlLibfabricProxyConnInfo;
 
+/** A proxy blob as serialize() starts it: version, then thread count. */
+nixlSerDes
+proxyBlob(const std::string &threads, uint16_t version = nixlLibfabricProxyWire::kVersion) {
+    nixlSerDes sd;
+    sd.addStr(ci::kVersionTag, std::to_string(version));
+    sd.addStr(ci::kThreadsTag, threads);
+    return sd;
+}
+
 ci::EpName
 epName(unsigned seed) {
     ci::EpName name{};
@@ -114,21 +123,18 @@ TEST(LibfabricProxyConnInfoTest, MalformedProxySectionsAreRejected) {
     bad.push_back("not a serdes blob");
     bad.push_back(good.substr(0, good.size() / 2)); // truncated
     {
-        nixlSerDes sd; // claims three threads, carries two
-        sd.addStr(ci::kThreadsTag, "3");
+        nixlSerDes sd = proxyBlob("3"); // claims three threads, carries two
         sd.addBuf(std::string(ci::kEpTagPrefix) + "0", homes[0].data(), homes[0].size());
         sd.addBuf(std::string(ci::kEpTagPrefix) + "1", homes[1].data(), homes[1].size());
         bad.push_back(sd.exportStr());
     }
     {
-        nixlSerDes sd; // thread count is not a number
-        sd.addStr(ci::kThreadsTag, "many");
+        nixlSerDes sd = proxyBlob("many"); // thread count is not a number
         bad.push_back(sd.exportStr());
     }
     {
-        nixlSerDes sd; // EP name longer than any libfabric name
+        nixlSerDes sd = proxyBlob("1"); // EP name longer than any libfabric name
         const std::string long_name(LF_EP_NAME_MAX_LEN + 1, 'x');
-        sd.addStr(ci::kThreadsTag, "1");
         sd.addBuf(std::string(ci::kEpTagPrefix) + "0", long_name.data(), long_name.size());
         bad.push_back(sd.exportStr());
     }
@@ -142,9 +148,8 @@ TEST(LibfabricProxyConnInfoTest, MalformedProxySectionsAreRejected) {
 
 TEST(LibfabricProxyConnInfoTest, ShortNamesArePadded) {
     // Providers may report names shorter than LF_EP_NAME_MAX_LEN.
-    nixlSerDes sd;
+    nixlSerDes sd = proxyBlob("1");
     const char short_name[] = {'\x01', '\0', '\x02'};
-    sd.addStr(ci::kThreadsTag, "1");
     sd.addBuf(std::string(ci::kEpTagPrefix) + "0", short_name, sizeof(short_name));
     std::vector<ci::EpName> parsed;
     ASSERT_EQ(ci::parse(sd.exportStr(), parsed), NIXL_SUCCESS);
@@ -152,6 +157,47 @@ TEST(LibfabricProxyConnInfoTest, ShortNamesArePadded) {
     ci::EpName expected{};
     std::copy(short_name, short_name + sizeof(short_name), expected.begin());
     EXPECT_EQ(parsed[0], expected);
+}
+
+// A peer speaking another proxy protocol gets no atomicAdds (parse fails, so
+// the backend treats it as having no proxy endpoints).
+TEST(LibfabricProxyConnInfoTest, OtherProtocolVersionIsRejected) {
+    const std::vector<ci::EpName> homes = {epName(0), epName(1)};
+    for (const uint16_t version : {uint16_t(nixlLibfabricProxyWire::kVersion - 1),
+                                   uint16_t(nixlLibfabricProxyWire::kVersion + 1)}) {
+        nixlSerDes sd = proxyBlob("2", version);
+        for (size_t t = 0; t < homes.size(); ++t) {
+            sd.addBuf(std::string(ci::kEpTagPrefix) + std::to_string(t),
+                      homes[t].data(),
+                      homes[t].size());
+        }
+        std::vector<ci::EpName> parsed = {epName(7)};
+        EXPECT_EQ(ci::parse(sd.exportStr(), parsed), NIXL_ERR_MISMATCH) << "version " << version;
+        EXPECT_TRUE(parsed.empty());
+    }
+    // A blob from before the version tag (version 1) is rejected too.
+    nixlSerDes old;
+    old.addStr(ci::kThreadsTag, "1");
+    old.addBuf(std::string(ci::kEpTagPrefix) + "0", homes[0].data(), homes[0].size());
+    std::vector<ci::EpName> parsed;
+    EXPECT_EQ(ci::parse(old.exportStr(), parsed), NIXL_ERR_MISMATCH);
+}
+
+TEST(LibfabricProxyWireTest, EveryCounterHasOneOwner) {
+    namespace wire = nixlLibfabricProxyWire;
+    // Deterministic, in range, and spread over the threads.
+    std::vector<size_t> hits(4, 0);
+    for (uint64_t addr = 0x7f0000000000ull; addr < 0x7f0000000000ull + 4096 * 8; addr += 8) {
+        const uint32_t owner = wire::counterOwner(addr, 4);
+        ASSERT_LT(owner, 4u);
+        EXPECT_EQ(owner, wire::counterOwner(addr, 4));
+        ++hits[owner];
+    }
+    for (size_t t = 0; t < hits.size(); ++t) {
+        EXPECT_GT(hits[t], 512u) << "thread " << t;
+    }
+    static_assert(sizeof(wire::anyMsg) == sizeof(wire::atomicAddMsg));
+    static_assert(sizeof(wire::atomicAddMsg) <= 128, "keep atomicAdd records small");
 }
 
 } // namespace

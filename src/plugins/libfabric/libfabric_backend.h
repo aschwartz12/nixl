@@ -96,7 +96,6 @@ private:
     std::vector<uint64_t> rail_key_list_; // Remote access keys, one per rail
     std::vector<char *> src_ep_names_; // Source endpoint names, one per rail
     std::vector<size_t> selected_rails_; // Rails selected based on memory topology
-    nixl_mem_t mem_type_ = DRAM_SEG; // Registered memory type
 
 public:
     nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1) {}

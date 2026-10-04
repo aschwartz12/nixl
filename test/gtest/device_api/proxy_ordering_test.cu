@@ -21,13 +21,15 @@
 #include "utils.cuh"
 #include "common.h"
 #include "proxy_ordering.cuh"
+#include "libfabric_proxy_wire.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
-#include <tuple>
+#include <thread>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -39,11 +41,79 @@ constexpr unsigned kChannels = 4;
 constexpr Layout kLayout{kChannels, 128};
 static_assert(kChannels <= kMaxChannels);
 constexpr unsigned long long kTimeoutNs = 60ull * 1000 * 1000 * 1000;
+constexpr uint32_t kProxyThreads = 4;
 
-/** Backend, and whether EFA requests FI_DELIVERY_COMPLETE (ignored by other backends). */
-using TestParams = std::tuple<std::string, bool>;
+/** One thread: `count` adds of 1 to one counter on channel 0, then wait for the last. */
+__global__ void
+atomicLoopKernel(nixlMemViewH dst,
+                 size_t counter_offset,
+                 unsigned count,
+                 unsigned long long timeout_ns,
+                 nixl_status_t *status_out) {
+    nixlGpuXferStatusH last{};
+    nixl_status_t status = NIXL_SUCCESS;
+    for (unsigned i = 0; i < count && status == NIXL_SUCCESS; ++i) {
+        if (nixlAtomicAdd<nixl_gpu_level_t::THREAD>(
+                1, {dst, 0, counter_offset}, 0, 0, i + 1 == count ? &last : nullptr) !=
+            NIXL_IN_PROG) {
+            status = NIXL_ERR_BACKEND;
+        }
+    }
+    const unsigned long long deadline = globalTimeNs() + timeout_ns;
+    if (status == NIXL_SUCCESS) {
+        do {
+            status = nixlGpuGetXferStatus<nixl_gpu_level_t::THREAD>(last);
+        } while (status == NIXL_IN_PROG && globalTimeNs() < deadline);
+    }
+    *status_out = status;
+}
 
-class ProxyOrderingTest : public testing::TestWithParam<TestParams> {
+/** Rounds of add(A), add(B) on one ring: B must never run ahead of A. */
+__global__ void
+twoCounterSenderKernel(nixlMemViewH dst,
+                       size_t offset_a,
+                       size_t offset_b,
+                       unsigned rounds,
+                       unsigned long long timeout_ns,
+                       nixl_status_t *status_out) {
+    nixlGpuXferStatusH last{};
+    nixl_status_t status = NIXL_SUCCESS;
+    for (unsigned r = 0; r < rounds && status == NIXL_SUCCESS; ++r) {
+        if (nixlAtomicAdd<nixl_gpu_level_t::THREAD>(1, {dst, 0, offset_a}, 0) != NIXL_IN_PROG ||
+            nixlAtomicAdd<nixl_gpu_level_t::THREAD>(
+                1, {dst, 0, offset_b}, 0, 0, r + 1 == rounds ? &last : nullptr) != NIXL_IN_PROG) {
+            status = NIXL_ERR_BACKEND;
+        }
+    }
+    const unsigned long long deadline = globalTimeNs() + timeout_ns;
+    if (status == NIXL_SUCCESS) {
+        do {
+            status = nixlGpuGetXferStatus<nixl_gpu_level_t::THREAD>(last);
+        } while (status == NIXL_IN_PROG && globalTimeNs() < deadline);
+    }
+    *status_out = status;
+}
+
+__global__ void
+twoCounterReceiverKernel(unsigned long long *a,
+                         unsigned long long *b,
+                         unsigned rounds,
+                         unsigned long long timeout_ns,
+                         unsigned long long *out /* violations, final b */) {
+    cuda::atomic_ref<unsigned long long, cuda::thread_scope_system> ra(*a), rb(*b);
+    const unsigned long long deadline = globalTimeNs() + timeout_ns;
+    unsigned long long violations = 0;
+    unsigned long long bv = 0;
+    do {
+        bv = rb.load(cuda::memory_order_acquire);
+        const unsigned long long av = ra.load(cuda::memory_order_acquire);
+        violations += av < bv;
+    } while (bv < rounds && globalTimeNs() < deadline);
+    out[0] = violations;
+    out[1] = bv;
+}
+
+class ProxyOrderingTest : public testing::TestWithParam<std::string> {
 protected:
     static constexpr size_t kSender = 0;
     static constexpr size_t kReceiver = 1;
@@ -51,19 +121,15 @@ protected:
 
     std::string
     backend() const {
-        return std::get<0>(GetParam());
+        return GetParam();
     }
 
     nixl_b_params_t
     backendParams() const {
-        nixl_b_params_t params = {{"device_proxy", "true"},
-                                  {"proxy_channel_count", std::to_string(kChannels)},
-                                  {"proxy_thread_count", "4"},
-                                  {"proxy_max_peers", "2"}};
-        if (backend() == "LIBFABRIC") {
-            params["efa_proxy_delivery_complete"] = std::get<1>(GetParam()) ? "true" : "false";
-        }
-        return params;
+        return {{"device_proxy", "true"},
+                {"proxy_channel_count", std::to_string(kChannels)},
+                {"proxy_thread_count", std::to_string(kProxyThreads)},
+                {"proxy_max_peers", "2"}};
     }
 
     void
@@ -116,6 +182,13 @@ protected:
         nixl_reg_dlist_t list(VRAM_SEG);
         list.addDesc(nixlBlobDesc(buf, buf.getSize(), kDevId));
         ASSERT_EQ(agents_[agent]->registerMem(list), NIXL_SUCCESS);
+    }
+
+    void
+    deregisterBuffer(size_t agent, const MemBuffer &buf) {
+        nixl_reg_dlist_t list(VRAM_SEG);
+        list.addDesc(nixlBlobDesc(buf, buf.getSize(), kDevId));
+        ASSERT_EQ(agents_[agent]->deregisterMem(list), NIXL_SUCCESS);
     }
 
     void
@@ -172,7 +245,7 @@ protected:
         b.dst_mvh = b.src_mvh = nullptr;
     }
 
-    /** After the rings drained: every channel signalled exactly @p rounds rounds with their data. */
+    /** Once the rings drained: every channel signalled @p rounds rounds, with their data. */
     void
     checkTarget(const Buffers &b, const Layout &layout, unsigned rounds) {
         std::vector<uint32_t> host(layout.bufferBytes() / sizeof(uint32_t));
@@ -195,9 +268,13 @@ protected:
         }
     }
 
-    /** Stream every round on every channel and check it on the target GPU. */
+    /**
+     * Stream every round on every channel and check it on the target GPU. With
+     * @p receiver_on_legacy_stream the receiver spins on the legacy default stream,
+     * which a target-side add must not wait for.
+     */
     void
-    runOrderingCheck(const Layout &layout) {
+    runOrderingCheck(const Layout &layout, bool receiver_on_legacy_stream = false) {
         Buffers b(layout);
         setUpBuffers(layout, b);
         if (HasFatalFailure()) {
@@ -222,14 +299,15 @@ protected:
         ASSERT_EQ(cudaFuncGetAttributes(&attr, receiverKernel), cudaSuccess);
         ASSERT_EQ(cudaFuncGetAttributes(&attr, senderKernel), cudaSuccess);
 
-        receiverKernel<<<layout.channels, 256, 0, rx_stream>>>(
+        cudaStream_t receiver_stream = receiver_on_legacy_stream ? cudaStreamLegacy : rx_stream;
+        receiverKernel<<<layout.channels, 256, 0, receiver_stream>>>(
             static_cast<uint8_t *>(static_cast<void *>(b.dst)), layout, kTimeoutNs, result);
         cudaEventRecord(start, tx_stream);
         senderKernel<<<layout.channels, 1, 0, tx_stream>>>(
             b.src_mvh, b.dst_mvh, layout, kTimeoutNs, result);
         cudaEventRecord(stop, tx_stream);
         ASSERT_EQ(cudaStreamSynchronize(tx_stream), cudaSuccess);
-        ASSERT_EQ(cudaStreamSynchronize(rx_stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(receiver_stream), cudaSuccess);
 
         Result host{};
         ASSERT_EQ(cudaMemcpy(&host, result, sizeof(host), cudaMemcpyDeviceToHost), cudaSuccess);
@@ -249,9 +327,9 @@ protected:
         EXPECT_EQ(host.regressions, 0u) << "a counter moved backwards";
         EXPECT_EQ(host.torn, 0u) << "a counter was read half-updated";
         EXPECT_EQ(host.mismatches, 0u)
-            << "data not visible when its counter was: channel " << host.first_channel
-            << " round " << host.first_round << " word " << (host.first_bad - 1) << " value 0x"
-            << std::hex << host.first_value << " expected 0x" << host.first_expected;
+            << "data not visible when its counter was: channel " << host.first_channel << " round "
+            << host.first_round << " word " << (host.first_bad - 1) << " value 0x" << std::hex
+            << host.first_value << " expected 0x" << host.first_expected;
 
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
@@ -319,6 +397,9 @@ protected:
         if (backend() != "LIBFABRIC") {
             GTEST_SKIP() << "fault injection is implemented by the LIBFABRIC proxy only";
         }
+#ifdef NDEBUG
+        GTEST_SKIP() << "fault injection is compiled out of NDEBUG builds";
+#endif
         ASSERT_EQ(cudaSetDevice(kDevId), cudaSuccess);
     }
 
@@ -334,7 +415,8 @@ protected:
         // The injected failures are expected to be logged.
         for (const char *rx : {"fault injection enabled",
                                "injected (post|completion) error",
-                               "post failed on rail"}) {
+                               "post failed on rail",
+                               "GDRCopy disabled"}) {
             ignore_.push_back(std::make_unique<::gtest::LogIgnoreGuard>(std::string(rx)));
         }
         ASSERT_EQ(setenv("NIXL_EFA_PROXY_INJECT", spec.c_str(), 1), 0);
@@ -391,28 +473,185 @@ TEST_P(ProxyFaultTest, FailedCompletionStopsLaterSignals) {
     runFailedPutCheck("cq_error_at=" + std::to_string(kFailRequest));
 }
 
+// Without GDRCopy the target adds through CUDA copies; they must not wait for a
+// kernel spinning on the legacy default stream (the counter's own receiver).
+TEST_P(ProxyFaultTest, WithoutGdrCopyKeepsOrder) {
+    createAgentsInjecting("no_gdrcopy=1");
+    if (IsSkipped() || HasFatalFailure()) {
+        return;
+    }
+    runOrderingCheck(kLayout, /*receiver_on_legacy_stream=*/true);
+}
+
+/** atomicAdd semantics at the target: errors reach the sender, and order holds. */
+class ProxyAtomicTest : public ProxyOrderingTest {
+protected:
+    static constexpr Layout kSmallLayout{1, 1};
+    static constexpr unsigned long long kAtomicTimeoutNs = 20ull * 1000 * 1000 * 1000;
+
+    void
+    SetUp() override {
+        ProxyOrderingTest::SetUp();
+        if (IsSkipped() || HasFatalFailure()) {
+            return;
+        }
+        if (backend() != "LIBFABRIC") {
+            GTEST_SKIP() << "checks the LIBFABRIC proxy's target-side adds";
+        }
+    }
+
+    /** Run atomicLoopKernel to completion and return its status. */
+    nixl_status_t
+    runAtomics(const Buffers &b, size_t offset, unsigned count, cudaStream_t stream = nullptr) {
+        nixl_status_t *status = nullptr;
+        EXPECT_EQ(cudaMalloc(&status, sizeof(*status)), cudaSuccess);
+        atomicLoopKernel<<<1, 1, 0, stream>>>(b.dst_mvh, offset, count, kAtomicTimeoutNs, status);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        nixl_status_t host = NIXL_IN_PROG;
+        EXPECT_EQ(cudaMemcpy(&host, status, sizeof(host), cudaMemcpyDeviceToHost), cudaSuccess);
+        cudaFree(status);
+        return host;
+    }
+
+    uint64_t
+    readCounter(const Buffers &b, size_t offset) {
+        uint64_t value = 0;
+        EXPECT_EQ(cudaMemcpy(&value,
+                             static_cast<char *>(static_cast<void *>(b.dst)) + offset,
+                             sizeof(value),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        return value;
+    }
+};
+
+// An add the target cannot apply (here: its region is gone) fails at the sender
+// instead of leaving the GPU waiting for a counter that never moves.
+TEST_P(ProxyAtomicTest, AddToDeregisteredCounterFails) {
+    const LogIgnoreGuard lig("atomicAdd to 0x[0-9a-f]+ failed");
+    Buffers b(kSmallLayout);
+    setUpBuffers(kSmallLayout, b);
+    if (HasFatalFailure()) {
+        return;
+    }
+    // Registered and known to the sender when its views were prepared, gone now.
+    deregisterBuffer(kReceiver, b.dst);
+    const nixl_status_t status = runAtomics(b, 0, 1);
+    EXPECT_NE(status, NIXL_SUCCESS);
+    EXPECT_NE(status, NIXL_IN_PROG) << "the sender timed out instead of seeing the failure";
+    EXPECT_EQ(readCounter(b, 0), 0u);
+    EXPECT_GE(lig.getIgnoredCount(), 1u);
+    releaseViews(b);
+}
+
+// Each add completes once applied, so add(A) of a round is visible before
+// add(B) even when A and B belong to different target threads.
+TEST_P(ProxyAtomicTest, CountersOfDifferentOwnersStayOrdered) {
+    constexpr unsigned kRounds = 2000;
+    Buffers b(kSmallLayout);
+    setUpBuffers(kSmallLayout, b);
+    if (HasFatalFailure()) {
+        return;
+    }
+    const auto dst = reinterpret_cast<uintptr_t>(static_cast<void *>(b.dst));
+    const size_t offset_a = 0;
+    size_t offset_b = 0;
+    for (size_t off = kCounterStride; off < kDataOffset; off += kCounterStride) {
+        if (nixlLibfabricProxyWire::counterOwner(dst + off, kProxyThreads) !=
+            nixlLibfabricProxyWire::counterOwner(dst + offset_a, kProxyThreads)) {
+            offset_b = off;
+            break;
+        }
+    }
+    ASSERT_NE(offset_b, 0u) << "no counter with another owner thread";
+
+    nixl_status_t *status = nullptr;
+    unsigned long long *out = nullptr;
+    ASSERT_EQ(cudaMalloc(&status, sizeof(*status)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&out, 2 * sizeof(*out)), cudaSuccess);
+    cudaStream_t rx_stream, tx_stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&rx_stream, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&tx_stream, cudaStreamNonBlocking), cudaSuccess);
+    cudaFuncAttributes attr;
+    ASSERT_EQ(cudaFuncGetAttributes(&attr, twoCounterReceiverKernel), cudaSuccess);
+    ASSERT_EQ(cudaFuncGetAttributes(&attr, twoCounterSenderKernel), cudaSuccess);
+
+    auto *base = static_cast<char *>(static_cast<void *>(b.dst));
+    twoCounterReceiverKernel<<<1, 1, 0, rx_stream>>>(
+        reinterpret_cast<unsigned long long *>(base + offset_a),
+        reinterpret_cast<unsigned long long *>(base + offset_b),
+        kRounds,
+        kAtomicTimeoutNs,
+        out);
+    twoCounterSenderKernel<<<1, 1, 0, tx_stream>>>(
+        b.dst_mvh, offset_a, offset_b, kRounds, kAtomicTimeoutNs, status);
+    ASSERT_EQ(cudaStreamSynchronize(tx_stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(rx_stream), cudaSuccess);
+
+    nixl_status_t host_status = NIXL_IN_PROG;
+    unsigned long long host_out[2] = {};
+    ASSERT_EQ(cudaMemcpy(&host_status, status, sizeof(host_status), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(host_out, out, sizeof(host_out), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(host_status, NIXL_SUCCESS);
+    EXPECT_EQ(host_out[1], kRounds) << "receiver saw counter B stop early";
+    EXPECT_EQ(host_out[0], 0u) << "counter B ran ahead of counter A";
+    EXPECT_EQ(readCounter(b, offset_a), kRounds);
+
+    cudaStreamDestroy(rx_stream);
+    cudaStreamDestroy(tx_stream);
+    cudaFree(status);
+    cudaFree(out);
+    releaseViews(b);
+}
+
+// Deregistering the target region while adds stream in must neither crash the
+// target's proxy threads nor leave the sender waiting.
+TEST_P(ProxyAtomicTest, DeregisterDuringAtomics) {
+    // Long enough (tens of microseconds per ordered add) to still run when the
+    // region goes away.
+    constexpr unsigned kCount = 20000;
+    const LogIgnoreGuard lig("atomicAdd to 0x[0-9a-f]+ failed");
+    Buffers b(kSmallLayout);
+    setUpBuffers(kSmallLayout, b);
+    if (HasFatalFailure()) {
+        return;
+    }
+    nixl_status_t *status = nullptr;
+    ASSERT_EQ(cudaMalloc(&status, sizeof(*status)), cudaSuccess);
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    atomicLoopKernel<<<1, 1, 0, stream>>>(b.dst_mvh, 0, kCount, kAtomicTimeoutNs, status);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    deregisterBuffer(kReceiver, b.dst);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    nixl_status_t host_status = NIXL_IN_PROG;
+    ASSERT_EQ(cudaMemcpy(&host_status, status, sizeof(host_status), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_NE(host_status, NIXL_IN_PROG) << "the sender timed out";
+    EXPECT_NE(host_status, NIXL_SUCCESS) << "every add was applied: nothing raced";
+    const uint64_t applied = readCounter(b, 0);
+    EXPECT_LT(applied, kCount);
+    Logger() << "DeregisterDuringAtomics: " << applied << " of " << kCount
+             << " add(s) applied before the region went away, status " << host_status << ", "
+             << lig.getIgnoredCount() << " reported failure(s)";
+    cudaStreamDestroy(stream);
+    cudaFree(status);
+    releaseViews(b);
+}
+
 namespace {
     std::string
-    testName(const testing::TestParamInfo<TestParams> &info) {
-        return std::get<1>(info.param) ? "DeliveryComplete" : "TransmitComplete";
+    testName(const testing::TestParamInfo<std::string> &info) {
+        return info.param;
     }
 } // namespace
 
-INSTANTIATE_TEST_SUITE_P(libfabricProxy,
-                         ProxyOrderingTest,
-                         testing::Values(TestParams{"LIBFABRIC", true}),
-                         testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyOrderingTest, testing::Values("LIBFABRIC"), testName);
 
-INSTANTIATE_TEST_SUITE_P(libfabricProxy,
-                         ProxyFaultTest,
-                         testing::Values(TestParams{"LIBFABRIC", true}),
-                         testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyFaultTest, testing::Values("LIBFABRIC"), testName);
 
-// Without FI_DELIVERY_COMPLETE the fence rests on transmit completion only; run
-// explicitly (--gtest_also_run_disabled_tests) to measure whether the flag matters.
-INSTANTIATE_TEST_SUITE_P(DISABLED_libfabricProxy,
-                         ProxyOrderingTest,
-                         testing::Values(TestParams{"LIBFABRIC", false}),
-                         testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyAtomicTest, testing::Values("LIBFABRIC"), testName);
 
 } // namespace gtest::nixl::gpu::proxy_ordering

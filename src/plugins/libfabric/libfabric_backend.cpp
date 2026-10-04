@@ -804,8 +804,8 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
         if (!proxy_info.empty() &&
             nixlLibfabricProxy::parseConnInfo(proxy_info, *connections_[remote_agent]) !=
                 NIXL_SUCCESS) {
-            NIXL_WARN << "Ignoring malformed device proxy info from " << remote_agent
-                      << "; atomicAdd to it will be unavailable";
+            NIXL_WARN << "Ignoring incompatible or malformed device proxy info from "
+                      << remote_agent << "; atomicAdd to it will be unavailable";
         }
 #endif
 
@@ -1053,7 +1053,6 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     priv->buffer_ = (void *)mem.addr;
     priv->length_ = mem.len;
     priv->device_id_ = mem.devId; // Store device ID
-    priv->mem_type_ = nixl_mem;
 
     std::string pci_bus_id = "";
 
@@ -1175,7 +1174,7 @@ nixlLibfabricEngine::deregisterMem(nixlBackendMD *meta) {
     auto *priv = static_cast<nixlLibfabricPrivateMetadata *>(meta);
 #ifdef HAVE_NIXL_DEVICE_API
     if (proxy_) {
-        proxy_->onDeregister(reinterpret_cast<uintptr_t>(priv->buffer_));
+        proxy_->onDeregister(reinterpret_cast<uintptr_t>(priv->buffer_), priv->length_);
     }
 #endif
     // Use Rail Manager for centralized memory deregistration

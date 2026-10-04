@@ -122,7 +122,11 @@ gtest_sources = [
 
 if cuda_dep.found()
     gtest_sources += device_api_test_sources
-    device_api_inc = nixl_device_api_inc_dirs + [include_directories('device_api')]
+    device_api_inc = nixl_device_api_inc_dirs + [
+        include_directories('device_api'),
+        # libfabric_proxy_wire.h (dependency-free) for the EFA proxy's counter owners.
+        include_directories('../../src/plugins/libfabric'),
+    ]
     device_api_dep = [device_proxy_interface]
 else
     device_api_inc = []

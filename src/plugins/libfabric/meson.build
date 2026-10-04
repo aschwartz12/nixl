@@ -60,6 +60,7 @@ if cuda_dep.found() and not rocm_dep.found()
         'libfabric_proxy_conninfo.h',
         'libfabric_proxy_fence.h',
         'libfabric_proxy_profile.h',
+        'libfabric_proxy_wire.h',
     ]
     libfabric_plugin_deps += [device_utils_interface, device_proxy_interface]
     libfabric_inc_dirs += [nixl_device_inc_dirs]

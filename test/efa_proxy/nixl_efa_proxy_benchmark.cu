@@ -12,14 +12,20 @@
  *   NIXL_PROXY_BENCH_BACKEND          LIBFABRIC (default) or UCX
  *   NIXL_EFA_PROXY_CHANNELS/WORKERS   proxy channels / threads (default 1 / 1)
  *   NIXL_EFA_PROXY_PIPELINE_WINDOW    outstanding puts in the pipelined tests
- *   NIXL_EFA_PROXY_DELIVERY_COMPLETE  0 disables FI_DELIVERY_COMPLETE (LIBFABRIC)
  *   NIXL_EFA_PROXY_RING_DEPTH         proxy_ring_depth (power of two, default 256)
  *   NIXL_EFA_PROXY_RAIL_POLICY        efa_proxy_rail_policy: thread (default) or ring
+ *   NIXL_EFA_PROXY_IDLE_POLL_US       efa_proxy_idle_poll_us (idle CQ polling period)
+ *   NIXL_PROXY_BENCH_HOST_ROUNDS      rounds per host-transfer trial (default 200)
+ *   NIXL_PROXY_BENCH_PTHR_DELAY_US    engine progress thread delay (default 1000)
  *   NIXL_PROXY_BENCH_PROGRESS_THREAD  0 disables the engine progress thread
  *   NIXL_PROXY_BENCH_ORDERING_ROUNDS  >0 runs the put -> atomicAdd ordering check
  *                                     (proxy_ordering.cuh) first, per channel
  *   NIXL_PROXY_BENCH_ORDERING_ONLY    1 stops after the ordering check
  *   NIXL_PROXY_BENCH_SKIP_{PINGPONG,SERIAL,PIPELINED}=1 skip that phase
+ *   NIXL_PROXY_BENCH_HOST_XFER=1      host-path writes (postXferReq) instead of the
+ *                                     device phases
+ *   NIXL_PROXY_BENCH_DEVICE_PROXY=0   create the backend without the device proxy
+ *                                     (host transfers only; for proxy on/off A/B)
  *   NIXL_PROXY_BENCH_PUT_ONLY, NIXL_PROXY_BENCH_COUNTER_HOST, NIXL_PROXY_BENCH_MIN_SIZE
  */
 #include <cuda_runtime.h>
@@ -572,10 +578,6 @@ main(int argc, char **argv) {
             const char *value = std::getenv("NIXL_PROXY_BENCH_COUNTER_HOST");
             return value != nullptr && std::string(value) == "1";
         }();
-        const bool delivery_complete = [] {
-            const char *value = std::getenv("NIXL_EFA_PROXY_DELIVERY_COMPLETE");
-            return value == nullptr || std::string(value) != "0";
-        }();
         // LIBFABRIC keeps the engine progress thread: a proxy's first write to a
         // peer waits for that peer's engine rail EP to answer the EFA handshake.
         const bool engine_progress_thread = [] {
@@ -584,6 +586,17 @@ main(int argc, char **argv) {
         }();
         const uint32_t ordering_rounds =
             unsignedFromEnvironment("NIXL_PROXY_BENCH_ORDERING_ROUNDS", 0, 1u << 20);
+        const auto env_flag = [](const char *name, bool default_value) {
+            const char *value = std::getenv(name);
+            return value == nullptr || *value == '\0' ? default_value : std::string(value) != "0";
+        };
+        const bool host_xfer = env_flag("NIXL_PROXY_BENCH_HOST_XFER", false);
+        const bool device_proxy = env_flag("NIXL_PROXY_BENCH_DEVICE_PROXY", true);
+        if (!device_proxy && (!host_xfer || ordering_rounds > 0)) {
+            throw std::runtime_error(
+                "NIXL_PROXY_BENCH_DEVICE_PROXY=0 needs NIXL_PROXY_BENCH_HOST_XFER=1 and no "
+                "ordering rounds");
+        }
         const char *backend_env = std::getenv("NIXL_PROXY_BENCH_BACKEND");
         const std::string backend_name = backend_env == nullptr ? "LIBFABRIC" : backend_env;
         if (backend_name != "LIBFABRIC" && backend_name != "UCX") {
@@ -623,26 +636,28 @@ main(int argc, char **argv) {
         // UCX proxy threads own the UCX workers, so its progress thread must be off.
         config.useProgThread = backend_name == "LIBFABRIC" && engine_progress_thread;
         config.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
-        config.pthrDelay = 1000;
+        config.pthrDelay = unsignedFromEnvironment("NIXL_PROXY_BENCH_PTHR_DELAY_US", 1000, 1000000);
         stage("create agent and selected transport backend");
         nixlAgent agent(agent_name, config);
 
         nixlBackendH *backend = nullptr;
-        nixl_b_params_t backend_params = {
-            {"device_proxy", "true"},
-            {"proxy_channel_count", std::to_string(pipeline_channels)},
-            {"proxy_thread_count", std::to_string(proxy_workers)},
-            {"proxy_max_peers", "1"},
-        };
-        if (backend_name == "LIBFABRIC") {
-            backend_params.emplace("efa_proxy_delivery_complete",
-                                   delivery_complete ? "true" : "false");
-        }
-        if (const char *policy = std::getenv("NIXL_EFA_PROXY_RAIL_POLICY")) {
-            backend_params.emplace("efa_proxy_rail_policy", policy);
-        }
-        if (const char *depth = std::getenv("NIXL_EFA_PROXY_RING_DEPTH")) {
-            backend_params.emplace("proxy_ring_depth", depth);
+        nixl_b_params_t backend_params;
+        if (device_proxy) {
+            backend_params = {
+                {"device_proxy", "true"},
+                {"proxy_channel_count", std::to_string(pipeline_channels)},
+                {"proxy_thread_count", std::to_string(proxy_workers)},
+                {"proxy_max_peers", "1"},
+            };
+            if (const char *policy = std::getenv("NIXL_EFA_PROXY_RAIL_POLICY")) {
+                backend_params.emplace("efa_proxy_rail_policy", policy);
+            }
+            if (const char *depth = std::getenv("NIXL_EFA_PROXY_RING_DEPTH")) {
+                backend_params.emplace("proxy_ring_depth", depth);
+            }
+            if (const char *idle = std::getenv("NIXL_EFA_PROXY_IDLE_POLL_US")) {
+                backend_params.emplace("efa_proxy_idle_poll_us", idle);
+            }
         }
         checkNixl(agent.createBackend(backend_name, backend_params, backend),
                   "create transport backend");
@@ -718,9 +733,12 @@ main(int argc, char **argv) {
         nixlMemViewH src_mvh = nullptr;
         nixlMemViewH dst_mvh = nullptr;
         nixlMemViewH counter_mvh = nullptr;
-        checkNixl(agent.prepMemView(local_src, src_mvh), "prepare local source view");
-        checkNixl(agent.prepMemView(remote_dst, dst_mvh), "prepare remote destination view");
-        checkNixl(agent.prepMemView(remote_counter, counter_mvh), "prepare remote counter view");
+        if (device_proxy) {
+            checkNixl(agent.prepMemView(local_src, src_mvh), "prepare local source view");
+            checkNixl(agent.prepMemView(remote_dst, dst_mvh), "prepare remote destination view");
+            checkNixl(agent.prepMemView(remote_counter, counter_mvh),
+                      "prepare remote counter view");
+        }
 
         if (rank == 0) {
             std::cout << "backend," << backend_name << '\n';
@@ -728,11 +746,12 @@ main(int argc, char **argv) {
             std::cout << "pipeline_channels," << pipeline_channels << '\n';
             std::cout << "proxy_workers," << proxy_workers << '\n';
             std::cout << "engine_progress_thread," << (config.useProgThread ? 1 : 0) << '\n';
-            std::cout << "efa_delivery_complete," << (delivery_complete ? 1 : 0) << '\n';
             std::cout << "ordering_rounds," << ordering_rounds << '\n';
             std::cout << "minimum_size," << minimum_size << '\n';
             std::cout << "put_only," << (put_only ? 1 : 0) << '\n';
             std::cout << "counter_memory," << (counter_host ? "host" : "gpu") << '\n';
+            std::cout << "device_proxy," << (device_proxy ? 1 : 0) << '\n';
+            std::cout << "host_xfer," << (host_xfer ? 1 : 0) << '\n';
             std::cout << "test,size_B,trial,iterations,mean_us,payload_Gbit_s\n";
         }
 
@@ -850,9 +869,9 @@ main(int argc, char **argv) {
             const char *value = std::getenv(name);
             return value != nullptr && std::string(value) == "1";
         };
-        const bool skip_pingpong = skip("NIXL_PROXY_BENCH_SKIP_PINGPONG");
-        const bool skip_serial = skip("NIXL_PROXY_BENCH_SKIP_SERIAL");
-        const bool skip_pipelined = skip("NIXL_PROXY_BENCH_SKIP_PIPELINED");
+        const bool skip_pingpong = host_xfer || skip("NIXL_PROXY_BENCH_SKIP_PINGPONG");
+        const bool skip_serial = host_xfer || skip("NIXL_PROXY_BENCH_SKIP_SERIAL");
+        const bool skip_pipelined = host_xfer || skip("NIXL_PROXY_BENCH_SKIP_PIPELINED");
 
         if (!put_only && !ordering_only && !skip_pingpong) {
             if (counter_host) {
@@ -935,6 +954,59 @@ main(int argc, char **argv) {
             uint64_t verified_extent = 0;
 
             stage("run benchmark");
+
+            // Host path: `window` requests in flight, each writing the whole buffer
+            // in descriptors of `size` bytes, reposted as they complete.
+            for (const size_t size :
+                 host_xfer ? std::vector<size_t>{65536, 1048576} : std::vector<size_t>{}) {
+                constexpr uint32_t window = 8;
+                const uint32_t rounds =
+                    unsignedFromEnvironment("NIXL_PROXY_BENCH_HOST_ROUNDS", 200, 1u << 20);
+                nixl_xfer_dlist_t local_descs(VRAM_SEG);
+                nixl_xfer_dlist_t remote_descs(VRAM_SEG);
+                for (size_t offset = 0; offset + size <= max_size; offset += size) {
+                    local_descs.addDesc(
+                        nixlBasicDesc(reinterpret_cast<uintptr_t>(src) + offset, size, kDeviceId));
+                    remote_descs.addDesc(nixlBasicDesc(remote.dst_addr + offset, size, kDeviceId));
+                }
+                std::vector<nixlXferReqH *> requests(window, nullptr);
+                for (auto &request : requests) {
+                    checkNixl(agent.createXferReq(
+                                  NIXL_WRITE, local_descs, remote_descs, peer_name, request),
+                              "create host transfer");
+                }
+                const auto run_rounds = [&](uint32_t count) {
+                    for (uint32_t round = 0; round < count; ++round) {
+                        for (auto *request : requests) {
+                            const nixl_status_t status = agent.postXferReq(request);
+                            if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
+                                checkNixl(status, "post host transfer");
+                            }
+                        }
+                        for (auto *request : requests) {
+                            nixl_status_t status;
+                            while ((status = agent.getXferStatus(request)) == NIXL_IN_PROG) {}
+                            checkNixl(status, "complete host transfer");
+                        }
+                    }
+                };
+                run_rounds(10);
+                for (uint32_t trial = 1; trial <= 5; ++trial) {
+                    const auto start = std::chrono::steady_clock::now();
+                    run_rounds(rounds);
+                    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count();
+                    const double bytes = double(window) * rounds * max_size;
+                    std::cout << "HOST-write," << size << ',' << trial << ',' << window * rounds
+                              << ',' << ns / 1000.0 / (window * rounds) << ',' << bytes * 8.0 / ns
+                              << std::endl;
+                }
+                for (auto *request : requests) {
+                    checkNixl(agent.releaseXferReq(request), "release host transfer");
+                }
+                verified_extent = max_size;
+            }
 
             for (const size_t size : skip_serial ? std::vector<size_t>{} : sizes) {
                 const uint32_t iterations = iterationCount(size);
@@ -1105,9 +1177,11 @@ main(int argc, char **argv) {
             stage("target validation passed");
         }
 
-        agent.releaseMemView(counter_mvh);
-        agent.releaseMemView(dst_mvh);
-        agent.releaseMemView(src_mvh);
+        if (device_proxy) {
+            agent.releaseMemView(counter_mvh);
+            agent.releaseMemView(dst_mvh);
+            agent.releaseMemView(src_mvh);
+        }
         if (ordering_buf != nullptr) {
             checkNixl(agent.deregisterMem(ordering_registrations), "deregister ordering buffer");
             checkCuda(cudaFree(ordering_buf), "free ordering buffer");

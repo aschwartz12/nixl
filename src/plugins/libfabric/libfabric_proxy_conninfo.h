@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "libfabric/libfabric_common.h"
+#include "libfabric_proxy_wire.h"
 #include "serdes/serdes.h"
 
 /**
@@ -32,9 +33,10 @@
  *
  *   "<engine blob><proxy blob><8-byte proxy blob length>EFAPRXY1"
  *
- * The proxy blob lists the home EP name of every proxy thread (targets of
- * atomicAdd records). A peer without the proxy sends only the engine blob,
- * which split() returns unchanged.
+ * The proxy blob carries the proxy protocol version and the home EP name of
+ * every proxy thread (targets of atomicAdd records). A peer without the proxy
+ * sends only the engine blob, which split() returns unchanged; a peer with
+ * another protocol version is rejected by parse(), so no atomicAdd is sent to it.
  */
 namespace nixlLibfabricProxyConnInfo {
 
@@ -42,6 +44,7 @@ using EpName = std::array<char, LF_EP_NAME_MAX_LEN>;
 
 inline constexpr char kMagic[] = "EFAPRXY1";
 inline constexpr size_t kMagicLen = sizeof(kMagic) - 1;
+inline constexpr char kVersionTag[] = "efa_proxy_version";
 inline constexpr char kThreadsTag[] = "efa_proxy_threads";
 inline constexpr char kEpTagPrefix[] = "efa_proxy_ep_";
 
@@ -49,6 +52,7 @@ inline constexpr char kEpTagPrefix[] = "efa_proxy_ep_";
 inline std::string
 serialize(const std::vector<EpName> &home_eps) {
     nixlSerDes sd;
+    sd.addStr(kVersionTag, std::to_string(nixlLibfabricProxyWire::kVersion));
     sd.addStr(kThreadsTag, std::to_string(home_eps.size()));
     for (size_t t = 0; t < home_eps.size(); ++t) {
         sd.addBuf(kEpTagPrefix + std::to_string(t), home_eps[t].data(), home_eps[t].size());
@@ -56,7 +60,10 @@ serialize(const std::vector<EpName> &home_eps) {
     return sd.exportStr();
 }
 
-/** Parse a proxy blob; an empty blob means no proxy. On error @p home_eps is empty. */
+/**
+ * Parse a proxy blob; an empty blob means no proxy. On error @p home_eps is empty:
+ * NIXL_ERR_MISMATCH for a malformed blob or another protocol version.
+ */
 inline nixl_status_t
 parse(const std::string &blob, std::vector<EpName> &home_eps) {
     home_eps.clear();
@@ -65,6 +72,9 @@ parse(const std::string &blob, std::vector<EpName> &home_eps) {
     }
     nixlSerDes sd;
     if (sd.importStr(blob) != NIXL_SUCCESS) {
+        return NIXL_ERR_MISMATCH;
+    }
+    if (sd.getStr(kVersionTag) != std::to_string(nixlLibfabricProxyWire::kVersion)) {
         return NIXL_ERR_MISMATCH;
     }
     size_t count = 0;

@@ -64,6 +64,7 @@ __host__ __device__ constexpr unsigned long long
 counterRounds(unsigned long long counter) {
     return counter & 0xffffffffull;
 }
+
 static_assert(kRoundBytes % sizeof(uint32_t) == 0);
 
 /** Buffer layout: counters, then kRoundBytes per (channel, round). */
