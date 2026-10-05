@@ -1,0 +1,12 @@
+base-c1-1 exit=0
+base-c4-1 exit=0
+base-ord-1 exit=0
+base-host-1 exit=0
+base-c1-2 exit=0
+base-c4-2 exit=0
+base-ord-2 exit=0
+base-host-2 exit=0
+base-c1-3 exit=0
+base-c4-3 exit=0
+base-ord-3 exit=0
+base-host-3 exit=0

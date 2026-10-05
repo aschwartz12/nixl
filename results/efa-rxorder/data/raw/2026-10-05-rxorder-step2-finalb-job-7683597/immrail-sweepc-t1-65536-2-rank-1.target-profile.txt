@@ -1,0 +1,14 @@
+I1005 05:11:29.980384 3080469 libfabric_proxy.cpp:1027] EFA proxy: 1 thread(s) x 32 rail(s) = 32 endpoint(s); home rails 0; small puts per thread rail; idle poll every 2 us; ordering sender with remote CQ data puts (test), counted by rail; fabric efa, data EP receive queue 64, 0 receive(s) posted per data EP
+I1005 05:11:29.986519 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 0 read #0 took 4366 us
+I1005 05:11:30.004517 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 1 read #0 took 17912 us
+I1005 05:11:30.016523 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 2 read #0 took 11913 us
+I1005 05:11:30.027826 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #0 took 11212 us
+I1005 05:11:30.032975 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 32 read #0 took 5086 us
+I1005 05:11:30.541037 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 0 read #244815 took 7170 us
+I1005 05:11:30.570880 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 1 read #255873 took 7249 us
+I1005 05:11:30.578440 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 2 read #255917 took 7406 us
+I1005 05:11:30.585971 3080551 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #255973 took 7377 us
+I1005 05:11:31.437161 3080469 libfabric_proxy.cpp:1122] EFA proxy profile: pass period: n=733714 mean=1.98us p50=2.05us p90=2.10us p99=2.10us max=50890.31us
+I1005 05:11:31.437183 3080469 libfabric_proxy.cpp:1122] EFA proxy profile: cq poll: n=733715 mean=0.62us p50=0.50us p90=0.70us p99=1.15us max=50882.28us
+I1005 05:11:31.437193 3080469 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 0: events=98368 busy_ms=75.8 window_ms=872.8 busy_pct=8.7
+I1005 05:11:31.437202 3080469 libfabric_proxy.cpp:2594] EFA proxy rx: thread 0: entries=98368 reads=90090 sweeps=71431 window_ms=872.8 sweep_ns_per_entry=665.2 read_ns_per_entry=349.1 decode_ns_per_entry=30.8 entries_per_read=1.1 busy_pct=7.5 entries_per_s=112699.1 consumed_rx=0 deferred_atomics=0

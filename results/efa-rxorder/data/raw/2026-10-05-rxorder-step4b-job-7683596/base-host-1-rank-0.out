@@ -1,0 +1,23 @@
+host=pool0-0321 cuda_visible=0 commit=8e9e25ee dirty=0
+backend,LIBFABRIC
+pipeline_window,32
+pipeline_channels,4
+proxy_workers,4
+engine_progress_thread,1
+ordering_rounds,0
+minimum_size,1
+put_only,1
+counter_memory,gpu
+device_proxy,1
+host_xfer,1
+test,size_B,trial,iterations,mean_us,payload_Gbit_s
+HOST-write,65536,1,400,46.528,180.292
+HOST-write,65536,2,400,46.1771,181.662
+HOST-write,65536,3,400,46.4503,180.593
+HOST-write,65536,4,400,46.2649,181.317
+HOST-write,65536,5,400,46.4948,180.42
+HOST-write,1048576,1,400,41.7857,200.753
+HOST-write,1048576,2,400,41.9709,199.867
+HOST-write,1048576,3,400,41.8813,200.295
+HOST-write,1048576,4,400,41.6971,201.18
+HOST-write,1048576,5,400,41.8977,200.216

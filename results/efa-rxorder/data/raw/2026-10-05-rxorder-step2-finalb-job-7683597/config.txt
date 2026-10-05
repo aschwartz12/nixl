@@ -1,0 +1,8 @@
+modes=sender imm immrail
+suites=sweep sweepc
+reps=3 sweep_sizes=4096 7168 16384 65536 sweep_threads=1 4
+base_build=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-efa-cpu-proxy
+commit=5a762a8e001abef27f3dab363a0152a1a3e217e7 dirty=0 built=2026-10-05T02:01:59-07:00
+study_build=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder
+commit=8e9e25eedd3519db238c92bd563e37b34b6a8fca (built from the identical working tree: diff_sha=e0a11723177b vs 5a762a8e) built=2026-10-05T04:24:05-07:00
+worktree=8e9e25eedd3519db238c92bd563e37b34b6a8fca dirty=0

@@ -1,0 +1,24 @@
+I1005 05:04:15.564831 3072819 libfabric_proxy.cpp:1027] EFA proxy: 4 thread(s) x 32 rail(s) = 128 endpoint(s); home rails 0,1,2,3; small puts per thread rail; idle poll every 2 us; ordering sender with remote CQ data puts (test), counted by rail; fabric efa, data EP receive queue 64, 0 receive(s) posted per data EP
+I1005 05:04:15.572557 3072913 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 1 read #0 took 5831 us
+I1005 05:04:15.572646 3072915 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 3 read #0 took 5808 us
+I1005 05:04:15.572555 3072912 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 0 read #0 took 5850 us
+I1005 05:04:15.573438 3072914 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 2 read #0 took 6675 us
+I1005 05:04:15.579643 3072915 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 32 read #0 took 6949 us
+I1005 05:04:15.579915 3072913 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 32 read #0 took 7253 us
+I1005 05:04:15.580353 3072912 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 32 read #0 took 7633 us
+I1005 05:04:15.580353 3072914 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 32 read #0 took 6708 us
+I1005 05:04:15.591739 3072913 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 1 read #1 took 11759 us
+I1005 05:04:15.603561 3072914 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 2 read #5536 took 11824 us
+I1005 05:04:15.615499 3072915 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 3 read #11622 took 11939 us
+I1005 05:04:16.130792 3072912 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 0 read #269009 took 7095 us
+I1005 05:04:16.644632 3072915 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 32 read #604098 took 4495 us
+I1005 05:04:17.147508 3072819 libfabric_proxy.cpp:1122] EFA proxy profile: pass period: n=3796630 mean=1.66us p50=2.05us p90=2.10us p99=2.10us max=13819.04us
+I1005 05:04:17.147531 3072819 libfabric_proxy.cpp:1122] EFA proxy profile: cq poll: n=3796634 mean=0.30us p50=0.25us p90=0.50us p99=0.65us max=13810.65us
+I1005 05:04:17.147540 3072819 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 0: events=224758 busy_ms=112.0 window_ms=1000.8 busy_pct=11.2
+I1005 05:04:17.147547 3072819 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 1: events=224758 busy_ms=106.5 window_ms=1000.6 busy_pct=10.6
+I1005 05:04:17.147554 3072819 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 2: events=224758 busy_ms=108.7 window_ms=1000.7 busy_pct=10.9
+I1005 05:04:17.147559 3072819 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 3: events=224758 busy_ms=105.4 window_ms=1000.4 busy_pct=10.5
+I1005 05:04:17.147578 3072819 libfabric_proxy.cpp:2594] EFA proxy rx: thread 0: entries=224758 reads=188733 sweeps=188733 window_ms=1000.8 sweep_ns_per_entry=375.7 read_ns_per_entry=226.9 decode_ns_per_entry=31.6 entries_per_read=1.2 busy_pct=8.4 entries_per_s=224589.6 consumed_rx=0 deferred_atomics=0
+I1005 05:04:17.147587 3072819 libfabric_proxy.cpp:2594] EFA proxy rx: thread 1: entries=224758 reads=181716 sweeps=181716 window_ms=1000.6 sweep_ns_per_entry=355.0 read_ns_per_entry=218.5 decode_ns_per_entry=26.8 entries_per_read=1.2 busy_pct=8.0 entries_per_s=224616.2 consumed_rx=0 deferred_atomics=0
+I1005 05:04:17.147594 3072819 libfabric_proxy.cpp:2594] EFA proxy rx: thread 2: entries=224758 reads=187906 sweeps=187906 window_ms=1000.7 sweep_ns_per_entry=361.3 read_ns_per_entry=220.7 decode_ns_per_entry=27.7 entries_per_read=1.2 busy_pct=8.1 entries_per_s=224597.5 consumed_rx=0 deferred_atomics=0
+I1005 05:04:17.147601 3072819 libfabric_proxy.cpp:2594] EFA proxy rx: thread 3: entries=224758 reads=180341 sweeps=180306 window_ms=1000.4 sweep_ns_per_entry=350.2 read_ns_per_entry=216.2 decode_ns_per_entry=26.6 entries_per_read=1.2 busy_pct=7.9 entries_per_s=224663.8 consumed_rx=0 deferred_atomics=0

@@ -1,0 +1,13 @@
+I1005 05:10:08.731226 3079155 libfabric_proxy.cpp:1027] EFA proxy: 1 thread(s) x 32 rail(s) = 32 endpoint(s); home rails 0; small puts per thread rail; idle poll every 2 us; ordering sender with remote CQ data puts (test), counted by rail; fabric efa, data EP receive queue 64, 0 receive(s) posted per data EP
+I1005 05:10:08.737271 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 0 read #0 took 4309 us
+I1005 05:10:08.741695 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 1 read #0 took 4333 us
+I1005 05:10:08.746917 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 2 read #0 took 5176 us
+I1005 05:10:08.751812 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #0 took 4808 us
+I1005 05:10:08.758039 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 32 read #0 took 6153 us
+I1005 05:10:08.766766 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 2 read #1 took 8576 us
+I1005 05:10:08.779001 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #1 took 12190 us
+I1005 05:10:09.290552 3079237 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 0 read #246451 took 7188 us
+I1005 05:10:13.089729 3079155 libfabric_proxy.cpp:1122] EFA proxy profile: pass period: n=2839942 mean=1.53us p50=2.05us p90=2.10us p99=2.10us max=25230.67us
+I1005 05:10:13.089754 3079155 libfabric_proxy.cpp:1122] EFA proxy profile: cq poll: n=2839943 mean=0.56us p50=0.50us p90=0.75us p99=1.10us max=25222.11us
+I1005 05:10:13.089763 3079155 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 0: events=898843 busy_ms=642.1 window_ms=3773.7 busy_pct=17.0
+I1005 05:10:13.089772 3079155 libfabric_proxy.cpp:2594] EFA proxy rx: thread 0: entries=898843 reads=898695 sweeps=749231 window_ms=3773.7 sweep_ns_per_entry=590.4 read_ns_per_entry=248.8 decode_ns_per_entry=33.4 entries_per_read=1.0 busy_pct=14.1 entries_per_s=238184.4 consumed_rx=0 deferred_atomics=0

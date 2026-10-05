@@ -1,0 +1,15 @@
+I1005 04:44:15.156566 3049201 libfabric_proxy.cpp:794] EFA proxy: 4 thread(s) x 32 rail(s) = 128 endpoint(s); home rails 0,1,2,3; small puts per thread rail; idle poll every 2 us
+I1005 04:44:15.165176 3049293 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 1 rail 32 read #0 took 6866 us
+I1005 04:44:15.165391 3049292 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 0 rail 32 read #0 took 7124 us
+I1005 04:44:15.165657 3049294 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 2 rail 32 read #0 took 7313 us
+I1005 04:44:15.166151 3049295 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 3 rail 32 read #0 took 7732 us
+I1005 04:44:15.181989 3049293 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 1 rail 32 read #578 took 15534 us
+I1005 04:44:15.201438 3049294 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 2 rail 32 read #8031 took 19450 us
+I1005 04:44:15.217458 3049295 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 3 rail 32 read #17430 took 16021 us
+I1005 04:44:15.774086 3049292 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 0 rail 32 read #297411 took 7328 us
+I1005 04:44:15.846301 3049293 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 1 rail 32 read #326735 took 4633 us
+I1005 04:44:15.850066 3049294 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 2 rail 32 read #326096 took 5040 us
+I1005 04:44:15.858733 3049292 libfabric_proxy.cpp:1397] EFA proxy profile: slow cq read: thread 0 rail 32 read #336989 took 4483 us
+I1005 04:44:16.185980 3049201 libfabric_proxy.cpp:869] EFA proxy profile: pass period: n=1969286 mean=2.09us p50=2.05us p90=2.05us p99=2.05us max=19514.04us
+I1005 04:44:16.186004 3049201 libfabric_proxy.cpp:869] EFA proxy profile: cq poll: n=1969290 mean=0.18us p50=0.15us p90=0.15us p99=0.25us max=19513.20us
+I1005 04:44:16.186010 3049201 libfabric_proxy.cpp:869] EFA proxy profile: atomic apply: n=8192 mean=3.11us p50=3.10us p90=3.30us p99=3.40us max=336.39us

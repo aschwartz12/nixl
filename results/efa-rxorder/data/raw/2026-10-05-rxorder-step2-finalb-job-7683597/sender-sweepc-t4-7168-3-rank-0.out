@@ -1,0 +1,27 @@
+host=pool0-0321 cuda_visible=0 commit=8e9e25ee dirty=0
+backend_param,proxy_max_peers=1
+backend_param,efa_proxy_ordering=sender
+backend_param,proxy_thread_count=4
+backend_param,proxy_channel_count=4
+backend_param,device_proxy=true
+backend,LIBFABRIC
+pipeline_window,32
+pipeline_channels,4
+proxy_workers,4
+engine_progress_thread,1
+ordering_rounds,0
+minimum_size,1
+put_only,1
+counter_memory,gpu
+device_proxy,1
+host_xfer,0
+test,size_B,trial,iterations,mean_us,payload_Gbit_s
+HOST-concurrent,1048576,1,14744,43.1986,194.187
+PUT-pipelined,7168,1,299592,2.12591,26.9739
+gpu-enqueue,PUT-pipelined,7168,1,3.15016us/op
+HOST-concurrent,1048576,2,15696,41.0116,204.542
+PUT-pipelined,7168,2,299592,2.14834,26.6923
+gpu-enqueue,PUT-pipelined,7168,2,3.13154us/op
+HOST-concurrent,1048576,3,15880,40.7917,205.645
+PUT-pipelined,7168,3,299592,2.16207,26.5228
+gpu-enqueue,PUT-pipelined,7168,3,3.12734us/op

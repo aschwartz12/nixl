@@ -1,0 +1,20 @@
+== pool0-0321
+== pool0-0736
+2026-10-05T04:43:50-07:00
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-7e845a2a-369d-e2c2-82e8-36d0933bc00f)
+/opt/amazon/efa/bin/fi_info: 2.1.0amzn1.0
+libfabric: 2.1.0amzn1.0
+libfabric api: 2.1
+# EFA installer version: 1.39.0
+# Debug packages installed: yes
+gdrdrv                 28672  2
+nvidia              11431936  357 nvidia_uvm,nvidia_peermem,gdrdrv,nvidia_modeset
+2026-10-05T04:43:50-07:00
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-70b570f2-3201-843e-01f6-6549786a888e)
+/opt/amazon/efa/bin/fi_info: 2.1.0amzn1.0
+libfabric: 2.1.0amzn1.0
+libfabric api: 2.1
+# EFA installer version: 1.39.0
+# Debug packages installed: yes
+gdrdrv                 28672  2
+nvidia              11431936  349 nvidia_uvm,nvidia_peermem,gdrdrv,nvidia_modeset

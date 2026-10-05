@@ -1,0 +1,34 @@
+job=7682251 nodes=pool0-[0624,0977] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_8.json master=pool0-0624
+=== install=default channels=4 workers=4 params=
+[rank 7] Dispatch + combine bandwidth: 8.89 GB/s, avg_t=2479.88 us, min_t=2160.51 us, max_t=3311.26 us
+[rank 5] Dispatch + combine bandwidth: 8.90 GB/s, avg_t=2478.31 us, min_t=2160.74 us, max_t=3408.22 us
+[rank 4] Dispatch + combine bandwidth: 8.89 GB/s, avg_t=2480.04 us, min_t=2125.98 us, max_t=3409.15 us
+[rank 2] Dispatch + combine bandwidth: 8.90 GB/s, avg_t=2477.59 us, min_t=2120.83 us, max_t=3448.32 us
+[rank 0] Dispatch + combine bandwidth: 8.89 GB/s, avg_t=2479.07 us, min_t=2158.43 us, max_t=3433.22 us
+[rank 3] Dispatch + combine bandwidth: 8.89 GB/s, avg_t=2480.06 us, min_t=2134.08 us, max_t=3309.60 us
+[rank 1] Dispatch + combine bandwidth: 8.89 GB/s, avg_t=2478.87 us, min_t=2159.97 us, max_t=3853.86 us
+[rank 6] Dispatch + combine bandwidth: 8.90 GB/s, avg_t=2476.66 us, min_t=2163.90 us, max_t=3458.37 us
+node=pool0-0977 elastic.py exit=0
+node=pool0-0624 elastic.py exit=0
+=== install=default channels=4 workers=4 params=
+[rank 4] Dispatch + combine bandwidth: 8.35 GB/s, avg_t=2641.57 us, min_t=2067.17 us, max_t=3543.42 us
+[rank 6] Dispatch + combine bandwidth: 8.36 GB/s, avg_t=2636.33 us, min_t=2170.91 us, max_t=3376.38 us
+[rank 5] Dispatch + combine bandwidth: 8.32 GB/s, avg_t=2648.94 us, min_t=2201.54 us, max_t=3841.95 us
+[rank 7] Dispatch + combine bandwidth: 8.34 GB/s, avg_t=2642.83 us, min_t=2195.17 us, max_t=3457.31 us
+[rank 0] Dispatch + combine bandwidth: 8.35 GB/s, avg_t=2639.84 us, min_t=2151.04 us, max_t=3486.85 us
+[rank 2] Dispatch + combine bandwidth: 8.33 GB/s, avg_t=2645.90 us, min_t=2183.42 us, max_t=3455.36 us
+[rank 1] Dispatch + combine bandwidth: 8.34 GB/s, avg_t=2642.73 us, min_t=2168.13 us, max_t=3559.04 us
+[rank 3] Dispatch + combine bandwidth: 8.34 GB/s, avg_t=2644.65 us, min_t=2193.63 us, max_t=3486.37 us
+node=pool0-0977 elastic.py exit=0
+node=pool0-0624 elastic.py exit=0
+=== install=default channels=4 workers=4 params=
+[rank 5] Dispatch + combine bandwidth: 7.83 GB/s, avg_t=2814.79 us, min_t=2282.34 us, max_t=6023.62 us
+[rank 6] Dispatch + combine bandwidth: 7.85 GB/s, avg_t=2809.63 us, min_t=2186.56 us, max_t=6045.31 us
+[rank 7] Dispatch + combine bandwidth: 7.83 GB/s, avg_t=2816.08 us, min_t=2275.97 us, max_t=6006.85 us
+[rank 4] Dispatch + combine bandwidth: 7.83 GB/s, avg_t=2815.95 us, min_t=2191.94 us, max_t=5989.12 us
+[rank 1] Dispatch + combine bandwidth: 7.84 GB/s, avg_t=2811.77 us, min_t=2094.08 us, max_t=6003.23 us
+[rank 0] Dispatch + combine bandwidth: 7.83 GB/s, avg_t=2814.59 us, min_t=2249.76 us, max_t=6023.90 us
+[rank 3] Dispatch + combine bandwidth: 7.83 GB/s, avg_t=2814.59 us, min_t=2225.47 us, max_t=5973.95 us
+[rank 2] Dispatch + combine bandwidth: 7.83 GB/s, avg_t=2814.79 us, min_t=2236.99 us, max_t=6033.22 us
+node=pool0-0977 elastic.py exit=0
+node=pool0-0624 elastic.py exit=0

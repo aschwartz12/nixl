@@ -1,0 +1,53 @@
+I1005 05:16:01.244265 3084910 libfabric_proxy.cpp:1027] EFA proxy: 4 thread(s) x 32 rail(s) = 128 endpoint(s); home rails 0,1,2,3; small puts per thread rail; idle poll every 2 us; ordering sender with remote CQ data puts (test), counted by ring; fabric efa, data EP receive queue 64, 0 receive(s) posted per data EP
+I1005 05:16:01.250747 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 0 read #0 took 4636 us
+I1005 05:16:01.255813 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 1 read #0 took 4961 us
+I1005 05:16:01.256063 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 0 read #0 took 9949 us
+I1005 05:16:01.261130 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 2 read #0 took 5273 us
+I1005 05:16:01.261252 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 1 read #0 took 5141 us
+I1005 05:16:01.261780 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 0 read #0 took 15640 us
+I1005 05:16:01.267915 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 2 read #0 took 6624 us
+I1005 05:16:01.267909 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 0 read #0 took 21704 us
+I1005 05:16:01.268304 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #0 took 7130 us
+I1005 05:16:01.274095 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 3 read #0 took 6149 us
+I1005 05:16:01.274582 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 32 read #0 took 6057 us
+I1005 05:16:01.279315 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 1 read #0 took 17489 us
+I1005 05:16:01.284283 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 1 read #0 took 16310 us
+I1005 05:16:01.290688 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 32 read #0 took 16562 us
+I1005 05:16:01.290697 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 1 read #2 took 16023 us
+I1005 05:16:01.292926 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 2 read #0 took 13580 us
+I1005 05:16:01.298082 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 2 read #0 took 13763 us
+I1005 05:16:01.298091 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 2 read #2 took 7151 us
+I1005 05:16:01.298085 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 2 read #1 took 7183 us
+I1005 05:16:01.304291 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 3 read #0 took 11333 us
+I1005 05:16:01.309163 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #2 took 11022 us
+I1005 05:16:01.309160 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 3 read #0 took 11038 us
+I1005 05:16:01.309173 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 3 read #1 took 11015 us
+I1005 05:16:01.309787 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 32 read #0 took 5464 us
+I1005 05:16:01.314388 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #3 took 4597 us
+I1005 05:16:01.314384 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 32 read #0 took 5147 us
+I1005 05:16:01.314395 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 3 read #2 took 4597 us
+I1005 05:16:01.314400 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 3 read #1 took 4412 us
+I1005 05:16:01.819894 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 0 read #226554 took 7450 us
+I1005 05:16:01.819890 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 32 read #213720 took 7446 us
+I1005 05:16:01.819937 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 0 read #229542 took 7494 us
+I1005 05:16:01.819932 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 0 read #230474 took 7488 us
+I1005 05:16:01.836678 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 1 read #234482 took 7467 us
+I1005 05:16:01.836668 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 1 read #217756 took 7457 us
+I1005 05:16:01.836674 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 1 read #230491 took 7463 us
+I1005 05:16:01.836683 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 1 read #233584 took 7471 us
+I1005 05:16:01.844242 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 2 read #234482 took 7543 us
+I1005 05:16:01.844267 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 2 read #233584 took 7468 us
+I1005 05:16:01.844260 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 2 read #230491 took 7486 us
+I1005 05:16:01.844253 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 2 read #217756 took 7499 us
+I1005 05:16:01.851860 3085085 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 3 rail 3 read #234482 took 7587 us
+I1005 05:16:01.851871 3085084 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 2 rail 3 read #233584 took 7567 us
+I1005 05:16:01.851876 3085083 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 1 rail 3 read #230491 took 7555 us
+I1005 05:16:01.851881 3085082 libfabric_proxy.cpp:1769] EFA proxy profile: slow cq read: thread 0 rail 3 read #217756 took 7542 us
+I1005 05:16:04.139941 3084910 libfabric_proxy.cpp:1122] EFA proxy profile: pass period: n=4722484 mean=2.45us p50=2.05us p90=2.70us p99=10.65us max=68229.94us
+I1005 05:16:04.139963 3084910 libfabric_proxy.cpp:1122] EFA proxy profile: cq poll: n=4722488 mean=1.63us p50=0.95us p90=2.55us p99=10.50us max=68224.12us
+I1005 05:16:04.139972 3084910 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 0: events=449516 busy_ms=742.9 window_ms=2294.6 busy_pct=32.4
+I1005 05:16:04.139979 3084910 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 1: events=224758 busy_ms=443.3 window_ms=2252.5 busy_pct=19.7
+I1005 05:16:04.139985 3084910 libfabric_proxy.cpp:2571] EFA proxy cpu: thread 2: events=224758 busy_ms=447.6 window_ms=2227.6 busy_pct=20.1
+I1005 05:16:04.139993 3084910 libfabric_proxy.cpp:2594] EFA proxy rx: thread 0: entries=449516 reads=291499 sweeps=260173 window_ms=2294.6 sweep_ns_per_entry=1572.8 read_ns_per_entry=598.9 decode_ns_per_entry=26.2 entries_per_read=1.5 busy_pct=30.8 entries_per_s=195900.5 consumed_rx=0 deferred_atomics=0
+I1005 05:16:04.140010 3084910 libfabric_proxy.cpp:2594] EFA proxy rx: thread 1: entries=224758 reads=145246 sweeps=145211 window_ms=2252.5 sweep_ns_per_entry=1877.5 read_ns_per_entry=572.7 decode_ns_per_entry=22.8 entries_per_read=1.5 busy_pct=18.7 entries_per_s=99783.5 consumed_rx=0 deferred_atomics=0
+I1005 05:16:04.140034 3084910 libfabric_proxy.cpp:2594] EFA proxy rx: thread 2: entries=224758 reads=142888 sweeps=142824 window_ms=2227.6 sweep_ns_per_entry=1901.5 read_ns_per_entry=424.2 decode_ns_per_entry=22.5 entries_per_read=1.6 busy_pct=19.2 entries_per_s=100897.3 consumed_rx=0 deferred_atomics=0
