@@ -1,0 +1,6 @@
+ordering_rounds,2048
+ordering_sender_ms,126.781
+ordering_signals_per_s,64615.5
+ordering_payload_Gbit_s,171.536
+ordering_gpu_enqueue_us_per_op,12.1292
+ordering_gpu_final_wait_us,249.488

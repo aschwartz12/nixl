@@ -1,0 +1,4 @@
+job=7684447 nodes=pool0-[0038,0065] gpus/node=2 plan=expansion_fault_contraction.json master=pool0-0038
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0038 elastic.py exit=1

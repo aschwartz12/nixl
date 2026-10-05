@@ -1,0 +1,25 @@
+job=7684381 nodes=pool0-[0321,0736] gpus/node=2 plan=expansion_fault_contraction.json master=pool0-0321
+=== install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install channels= workers= params=efa_proxy_ordering=sender
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0321 elastic.py exit=1
+=== install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install channels= workers= params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0321 elastic.py exit=1
+=== install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install channels= workers= params=efa_proxy_ordering=sender
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0321 elastic.py exit=1
+=== install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install channels= workers= params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0321 elastic.py exit=1
+=== install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install channels= workers= params=efa_proxy_ordering=sender
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0321 elastic.py exit=1
+=== install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install channels= workers= params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0321 elastic.py exit=1

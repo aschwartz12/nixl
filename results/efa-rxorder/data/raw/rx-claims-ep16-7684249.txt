@@ -1,0 +1,129 @@
+job=7684249 nodes=pool0-[0321,0736,0991,1024] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_16.json
+base_install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-efa-cpu-proxy-ctr-install (commit=5a762a8e001abef27f3dab363a0152a1a3e217e7 built=2026-10-05T02:02:30-07:00)
+study_install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install (commit=8e9e25eedd3519db238c92bd563e37b34b6a8fca (built from the identical working tree: diff_sha=e0a11723177b vs 5a762a8e) built=2026-10-05T04:24:05-07:00)
+=== mode=sender rep=1 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=sender
+[rank 1] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.88 us, min_t=1767.94 us, max_t=2310.69 us
+[rank 0] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.79 us, min_t=1773.38 us, max_t=2222.27 us
+[rank 3] Dispatch + combine bandwidth: 11.63 GB/s, avg_t=1896.00 us, min_t=1765.31 us, max_t=2216.51 us
+[rank 2] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1893.90 us, min_t=1742.94 us, max_t=2261.22 us
+[rank 7] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.96 us, min_t=1779.62 us, max_t=2213.41 us
+[rank 4] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.71 us, min_t=1782.66 us, max_t=2246.02 us
+[rank 5] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.88 us, min_t=1774.24 us, max_t=2153.54 us
+[rank 11] Dispatch + combine bandwidth: 11.63 GB/s, avg_t=1895.11 us, min_t=1767.81 us, max_t=2190.50 us
+[rank 9] Dispatch + combine bandwidth: 11.63 GB/s, avg_t=1895.25 us, min_t=1744.83 us, max_t=2268.10 us
+[rank 10] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.77 us, min_t=1775.33 us, max_t=2185.02 us
+[rank 8] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.46 us, min_t=1775.04 us, max_t=2219.01 us
+[rank 12] Dispatch + combine bandwidth: 11.63 GB/s, avg_t=1895.01 us, min_t=1761.38 us, max_t=2177.38 us
+[rank 15] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.74 us, min_t=1781.70 us, max_t=2258.91 us
+[rank 14] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.46 us, min_t=1776.13 us, max_t=2160.29 us
+[rank 13] Dispatch + combine bandwidth: 11.63 GB/s, avg_t=1895.55 us, min_t=1764.64 us, max_t=2287.26 us
+[rank 6] Dispatch + combine bandwidth: 11.64 GB/s, avg_t=1894.82 us, min_t=1774.43 us, max_t=2185.70 us
+node=pool0-0321 elastic.py exit=0
+node=pool0-0991 elastic.py exit=0
+node=pool0-1024 elastic.py exit=0
+node=pool0-0736 elastic.py exit=0
+=== mode=rxrail rep=1 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+[rank 2] Dispatch + combine bandwidth: 11.39 GB/s, avg_t=1935.98 us, min_t=1864.48 us, max_t=2234.88 us
+[rank 1] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1937.46 us, min_t=1865.79 us, max_t=2265.38 us
+[rank 3] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1936.70 us, min_t=1847.07 us, max_t=2209.25 us
+[rank 7] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1936.97 us, min_t=1846.37 us, max_t=2208.61 us
+[rank 4] Dispatch + combine bandwidth: 11.39 GB/s, avg_t=1936.01 us, min_t=1851.65 us, max_t=2207.65 us
+[rank 0] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1937.90 us, min_t=1839.01 us, max_t=2262.75 us
+[rank 12] Dispatch + combine bandwidth: 11.39 GB/s, avg_t=1935.52 us, min_t=1852.80 us, max_t=2274.05 us
+[rank 8] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1936.69 us, min_t=1837.28 us, max_t=2227.62 us
+[rank 6] Dispatch + combine bandwidth: 11.39 GB/s, avg_t=1935.94 us, min_t=1855.01 us, max_t=2149.50 us
+[rank 5] Dispatch + combine bandwidth: 11.37 GB/s, avg_t=1938.68 us, min_t=1855.55 us, max_t=2262.59 us
+[rank 13] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1937.46 us, min_t=1865.25 us, max_t=2147.58 us
+[rank 14] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1938.21 us, min_t=1832.03 us, max_t=2298.34 us
+[rank 11] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1937.64 us, min_t=1855.39 us, max_t=2151.07 us
+[rank 10] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1936.98 us, min_t=1846.69 us, max_t=2165.98 us
+[rank 15] Dispatch + combine bandwidth: 11.38 GB/s, avg_t=1938.21 us, min_t=1860.51 us, max_t=2197.15 us
+[rank 9] Dispatch + combine bandwidth: 11.37 GB/s, avg_t=1938.37 us, min_t=1870.66 us, max_t=2241.12 us
+node=pool0-0736 elastic.py exit=0
+node=pool0-1024 elastic.py exit=0
+node=pool0-0991 elastic.py exit=0
+node=pool0-0321 elastic.py exit=0
+=== mode=sender rep=2 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=sender
+[rank 3] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.60 us, min_t=1783.62 us, max_t=2066.98 us
+[rank 1] Dispatch + combine bandwidth: 11.96 GB/s, avg_t=1843.24 us, min_t=1799.01 us, max_t=2102.37 us
+[rank 2] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.28 us, min_t=1764.45 us, max_t=2287.04 us
+[rank 0] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.14 us, min_t=1738.37 us, max_t=2043.94 us
+[rank 6] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.17 us, min_t=1778.05 us, max_t=2116.22 us
+[rank 4] Dispatch + combine bandwidth: 11.96 GB/s, avg_t=1843.05 us, min_t=1769.54 us, max_t=2117.79 us
+[rank 5] Dispatch + combine bandwidth: 11.96 GB/s, avg_t=1843.13 us, min_t=1770.82 us, max_t=2168.90 us
+[rank 14] Dispatch + combine bandwidth: 11.96 GB/s, avg_t=1842.95 us, min_t=1778.94 us, max_t=2048.58 us
+[rank 13] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.18 us, min_t=1783.42 us, max_t=2190.85 us
+[rank 15] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.52 us, min_t=1780.70 us, max_t=2108.10 us
+[rank 11] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.14 us, min_t=1787.20 us, max_t=2030.40 us
+[rank 10] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1841.60 us, min_t=1764.32 us, max_t=2143.78 us
+[rank 12] Dispatch + combine bandwidth: 11.96 GB/s, avg_t=1842.93 us, min_t=1775.04 us, max_t=2188.99 us
+[rank 7] Dispatch + combine bandwidth: 11.96 GB/s, avg_t=1843.39 us, min_t=1780.61 us, max_t=2223.90 us
+[rank 8] Dispatch + combine bandwidth: 11.97 GB/s, avg_t=1842.55 us, min_t=1773.34 us, max_t=2093.86 us
+[rank 9] Dispatch + combine bandwidth: 11.96 GB/s, avg_t=1842.93 us, min_t=1768.10 us, max_t=2049.92 us
+node=pool0-0991 elastic.py exit=0
+node=pool0-1024 elastic.py exit=0
+node=pool0-0736 elastic.py exit=0
+node=pool0-0321 elastic.py exit=0
+=== mode=rxrail rep=2 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+[rank 2] Dispatch + combine bandwidth: 10.44 GB/s, avg_t=2112.89 us, min_t=1862.18 us, max_t=5740.67 us
+[rank 0] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2112.97 us, min_t=1853.89 us, max_t=5700.99 us
+[rank 1] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2113.95 us, min_t=1865.47 us, max_t=5671.94 us
+[rank 3] Dispatch + combine bandwidth: 10.42 GB/s, avg_t=2115.35 us, min_t=1822.37 us, max_t=5710.14 us
+[rank 13] Dispatch + combine bandwidth: 10.44 GB/s, avg_t=2112.50 us, min_t=1862.82 us, max_t=5890.94 us
+[rank 7] Dispatch + combine bandwidth: 10.42 GB/s, avg_t=2114.98 us, min_t=1850.78 us, max_t=5750.59 us
+[rank 6] Dispatch + combine bandwidth: 10.44 GB/s, avg_t=2112.68 us, min_t=1849.66 us, max_t=5709.89 us
+[rank 4] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2113.93 us, min_t=1862.08 us, max_t=5725.06 us
+[rank 5] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2113.86 us, min_t=1836.61 us, max_t=5707.84 us
+[rank 10] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2113.72 us, min_t=1869.50 us, max_t=5721.25 us
+[rank 9] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2113.01 us, min_t=1879.17 us, max_t=5677.18 us
+[rank 11] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2114.78 us, min_t=1846.02 us, max_t=5793.73 us
+[rank 8] Dispatch + combine bandwidth: 10.42 GB/s, avg_t=2115.28 us, min_t=1854.43 us, max_t=5699.49 us
+[rank 12] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2114.07 us, min_t=1855.07 us, max_t=5680.13 us
+[rank 15] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2113.50 us, min_t=1858.46 us, max_t=5712.29 us
+[rank 14] Dispatch + combine bandwidth: 10.43 GB/s, avg_t=2114.69 us, min_t=1844.35 us, max_t=5710.56 us
+node=pool0-1024 elastic.py exit=0
+node=pool0-0736 elastic.py exit=0
+node=pool0-0321 elastic.py exit=0
+node=pool0-0991 elastic.py exit=0
+=== mode=sender rep=3 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=sender
+[rank 1] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.63 us, min_t=1780.86 us, max_t=2119.97 us
+[rank 3] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.97 us, min_t=1778.43 us, max_t=2111.04 us
+[rank 0] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.05 us, min_t=1782.27 us, max_t=2124.06 us
+[rank 2] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.87 us, min_t=1761.54 us, max_t=2030.43 us
+[rank 13] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.10 us, min_t=1775.07 us, max_t=2149.34 us
+[rank 10] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.54 us, min_t=1775.68 us, max_t=2117.70 us
+[rank 9] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.51 us, min_t=1791.36 us, max_t=2125.12 us
+[rank 5] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.76 us, min_t=1799.39 us, max_t=2184.38 us
+[rank 12] Dispatch + combine bandwidth: 11.88 GB/s, avg_t=1855.54 us, min_t=1801.28 us, max_t=2160.74 us
+[rank 14] Dispatch + combine bandwidth: 11.88 GB/s, avg_t=1855.22 us, min_t=1763.10 us, max_t=2057.41 us
+[rank 15] Dispatch + combine bandwidth: 11.88 GB/s, avg_t=1855.45 us, min_t=1779.01 us, max_t=2115.36 us
+[rank 6] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.58 us, min_t=1768.58 us, max_t=2035.23 us
+[rank 8] Dispatch + combine bandwidth: 11.88 GB/s, avg_t=1855.28 us, min_t=1787.94 us, max_t=2127.78 us
+[rank 4] Dispatch + combine bandwidth: 11.89 GB/s, avg_t=1854.29 us, min_t=1785.98 us, max_t=2129.54 us
+[rank 7] Dispatch + combine bandwidth: 11.88 GB/s, avg_t=1855.34 us, min_t=1776.83 us, max_t=2099.33 us
+[rank 11] Dispatch + combine bandwidth: 11.88 GB/s, avg_t=1855.32 us, min_t=1774.30 us, max_t=2125.38 us
+node=pool0-0321 elastic.py exit=0
+node=pool0-0991 elastic.py exit=0
+node=pool0-0736 elastic.py exit=0
+node=pool0-1024 elastic.py exit=0
+=== mode=rxrail rep=3 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+[rank 0] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1982.13 us, min_t=1851.17 us, max_t=2102.78 us
+[rank 1] Dispatch + combine bandwidth: 11.13 GB/s, avg_t=1981.87 us, min_t=1873.09 us, max_t=2093.06 us
+[rank 3] Dispatch + combine bandwidth: 11.13 GB/s, avg_t=1981.49 us, min_t=1898.56 us, max_t=2078.24 us
+[rank 12] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1982.48 us, min_t=1875.01 us, max_t=2108.99 us
+[rank 5] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1981.94 us, min_t=1862.91 us, max_t=2105.12 us
+[rank 13] Dispatch + combine bandwidth: 11.13 GB/s, avg_t=1981.51 us, min_t=1867.07 us, max_t=2079.23 us
+[rank 7] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1983.54 us, min_t=1891.87 us, max_t=2078.34 us
+[rank 10] Dispatch + combine bandwidth: 11.13 GB/s, avg_t=1981.34 us, min_t=1844.45 us, max_t=2052.83 us
+[rank 6] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1982.48 us, min_t=1867.94 us, max_t=2064.32 us
+[rank 9] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1982.51 us, min_t=1902.30 us, max_t=2054.94 us
+[rank 11] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1982.48 us, min_t=1860.54 us, max_t=2108.29 us
+[rank 2] Dispatch + combine bandwidth: 11.11 GB/s, avg_t=1984.01 us, min_t=1897.50 us, max_t=2101.22 us
+[rank 15] Dispatch + combine bandwidth: 11.13 GB/s, avg_t=1981.36 us, min_t=1878.46 us, max_t=2094.02 us
+[rank 14] Dispatch + combine bandwidth: 11.11 GB/s, avg_t=1983.86 us, min_t=1896.26 us, max_t=2067.10 us
+[rank 8] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1983.22 us, min_t=1886.56 us, max_t=2063.30 us
+[rank 4] Dispatch + combine bandwidth: 11.12 GB/s, avg_t=1983.32 us, min_t=1867.17 us, max_t=2084.48 us
+node=pool0-1024 elastic.py exit=0
+node=pool0-0991 elastic.py exit=0
+node=pool0-0321 elastic.py exit=0
+node=pool0-0736 elastic.py exit=0

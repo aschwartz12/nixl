@@ -1,0 +1,11 @@
+NCCL version 2.28.8+cuda13.0
+
+[2026-10-05 06:14:01] pool0-0516:3940198:3940198 [0] ras/client_support.cc:178 NCCL WARN Call to bind failed: Address already in use
+Note: This test measures full round-trip latency
+Warmup iterations: 500
+Normal iterations: 5000
+Message size range: 8 to 8 bytes
+size(B)     latency (us)
+8            59.77       
+[MPI Rank 1] Success 
+[MPI Rank 0] Success 

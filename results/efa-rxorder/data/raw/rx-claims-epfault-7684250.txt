@@ -1,0 +1,27 @@
+job=7684250 nodes=pool0-[0327,0979] gpus/node=2 plan=expansion_fault_contraction.json
+base_install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-efa-cpu-proxy-ctr-install (commit=5a762a8e001abef27f3dab363a0152a1a3e217e7 built=2026-10-05T02:02:30-07:00)
+study_install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install (commit=8e9e25eedd3519db238c92bd563e37b34b6a8fca (built from the identical working tree: diff_sha=e0a11723177b vs 5a762a8e) built=2026-10-05T04:24:05-07:00)
+=== mode=sender rep=1 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=sender
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0327 elastic.py exit=1
+=== mode=rxrail rep=1 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0327 elastic.py exit=1
+=== mode=sender rep=2 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=sender
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0327 elastic.py exit=1
+=== mode=rxrail rep=2 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0327 elastic.py exit=1
+=== mode=sender rep=3 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=sender
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0327 elastic.py exit=1
+=== mode=rxrail rep=3 install=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder-ctr-install params=efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail
+    raise RuntimeError(
+RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1)
+node=pool0-0327 elastic.py exit=1

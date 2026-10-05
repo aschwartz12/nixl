@@ -233,3 +233,58 @@ spread; this allocation was also faster overall.)
 - Pitfall: two of these two-node jobs submitted at once can land on the same nodes and
   slow each other to timeouts; their results were discarded and the runs repeated
   back-to-back (all reported jobs ran alone).
+
+## Follow-up: checks of "adopt receiver-side ordering with rail-affine receiving"
+
+Run after the study to test that recommendation's claims (scripts:
+`results/efa-rxorder/scripts/rxorder-claims.sbatch`, `ep-modes.sbatch`; data:
+`results/efa-rxorder/data/raw/*claims*`).
+
+**NCCL GIN on the same nodes** (job 7684248, pool0-0516/0762; GIN = NCCL 2.28.8
+`put_signal_ping_pong_gin`, aws-ofi-nccl GIN proxy, libfabric 2.5.1 `efa-direct`; ours =
+libfabric 2.1 `efa`; median of 3):
+
+| 8 B put+signal ping-pong, full round trip | us |
+|---|---|
+| NCCL GIN proxy | 59.9 (59.8-61.5) |
+| this proxy, sender fence | 101.3 (100.9-101.9) |
+| this proxy, receiver (rail) | 53.8 (53.7-53.9) |
+
+Put+signal completion at the sender: 67.3 (sender) vs 44.3 us (receiver); 8 B put 33.8
+us in both. GIN completes `iputSignal` at the source on local completion only (32.4 us
+measured in milestone 3), not when the target applied the signal as here.
+
+**GDAKI on EFA is not available on these nodes**: `efadv_query_device` reports
+`comp_cntr=0` and `cq_ext_mem_dmabuf=0` on all 32 EFA devices (p5.48xlarge, efa driver
+2.15.0g); EFA GIN GDAKI needs both, and offers weak (per-put) signals only.
+
+**A two-node ordering test that catches violations** (ordering check, 4 ch x 2048 rounds,
+`NIXL_EFA_PROXY_INJECT=eagain_every=3`, 3 runs per mode):
+
+| Signal | Mode | Runs with data missing at signal time | Mismatched words |
+|---|---|---|---|
+| atomicAdd | fence off | 3 of 3 | 16384-32768 |
+| atomicAdd | sender | 0 of 3 | 0 |
+| atomicAdd | receiver (rail) | 0 of 3 | 0 |
+| 8-byte value put ("PUT_VALUE") | sender | 3 of 3 | 16384-32768 |
+| 8-byte value put ("PUT_VALUE") | receiver (rail) | 2 of 3 | 16384-34896 |
+
+Without injected back-pressure, value puts showed no violation in 6 runs (and fence off
+none in 3): the race needs a retried put. A value put is placed by the NIC directly, so
+no target-side counting can hold it back.
+
+**nixl_ep at 16 ranks** (4 nodes x 4 GPUs, static 16-rank plan, modes interleaved, two
+allocations):
+
+| | job 7684249 | job 7684444 |
+|---|---|---|
+| sender | 11.89 (11.64-11.97) | 11.89 (11.34-11.97) |
+| receiver (rail) | 11.12 (10.43-11.38), -6.5% | 10.96 (10.66-11.29), -7.8% |
+| receiver (rail), no flush | - | 11.29 (2 runs), -5% |
+
+The third no-flush run hung in connection setup ("Handshake from peer '15' not received
+after 60s"): 1 hang in 9 receiver runs at 16 ranks, 0 in 6 sender runs.
+
+**Fault plan (rank killed mid-dispatch)**: inconclusive. On 2026-10-05 it failed before
+its first phase for every build and mode, including 5a762a8, which passed it the day
+before (jobs 7684250, 7684381, 7684447).

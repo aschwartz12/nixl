@@ -1,0 +1,6 @@
+== pool0-0516
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-5b6b2977-1372-16b8-3766-8251affa4d36)
+/opt/amazon/efa/bin/fi_info: 2.1.0amzn1.0
+== pool0-0762
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-069a6a92-8a39-4de2-8d8a-1208257e3123)
+/opt/amazon/efa/bin/fi_info: 2.1.0amzn1.0

@@ -1,0 +1,2 @@
+parts=valueinject reps=3
+study_build=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/build/nixl-rxorder commit=06d3ea2706a78694bd800e7ae712c38dfb1bcb87 dirty=0 built=2026-10-05T06:12:11-07:00
