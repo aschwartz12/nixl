@@ -851,14 +851,20 @@ nixlLibfabricRail::progressCompletionQueue() {
 void
 nixlLibfabricRail::pollForCompletions() {
     struct fi_cq_data_entry cq_buf[16];
-    int cq_ret = fi_cq_read(cq, cq_buf, 16);
+    struct fi_cq_err_entry err_entry = {};
+    int cq_ret;
+    {
+        const std::lock_guard<std::mutex> ep_lock(ep_mutex_); // see insertAddress()
+        cq_ret = fi_cq_read(cq, cq_buf, 16);
+        if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
+            fi_cq_readerr(cq, &err_entry, 0);
+        }
+    }
     if (cq_ret > 0) {
         for (int c = 0; c < cq_ret; c++) {
             processCompletionQueueEntry(&cq_buf[c]);
         }
     } else if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
-        struct fi_cq_err_entry err_entry = {};
-        fi_cq_readerr(cq, &err_entry, 0);
         NIXL_ERROR << "CQ error in drain interleave on rail " << rail_id << ": "
                    << fi_strerror(err_entry.err);
     }
@@ -1725,7 +1731,16 @@ nixlLibfabricRail::insertAddress(const void *addr, fi_addr_t *fi_addr_out) const
         return NIXL_ERR_BACKEND;
     }
 
-    int ret = fi_av_insert(av, addr, 1, fi_addr_out, 0, NULL);
+    // Under the endpoint lock, like every CQ read on this rail: the efa provider
+    // (libfabric 2.1) inserts under the AV lock and then takes the domain lock,
+    // while a CQ read holds the domain lock and takes the AV lock to resolve a
+    // packet from a peer not in the AV yet. Concurrently (an application thread
+    // connecting while a proxy or progress thread reads the CQ), they deadlock.
+    int ret;
+    {
+        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        ret = fi_av_insert(av, addr, 1, fi_addr_out, 0, NULL);
+    }
     if (ret != 1) {
         NIXL_ERROR << "fi_av_insert failed on rail " << rail_id << ": " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
@@ -1745,7 +1760,11 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
         return NIXL_ERR_BACKEND;
     }
 
-    int ret = fi_av_remove(av, &fi_addr, 1, 0);
+    int ret;
+    {
+        const std::lock_guard<std::mutex> ep_lock(ep_mutex_); // see insertAddress()
+        ret = fi_av_remove(av, &fi_addr, 1, 0);
+    }
     if (ret != 0) {
         NIXL_ERROR << "fi_av_remove failed on rail " << rail_id << ": " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
