@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -113,6 +114,11 @@ twoCounterReceiverKernel(unsigned long long *a,
     out[1] = bv;
 }
 
+/**
+ * Parameter: the backend, optionally with a receiver-side ordering variant:
+ * LIBFABRIC_receiver (efa_proxy_ordering=receiver), LIBFABRIC_rxrail (the same,
+ * with each put counted by the target thread of its rail).
+ */
 class ProxyOrderingTest : public testing::TestWithParam<std::string> {
 protected:
     static constexpr size_t kSender = 0;
@@ -121,15 +127,39 @@ protected:
 
     std::string
     backend() const {
-        return GetParam();
+        return GetParam().substr(0, GetParam().find('_'));
+    }
+
+    bool
+    receiverOrdering() const {
+        return GetParam() == "LIBFABRIC_receiver" || GetParam() == "LIBFABRIC_rxrail";
     }
 
     nixl_b_params_t
     backendParams() const {
-        return {{"device_proxy", "true"},
-                {"proxy_channel_count", std::to_string(kChannels)},
-                {"proxy_thread_count", std::to_string(kProxyThreads)},
-                {"proxy_max_peers", "2"}};
+        nixl_b_params_t params = {{"device_proxy", "true"},
+                                  {"proxy_channel_count", std::to_string(kChannels)},
+                                  {"proxy_thread_count", std::to_string(kProxyThreads)},
+                                  {"proxy_max_peers", "2"}};
+        if (receiverOrdering()) {
+            params.emplace("efa_proxy_ordering", "receiver");
+        }
+        if (GetParam() == "LIBFABRIC_rxrail") {
+            params.emplace("efa_proxy_rx_thread", "rail");
+        }
+        // Experiments: extra receiver-ordering parameters, "key=value,...".
+        const char *extra = std::getenv("NIXL_GTEST_EFA_PROXY_RX_PARAMS");
+        if (receiverOrdering() && extra != nullptr) {
+            std::stringstream items(extra);
+            std::string item;
+            while (std::getline(items, item, ',')) {
+                const size_t eq = item.find('=');
+                if (eq != std::string::npos) {
+                    params[item.substr(0, eq)] = item.substr(eq + 1);
+                }
+            }
+        }
+        return params;
     }
 
     void
@@ -425,9 +455,14 @@ protected:
 
     std::vector<std::unique_ptr<::gtest::LogIgnoreGuard>> ignore_;
 
-    /** The failed put's round and every later round must stay unsignalled. */
+    /**
+     * The failed put's round and every later round must stay unsignalled. With
+     * receiver ordering and @p put_landed (an injected completion error on a put
+     * that did reach the target), the target may still apply those rounds' adds,
+     * having their data: then every round it signalled must have its data.
+     */
     void
-    runFailedPutCheck(const std::string &spec) {
+    runFailedPutCheck(const std::string &spec, bool put_landed = false) {
         createAgentsInjecting(spec);
         if (IsSkipped() || HasFatalFailure()) {
             return;
@@ -452,6 +487,17 @@ protected:
 
         releaseViews(b);
 
+        if (receiverOrdering() && put_landed) {
+            uint64_t counter = 0;
+            ASSERT_EQ(cudaMemcpy(&counter, b.dst, sizeof(counter), cudaMemcpyDeviceToHost),
+                      cudaSuccess);
+            const unsigned signalled = static_cast<unsigned>(counter / kCounterStep);
+            Logger() << "receiver ordering: " << signalled << " round(s) signalled at the target, "
+                     << kFailRound << " before the failed completion";
+            EXPECT_GE(signalled, kFailRound);
+            checkTarget(b, layout, signalled);
+            return;
+        }
         // Exactly the rounds before the failed put were signalled, with their data.
         checkTarget(b, layout, kFailRound);
     }
@@ -470,7 +516,7 @@ TEST_P(ProxyFaultTest, FailedPostStopsLaterSignals) {
 }
 
 TEST_P(ProxyFaultTest, FailedCompletionStopsLaterSignals) {
-    runFailedPutCheck("cq_error_at=" + std::to_string(kFailRequest));
+    runFailedPutCheck("cq_error_at=" + std::to_string(kFailRequest), /*put_landed=*/true);
 }
 
 // Without GDRCopy the target adds through CUDA copies; they must not wait for a
@@ -648,10 +694,19 @@ namespace {
     }
 } // namespace
 
-INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyOrderingTest, testing::Values("LIBFABRIC"), testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy,
+                         ProxyOrderingTest,
+                         testing::Values("LIBFABRIC", "LIBFABRIC_receiver", "LIBFABRIC_rxrail"),
+                         testName);
 
-INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyFaultTest, testing::Values("LIBFABRIC"), testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy,
+                         ProxyFaultTest,
+                         testing::Values("LIBFABRIC", "LIBFABRIC_receiver", "LIBFABRIC_rxrail"),
+                         testName);
 
-INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyAtomicTest, testing::Values("LIBFABRIC"), testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy,
+                         ProxyAtomicTest,
+                         testing::Values("LIBFABRIC", "LIBFABRIC_receiver", "LIBFABRIC_rxrail"),
+                         testName);
 
 } // namespace gtest::nixl::gpu::proxy_ordering

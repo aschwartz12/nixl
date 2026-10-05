@@ -99,7 +99,7 @@ TEST(LibfabricProxyConnInfoTest, EmptyProxySection) {
     EXPECT_TRUE(proxy_part.empty());
 
     std::vector<ci::EpName> parsed;
-    EXPECT_EQ(ci::parse(ci::serialize({}), parsed), NIXL_SUCCESS);
+    EXPECT_EQ(ci::parse(ci::serialize(std::vector<ci::EpName>{}), parsed), NIXL_SUCCESS);
     EXPECT_TRUE(parsed.empty());
 }
 
@@ -151,6 +151,7 @@ TEST(LibfabricProxyConnInfoTest, ShortNamesArePadded) {
     nixlSerDes sd = proxyBlob("1");
     const char short_name[] = {'\x01', '\0', '\x02'};
     sd.addBuf(std::string(ci::kEpTagPrefix) + "0", short_name, sizeof(short_name));
+    sd.addStr(ci::kRailsTag, "0");
     std::vector<ci::EpName> parsed;
     ASSERT_EQ(ci::parse(sd.exportStr(), parsed), NIXL_SUCCESS);
     ASSERT_EQ(parsed.size(), 1u);
@@ -181,6 +182,66 @@ TEST(LibfabricProxyConnInfoTest, OtherProtocolVersionIsRejected) {
     old.addBuf(std::string(ci::kEpTagPrefix) + "0", homes[0].data(), homes[0].size());
     std::vector<ci::EpName> parsed;
     EXPECT_EQ(ci::parse(old.exportStr(), parsed), NIXL_ERR_MISMATCH);
+}
+
+// A proxy that accepts puts with remote CQ data (receiver ordering) also
+// publishes its data EPs per thread and rail, and its incarnation.
+TEST(LibfabricProxyConnInfoTest, DataEndpointsRoundTrip) {
+    ci::ProxyEps eps;
+    eps.home = {epName(0), epName(1)};
+    eps.data_rails = {16, 17, 19};
+    eps.data = {{epName(10), epName(11), epName(12)}, {epName(20), epName(21), epName(22)}};
+    eps.incarnation = 0xfedcba9876543210ull;
+    ci::ProxyEps parsed;
+    for (const bool by_rail : {false, true}) {
+        eps.rx_by_rail = by_rail;
+        ASSERT_EQ(ci::parse(ci::serialize(eps), parsed), NIXL_SUCCESS);
+        EXPECT_EQ(parsed.home, eps.home);
+        EXPECT_EQ(parsed.data_rails, eps.data_rails);
+        EXPECT_EQ(parsed.data, eps.data);
+        EXPECT_EQ(parsed.incarnation, eps.incarnation);
+        EXPECT_EQ(parsed.rx_by_rail, by_rail);
+    }
+
+    // Without data EPs (sender ordering) only the home EPs come back.
+    eps.data.clear();
+    ASSERT_EQ(ci::parse(ci::serialize(eps), parsed), NIXL_SUCCESS);
+    EXPECT_EQ(parsed.home, eps.home);
+    EXPECT_TRUE(parsed.data.empty());
+    EXPECT_TRUE(parsed.data_rails.empty());
+
+    // Claiming more rails than it carries is malformed.
+    nixlSerDes sd = proxyBlob("1");
+    sd.addBuf(std::string(ci::kEpTagPrefix) + "0", eps.home[0].data(), eps.home[0].size());
+    sd.addStr(ci::kRailsTag, "2");
+    sd.addStr(ci::kIncarnationTag, "7");
+    sd.addStr(ci::kRxThreadTag, "ring");
+    sd.addStr(std::string(ci::kRailTagPrefix) + "0", "3");
+    sd.addStr(std::string(ci::kRailTagPrefix) + "1", "4");
+    const ci::EpName data = epName(30);
+    sd.addBuf(std::string(ci::kDataEpTagPrefix) + "0_0", data.data(), data.size());
+    EXPECT_EQ(ci::parse(sd.exportStr(), parsed), NIXL_ERR_MISMATCH);
+    EXPECT_TRUE(parsed.home.empty());
+}
+
+TEST(LibfabricProxyWireTest, PutImmediateCarriesRingAndEpoch) {
+    namespace wire = nixlLibfabricProxyWire;
+    const uint32_t imm = wire::ringImm(wire::kMaxRingKey, 5);
+    EXPECT_EQ(wire::immRing(imm), wire::kMaxRingKey);
+    EXPECT_EQ(wire::immSlot(imm), 5u);
+    // Epochs wrap: the slot of epoch e + kRingEpochs is e's.
+    EXPECT_EQ(wire::immSlot(wire::ringImm(7, 3 + wire::kRingEpochs)), 3u);
+    EXPECT_EQ(wire::immRing(wire::ringImm(7, 3 + wire::kRingEpochs)), 7u);
+    // Rings spread over the target's threads.
+    std::vector<size_t> hits(4, 0);
+    for (uint32_t id = 1; id <= 4096; ++id) {
+        const uint32_t t = wire::ringThread(id * 2654435761u & wire::kMaxRingKey, 4);
+        ASSERT_LT(t, 4u);
+        ++hits[t];
+    }
+    for (size_t t = 0; t < hits.size(); ++t) {
+        EXPECT_GT(hits[t], 768u) << "thread " << t;
+    }
 }
 
 TEST(LibfabricProxyWireTest, EveryCounterHasOneOwner) {

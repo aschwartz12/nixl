@@ -26,6 +26,14 @@
  *                                     device phases
  *   NIXL_PROXY_BENCH_DEVICE_PROXY=0   create the backend without the device proxy
  *                                     (host transfers only; for proxy on/off A/B)
+ *   NIXL_PROXY_BENCH_BACKEND_PARAMS   extra backend parameters, "key=value,key=value"
+ *   NIXL_PROXY_BENCH_PIPE_SIZES       pipelined put sizes, comma-separated (default
+ *                                     8192,65536,1048576)
+ *   NIXL_PROXY_BENCH_PIPE_BYTES       bytes per pipelined trial over all channels
+ *                                     (default: fixed iteration counts per size)
+ *   NIXL_PROXY_BENCH_PIPE_TRIALS      pipelined trials per size (default 5)
+ *   NIXL_PROXY_BENCH_CONCURRENT_HOST=1  host-path 1 MiB writes from a CPU thread
+ *                                     while each pipelined trial runs ("HOST-concurrent")
  *   NIXL_PROXY_BENCH_PUT_ONLY, NIXL_PROXY_BENCH_COUNTER_HOST, NIXL_PROXY_BENCH_MIN_SIZE
  */
 #include <cuda_runtime.h>
@@ -35,6 +43,7 @@
 #include "proxy_ordering.cuh"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
@@ -658,6 +667,26 @@ main(int argc, char **argv) {
             if (const char *idle = std::getenv("NIXL_EFA_PROXY_IDLE_POLL_US")) {
                 backend_params.emplace("efa_proxy_idle_poll_us", idle);
             }
+            if (const char *extra = std::getenv("NIXL_PROXY_BENCH_BACKEND_PARAMS")) {
+                std::stringstream items(extra);
+                std::string item;
+                while (std::getline(items, item, ',')) {
+                    const size_t eq = item.find('=');
+                    if (item.empty()) {
+                        continue;
+                    }
+                    if (eq == std::string::npos || eq == 0) {
+                        throw std::runtime_error(
+                            "NIXL_PROXY_BENCH_BACKEND_PARAMS items must be key=value");
+                    }
+                    backend_params[item.substr(0, eq)] = item.substr(eq + 1);
+                }
+            }
+            if (rank == 0) {
+                for (const auto &[key, value] : backend_params) {
+                    std::cout << "backend_param," << key << '=' << value << '\n';
+                }
+            }
         }
         checkNixl(agent.createBackend(backend_name, backend_params, backend),
                   "create transport backend");
@@ -1062,12 +1091,80 @@ main(int argc, char **argv) {
 
             // Keep pipeline_window operations outstanding. For sub-threshold
             // sizes, successive LIBFABRIC transfers rotate across selected rails.
-            for (const size_t size : skip_pipelined ? std::vector<size_t>{} :
-                                                      std::vector<size_t>{8192, 65536, 1048576}) {
+            std::vector<size_t> pipe_sizes{8192, 65536, 1048576};
+            if (const char *list = std::getenv("NIXL_PROXY_BENCH_PIPE_SIZES")) {
+                pipe_sizes.clear();
+                std::stringstream items(list);
+                std::string item;
+                while (std::getline(items, item, ',')) {
+                    const size_t size = std::stoul(item);
+                    if (size == 0 || size > max_size) {
+                        throw std::runtime_error("NIXL_PROXY_BENCH_PIPE_SIZES must be in [1, " +
+                                                 std::to_string(max_size) + "]");
+                    }
+                    pipe_sizes.push_back(size);
+                }
+            }
+            const uint64_t pipe_bytes = [] {
+                const char *value = std::getenv("NIXL_PROXY_BENCH_PIPE_BYTES");
+                return value == nullptr ? 0ull : std::stoull(value);
+            }();
+            const uint32_t pipe_trials =
+                unsignedFromEnvironment("NIXL_PROXY_BENCH_PIPE_TRIALS", trials, 100);
+            const bool concurrent_host = skip("NIXL_PROXY_BENCH_CONCURRENT_HOST");
+
+            // Host-path writes of the whole buffer (1 MiB descriptors, 8 requests in
+            // flight) from a CPU thread while a pipelined trial runs.
+            constexpr uint32_t host_window = 8;
+            std::vector<nixlXferReqH *> host_requests;
+            if (concurrent_host) {
+                nixl_xfer_dlist_t local_descs(VRAM_SEG);
+                nixl_xfer_dlist_t remote_descs(VRAM_SEG);
+                local_descs.addDesc(
+                    nixlBasicDesc(reinterpret_cast<uintptr_t>(src), max_size, kDeviceId));
+                remote_descs.addDesc(nixlBasicDesc(remote.dst_addr, max_size, kDeviceId));
+                host_requests.assign(host_window, nullptr);
+                for (auto &request : host_requests) {
+                    checkNixl(agent.createXferReq(
+                                  NIXL_WRITE, local_descs, remote_descs, peer_name, request),
+                              "create concurrent host transfer");
+                }
+                verified_extent = max_size;
+            }
+            std::atomic<bool> host_stop{false};
+            uint64_t host_rounds = 0;
+            uint64_t host_ns = 0;
+            const auto host_loop = [&] {
+                const auto start = std::chrono::steady_clock::now();
+                uint64_t rounds = 0;
+                while (!host_stop.load(std::memory_order_relaxed)) {
+                    for (auto *request : host_requests) {
+                        const nixl_status_t status = agent.postXferReq(request);
+                        if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
+                            checkNixl(status, "post concurrent host transfer");
+                        }
+                    }
+                    for (auto *request : host_requests) {
+                        nixl_status_t status;
+                        while ((status = agent.getXferStatus(request)) == NIXL_IN_PROG) {}
+                        checkNixl(status, "complete concurrent host transfer");
+                    }
+                    ++rounds;
+                }
+                host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+                host_rounds = rounds;
+            };
+
+            for (const size_t size : skip_pipelined ? std::vector<size_t>{} : pipe_sizes) {
                 if (size < minimum_size) {
                     continue;
                 }
-                const uint32_t iterations = pipelineIterationCount(size);
+                const uint32_t iterations = pipe_bytes == 0 ?
+                    pipelineIterationCount(size) :
+                    static_cast<uint32_t>(std::max<uint64_t>(
+                        pipeline_window * 2, pipe_bytes / size / pipeline_channels));
                 const uint32_t pipeline_warmup_iterations = pipeline_window * 2;
                 verified_extent = std::max<uint64_t>(verified_extent, size);
 
@@ -1098,7 +1195,12 @@ main(int argc, char **argv) {
                         pipeline_channels;
                 }
 
-                for (uint32_t trial = 1; trial <= trials; ++trial) {
+                for (uint32_t trial = 1; trial <= pipe_trials; ++trial) {
+                    std::thread host_thread;
+                    if (concurrent_host) {
+                        host_stop = false;
+                        host_thread = std::thread(host_loop);
+                    }
                     runPipelinedPutBenchmark<<<1, pipeline_channels>>>({src_mvh, 0, 0},
                                                                        {dst_mvh, 0, 0},
                                                                        size,
@@ -1106,6 +1208,18 @@ main(int argc, char **argv) {
                                                                        pipeline_window,
                                                                        device_result);
                     checkCuda(cudaDeviceSynchronize(), "run pipelined PUT benchmark");
+                    if (concurrent_host) {
+                        host_stop = true;
+                        host_thread.join();
+                        const double bytes = double(host_rounds) * host_window * max_size;
+                        std::cout << "HOST-concurrent," << max_size << ',' << trial << ','
+                                  << host_rounds * host_window << ','
+                                  << (host_rounds != 0 ?
+                                          host_ns / 1000.0 / double(host_rounds * host_window) :
+                                          0.0)
+                                  << ',' << (host_ns != 0 ? bytes * 8.0 / host_ns : 0.0)
+                                  << std::endl;
+                    }
                     printResult("PUT-pipelined",
                                 size,
                                 trial,
@@ -1133,6 +1247,9 @@ main(int argc, char **argv) {
                 }
             }
 
+            for (auto *request : host_requests) {
+                checkNixl(agent.releaseXferReq(request), "release concurrent host transfer");
+            }
             checkCuda(cudaFree(device_result), "free result");
             writeFileAtomically(coord_dir / "done",
                                 std::to_string(expected_signals) + " " +
