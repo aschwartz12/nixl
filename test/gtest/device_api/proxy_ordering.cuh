@@ -176,6 +176,74 @@ senderKernel(nixlMemViewH src,
     result->final_wait_ns[channel] = globalTimeNs() - wait_start;
 }
 
+/**
+ * Like senderKernel, but each round's signal is an 8-byte put of the counter's new
+ * value ("PUT_VALUE") instead of an atomicAdd: nothing orders it after the round's
+ * puts. The value is staged in the source buffer's counter area (8 slots per
+ * channel, each reused once its previous put completed).
+ */
+__global__ void
+valueSenderKernel(nixlMemViewH src,
+                  nixlMemViewH dst,
+                  uint8_t *src_buf,
+                  Layout layout,
+                  unsigned long long timeout_ns,
+                  Result *result) {
+    constexpr unsigned kSlots = kCounterStride / sizeof(unsigned long long);
+    const unsigned channel = blockIdx.x;
+    nixlGpuXferStatusH slot_status[kSlots];
+    bool slot_busy[kSlots] = {};
+    nixl_status_t status = NIXL_SUCCESS;
+    unsigned long long enqueue_ns = 0;
+    const unsigned long long deadline = globalTimeNs() + timeout_ns;
+
+    for (unsigned round = 0; round < layout.rounds && status == NIXL_SUCCESS; ++round) {
+        size_t offset = layout.roundOffset(channel, round);
+        enqueue_ns -= globalTimeNs();
+        for (unsigned put = 0; put < kPutsPerRound; ++put) {
+            if (nixlPut<nixl_gpu_level_t::THREAD>(
+                    {src, 0, offset}, {dst, 0, offset}, putSize(put), channel) != NIXL_IN_PROG) {
+                status = NIXL_ERR_BACKEND;
+                break;
+            }
+            offset += putSize(put);
+        }
+        const unsigned slot = round % kSlots;
+        if (status == NIXL_SUCCESS && slot_busy[slot]) {
+            do {
+                status = nixlGpuGetXferStatus<nixl_gpu_level_t::THREAD>(slot_status[slot]);
+            } while (status == NIXL_IN_PROG && globalTimeNs() < deadline);
+        }
+        const size_t value_offset = channel * kCounterStride + slot * sizeof(unsigned long long);
+        if (status == NIXL_SUCCESS) {
+            *reinterpret_cast<volatile unsigned long long *>(src_buf + value_offset) =
+                (round + 1) * kCounterStep;
+            __threadfence_system();
+            slot_status[slot] = nixlGpuXferStatusH{};
+            if (nixlPut<nixl_gpu_level_t::THREAD>({src, 0, value_offset},
+                                                  {dst, 0, channel * kCounterStride},
+                                                  sizeof(unsigned long long),
+                                                  channel,
+                                                  0,
+                                                  &slot_status[slot]) != NIXL_IN_PROG) {
+                status = NIXL_ERR_BACKEND;
+            }
+            slot_busy[slot] = true;
+        }
+        enqueue_ns += globalTimeNs();
+    }
+    const unsigned long long wait_start = globalTimeNs();
+    for (unsigned slot = 0; slot < kSlots && status == NIXL_SUCCESS; ++slot) {
+        while (slot_busy[slot] &&
+               (status = nixlGpuGetXferStatus<nixl_gpu_level_t::THREAD>(slot_status[slot])) ==
+                   NIXL_IN_PROG &&
+               globalTimeNs() < deadline) {}
+    }
+    result->sender_status[channel] = status;
+    result->enqueue_ns[channel] = enqueue_ns;
+    result->final_wait_ns[channel] = globalTimeNs() - wait_start;
+}
+
 /** One block per channel: follow the counter and check the rounds it covers. */
 __global__ void
 receiverKernel(uint8_t *buf, Layout layout, unsigned long long timeout_ns, Result *result) {

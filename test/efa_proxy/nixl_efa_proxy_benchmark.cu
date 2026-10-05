@@ -21,6 +21,8 @@
  *   NIXL_PROXY_BENCH_ORDERING_ROUNDS  >0 runs the put -> atomicAdd ordering check
  *                                     (proxy_ordering.cuh) first, per channel
  *   NIXL_PROXY_BENCH_ORDERING_ONLY    1 stops after the ordering check
+ *   NIXL_PROXY_BENCH_ORDERING_SIGNAL  put: signal each round with an 8-byte put of the
+ *                                     counter value instead of an atomicAdd
  *   NIXL_PROXY_BENCH_SKIP_{PINGPONG,SERIAL,PIPELINED}=1 skip that phase
  *   NIXL_PROXY_BENCH_HOST_XFER=1      host-path writes (postXferReq) instead of the
  *                                     device phases
@@ -795,6 +797,7 @@ main(int argc, char **argv) {
             cudaFuncAttributes attr;
             checkCuda(cudaFuncGetAttributes(&attr, po::receiverKernel), "load receiver");
             checkCuda(cudaFuncGetAttributes(&attr, po::senderKernel), "load sender");
+            checkCuda(cudaFuncGetAttributes(&attr, po::valueSenderKernel), "load value sender");
             if (rank == 1) {
                 po::receiverKernel<<<pipeline_channels, 256>>>(
                     static_cast<uint8_t *>(ordering_buf), ordering_layout, timeout_ns, result);
@@ -820,8 +823,21 @@ main(int argc, char **argv) {
                 checkCuda(cudaEventCreate(&start), "create event");
                 checkCuda(cudaEventCreate(&stop), "create event");
                 checkCuda(cudaEventRecord(start), "record start");
-                po::senderKernel<<<pipeline_channels, 1>>>(
-                    local_mvh, remote_mvh, ordering_layout, timeout_ns, result);
+                // NIXL_PROXY_BENCH_ORDERING_SIGNAL=put: signal with an 8-byte put of
+                // the counter value instead of an atomicAdd (nothing orders it).
+                const char *signal_env = std::getenv("NIXL_PROXY_BENCH_ORDERING_SIGNAL");
+                if (signal_env != nullptr && std::string(signal_env) == "put") {
+                    po::valueSenderKernel<<<pipeline_channels, 1>>>(
+                        local_mvh,
+                        remote_mvh,
+                        static_cast<uint8_t *>(ordering_buf),
+                        ordering_layout,
+                        timeout_ns,
+                        result);
+                } else {
+                    po::senderKernel<<<pipeline_channels, 1>>>(
+                        local_mvh, remote_mvh, ordering_layout, timeout_ns, result);
+                }
                 checkCuda(cudaEventRecord(stop), "record stop");
                 checkCuda(cudaDeviceSynchronize(), "run ordering sender");
                 float ms = 0;
