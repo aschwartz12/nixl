@@ -51,6 +51,14 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     // Remote device-proxy threads' home EP names (atomicAdd targets); empty if
     // the peer did not publish a proxy section.
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> remote_proxy_ep_names_;
+    // Its data EPs per [thread][rail] if it accepts puts with remote CQ data
+    // (receiver-side ordering), and the incarnation they belong to.
+    std::vector<std::vector<std::array<char, LF_EP_NAME_MAX_LEN>>> remote_proxy_data_ep_names_;
+    uint64_t remote_proxy_incarnation_ = 0;
+    // The rails it accepts them on, in its order, and whether the destination
+    // rail (rather than the ring) picks the thread that counts a put.
+    std::vector<uint32_t> remote_proxy_data_rails_;
+    bool remote_proxy_rx_by_rail_ = false;
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
     // Handshake received state.

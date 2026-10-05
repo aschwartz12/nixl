@@ -56,6 +56,8 @@ public:
         ATOMIC_APPLY, // target side: applying one received atomicAdd
         RETRY_WAIT, // a back-pressured post's time in the thread's retry queue
         POST_EAGAIN, // post calls that returned -FI_EAGAIN (n = how many)
+        RX_ORDER_WAIT, // target side: a receiver-ordered atomicAdd's wait for its ring
+        RX_FLUSH, // target side: cudaDeviceFlushGPUDirectRDMAWrites before such adds
         LOOP_COUNT
     };
 
@@ -104,8 +106,14 @@ public:
         static const char *ops[] = {"put", "atomic"};
         static const char *classes[] = {"<=64B", "<=4KiB", "<=64KiB", "<=1MiB", ">1MiB"};
         static const char *stages[] = {"submit->post", "post->done", "done->collect", "residence"};
-        static const char *loops[] = {
-            "pass period", "cq poll", "post call", "atomic apply", "retry wait", "post -FI_EAGAIN"};
+        static const char *loops[] = {"pass period",
+                                      "cq poll",
+                                      "post call",
+                                      "atomic apply",
+                                      "retry wait",
+                                      "post -FI_EAGAIN",
+                                      "rx order wait",
+                                      "rx flush"};
         std::vector<std::string> lines;
         for (size_t o = 0; o < OP_COUNT; ++o) {
             for (size_t c = 0; c < kSizeClasses; ++c) {

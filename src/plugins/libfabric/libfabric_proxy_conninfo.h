@@ -34,9 +34,15 @@
  *   "<engine blob><proxy blob><8-byte proxy blob length>EFAPRXY1"
  *
  * The proxy blob carries the proxy protocol version and the home EP name of
- * every proxy thread (targets of atomicAdd records). A peer without the proxy
- * sends only the engine blob, which split() returns unchanged; a peer with
- * another protocol version is rejected by parse(), so no atomicAdd is sent to it.
+ * every proxy thread (targets of atomicAdd records). A proxy that accepts puts
+ * with remote CQ data (receiver-side ordering) also publishes the rails it
+ * receives them on (those of its GPU), every thread's data EP name on each, and a
+ * random incarnation id that changes whenever the proxy is re-created (senders
+ * restart their per-ring counts with it). The whole connection info travels in
+ * the engine's handshake, whose size is limited: hence only those rails. A peer without
+ * the proxy sends only the engine blob, which split() returns unchanged; a peer
+ * with another protocol version is rejected by parse(), so no atomicAdd is sent
+ * to it.
  */
 namespace nixlLibfabricProxyConnInfo {
 
@@ -47,26 +53,92 @@ inline constexpr size_t kMagicLen = sizeof(kMagic) - 1;
 inline constexpr char kVersionTag[] = "efa_proxy_version";
 inline constexpr char kThreadsTag[] = "efa_proxy_threads";
 inline constexpr char kEpTagPrefix[] = "efa_proxy_ep_";
+inline constexpr char kRailsTag[] = "efa_proxy_data_rails";
+inline constexpr char kRailTagPrefix[] = "efa_proxy_data_rail_";
+inline constexpr char kDataEpTagPrefix[] = "efa_proxy_data_ep_";
+inline constexpr char kIncarnationTag[] = "efa_proxy_incarnation";
+inline constexpr char kRxThreadTag[] = "efa_proxy_rx_thread";
 
-/** Proxy blob for the given home EP names, one per proxy thread. */
+/** A peer's proxy endpoints. */
+struct ProxyEps {
+    std::vector<EpName> home; // per proxy thread: control EP (atomicAdd records, acks)
+    // Rails that accept puts with remote CQ data (none if the peer does not), and
+    // data[thread][i]: that thread's data EP on rail data_rails[i].
+    std::vector<uint32_t> data_rails;
+    std::vector<std::vector<EpName>> data;
+    uint64_t incarnation = 0;
+    // Which thread counts a put: the ring's (ringThread()), or the destination
+    // rail's (rail data_rails[i] belongs to thread i % threads).
+    bool rx_by_rail = false;
+};
+
+/** Proxy blob for the given endpoints (data and incarnation only if eps.data is set). */
 inline std::string
-serialize(const std::vector<EpName> &home_eps) {
+serialize(const ProxyEps &eps) {
     nixlSerDes sd;
     sd.addStr(kVersionTag, std::to_string(nixlLibfabricProxyWire::kVersion));
-    sd.addStr(kThreadsTag, std::to_string(home_eps.size()));
-    for (size_t t = 0; t < home_eps.size(); ++t) {
-        sd.addBuf(kEpTagPrefix + std::to_string(t), home_eps[t].data(), home_eps[t].size());
+    sd.addStr(kThreadsTag, std::to_string(eps.home.size()));
+    for (size_t t = 0; t < eps.home.size(); ++t) {
+        sd.addBuf(kEpTagPrefix + std::to_string(t), eps.home[t].data(), eps.home[t].size());
+    }
+    const size_t rails = eps.data.empty() ? 0 : eps.data_rails.size();
+    sd.addStr(kRailsTag, std::to_string(rails));
+    if (rails != 0) {
+        sd.addStr(kIncarnationTag, std::to_string(eps.incarnation));
+        sd.addStr(kRxThreadTag, eps.rx_by_rail ? "rail" : "ring");
+        for (size_t i = 0; i < rails; ++i) {
+            sd.addStr(kRailTagPrefix + std::to_string(i), std::to_string(eps.data_rails[i]));
+        }
+        for (size_t t = 0; t < eps.data.size(); ++t) {
+            for (size_t i = 0; i < rails; ++i) {
+                const EpName &name = eps.data[t][i];
+                sd.addBuf(kDataEpTagPrefix + std::to_string(t) + "_" + std::to_string(i),
+                          name.data(),
+                          name.size());
+            }
+        }
     }
     return sd.exportStr();
 }
 
+/** Proxy blob with home EPs only (a proxy that accepts no remote CQ data). */
+inline std::string
+serialize(const std::vector<EpName> &home_eps) {
+    ProxyEps eps;
+    eps.home = home_eps;
+    return serialize(eps);
+}
+
+namespace detail {
+    inline bool
+    getName(nixlSerDes &sd, const std::string &tag, EpName &name) {
+        name = EpName{};
+        const ssize_t len = sd.getBufLen(tag);
+        return len > 0 && static_cast<size_t>(len) <= name.size() &&
+            sd.getBuf(tag, name.data(), len) == NIXL_SUCCESS;
+    }
+
+    inline bool
+    getCount(nixlSerDes &sd, const char *tag, uint64_t &value) {
+        try {
+            size_t used = 0;
+            const std::string text = sd.getStr(tag);
+            value = std::stoull(text, &used);
+            return used == text.size();
+        }
+        catch (const std::exception &) {
+            return false;
+        }
+    }
+} // namespace detail
+
 /**
- * Parse a proxy blob; an empty blob means no proxy. On error @p home_eps is empty:
+ * Parse a proxy blob; an empty blob means no proxy. On error @p eps is empty:
  * NIXL_ERR_MISMATCH for a malformed blob or another protocol version.
  */
 inline nixl_status_t
-parse(const std::string &blob, std::vector<EpName> &home_eps) {
-    home_eps.clear();
+parse(const std::string &blob, ProxyEps &eps) {
+    eps = ProxyEps{};
     if (blob.empty()) {
         return NIXL_SUCCESS;
     }
@@ -77,25 +149,61 @@ parse(const std::string &blob, std::vector<EpName> &home_eps) {
     if (sd.getStr(kVersionTag) != std::to_string(nixlLibfabricProxyWire::kVersion)) {
         return NIXL_ERR_MISMATCH;
     }
-    size_t count = 0;
-    try {
-        count = std::stoul(sd.getStr(kThreadsTag));
-    }
-    catch (const std::exception &) {
+    uint64_t threads = 0;
+    uint64_t rails = 0;
+    if (!detail::getCount(sd, kThreadsTag, threads)) {
         return NIXL_ERR_MISMATCH;
     }
-    for (size_t t = 0; t < count; ++t) {
-        const std::string tag = kEpTagPrefix + std::to_string(t);
-        EpName name{};
-        const ssize_t len = sd.getBufLen(tag);
-        if (len <= 0 || static_cast<size_t>(len) > name.size() ||
-            sd.getBuf(tag, name.data(), len) != NIXL_SUCCESS) {
-            home_eps.clear();
+    ProxyEps out;
+    for (size_t t = 0; t < threads; ++t) {
+        EpName name;
+        if (!detail::getName(sd, kEpTagPrefix + std::to_string(t), name)) {
             return NIXL_ERR_MISMATCH;
         }
-        home_eps.push_back(name);
+        out.home.push_back(name);
     }
+    if (!detail::getCount(sd, kRailsTag, rails)) {
+        return NIXL_ERR_MISMATCH;
+    }
+    if (rails != 0) {
+        if (!detail::getCount(sd, kIncarnationTag, out.incarnation)) {
+            return NIXL_ERR_MISMATCH;
+        }
+        const std::string rx_thread = sd.getStr(kRxThreadTag);
+        if (rx_thread != "ring" && rx_thread != "rail") {
+            return NIXL_ERR_MISMATCH;
+        }
+        out.rx_by_rail = rx_thread == "rail";
+        for (size_t i = 0; i < rails; ++i) {
+            uint64_t rail = 0;
+            if (!detail::getCount(sd, (kRailTagPrefix + std::to_string(i)).c_str(), rail) ||
+                rail > UINT32_MAX) {
+                return NIXL_ERR_MISMATCH;
+            }
+            out.data_rails.push_back(static_cast<uint32_t>(rail));
+        }
+        out.data.assign(threads, std::vector<EpName>(rails));
+        for (size_t t = 0; t < threads; ++t) {
+            for (size_t i = 0; i < rails; ++i) {
+                const std::string tag =
+                    kDataEpTagPrefix + std::to_string(t) + "_" + std::to_string(i);
+                if (!detail::getName(sd, tag, out.data[t][i])) {
+                    return NIXL_ERR_MISMATCH;
+                }
+            }
+        }
+    }
+    eps = std::move(out);
     return NIXL_SUCCESS;
+}
+
+/** parse() for callers that only need the home EPs. */
+inline nixl_status_t
+parse(const std::string &blob, std::vector<EpName> &home_eps) {
+    ProxyEps eps;
+    const nixl_status_t status = parse(blob, eps);
+    home_eps = std::move(eps.home);
+    return status;
 }
 
 /** Append a proxy blob to the engine's connection info. */

@@ -20,6 +20,7 @@
 #ifdef HAVE_NIXL_DEVICE_API
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -27,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -61,6 +63,11 @@ struct nixlLibfabricConnection;
  *    non-blocking stream (VRAM without GDRCopy) or a CPU atomic (DRAM), and acks
  *    with the result: an atomicAdd completes once applied, and a failure at the
  *    target reaches the sender's GPU.
+ *  - efa_proxy_ordering=receiver (opt-in prototype) orders at the target
+ *    instead: every put fragment carries its ring's key as remote CQ data and goes
+ *    to one data EP of the target per ring, whose thread counts it; an atomicAdd
+ *    is sent at once with its ring's put count and sequence number, and its owner
+ *    applies it once the ring's received puts and applied atomicAdds reach them.
  *
  * Threading: ProxyWorker owns channel c on thread c % effectiveThreadCount() and
  * calls submit/check_completion/progress/quiesce for a ring only from that
@@ -120,6 +127,9 @@ private:
     struct Thread;
     struct CounterMap;
     struct Inject;
+    struct TxRing;
+    struct RxRing;
+    struct Deferred;
 
     // nixlProxyBackendOps callbacks.
     nixl_status_t
@@ -183,6 +193,9 @@ private:
     handleRecv(Thread &th, RecvBuf *buf, size_t len);
     void
     handleAtomic(Thread &th, const nixlLibfabricProxyWire::atomicAddMsg &msg);
+    /** Apply a received atomicAdd now and ack it with the result. */
+    void
+    applyAndAck(Thread &th, const nixlLibfabricProxyWire::atomicAddMsg &msg, fi_addr_t reply);
     void
     handleAck(Thread &th, const nixlLibfabricProxyWire::atomicAckMsg &ack);
     fi_addr_t
@@ -194,6 +207,43 @@ private:
     postAck(Thread &th, const PendingAck &ack);
     nixl_status_t
     applyAtomic(Thread &th, uint64_t addr, uint64_t value);
+    /** Make completed RDMA writes to the GPU of @p addr visible to it (receiver ordering). */
+    nixl_status_t
+    flushRdmaWrites(Thread &th, uint64_t addr);
+
+    // Receiver-side ordering (and the test-only immediate-data puts).
+    /** The sender-side counts of a ring (channel, peer) to @p conn; re-keyed after a failure. */
+    TxRing *
+    txRing(Thread &th,
+           RingFence &fence,
+           const std::shared_ptr<nixlLibfabricConnection> &conn,
+           uint32_t ring);
+    /** Fail the atomicAdds after a failed operation of @p req's ring, as the fence does. */
+    void
+    failRing(Thread &th, Request *req, nixl_status_t status);
+    /** A put fragment with remote CQ data @p imm arrived: count it for its ring and epoch. */
+    void
+    handleImm(Thread &th, uint32_t imm);
+    RxRing *
+    rxRing(Thread &th, uint32_t ring_key);
+    /** Apply the deferred atomicAdds whose rings caught up; expire overdue ones. */
+    void
+    drainDeferred(Thread &th);
+    /** Apply @p d (its puts arrived and were flushed) if it is its ring's next one. */
+    bool
+    tryApplyDeferred(Thread &th, Deferred &d);
+    fi_addr_t
+    dataAddr(Thread &th,
+             PeerAddrs &pa,
+             const nixlLibfabricConnection &conn,
+             size_t rail,
+             size_t remote_thread,
+             size_t remote_rail);
+    /** The target thread that counts a put of ring @p key landing on @p remote_rail. */
+    static size_t
+    rxThread(const nixlLibfabricConnection &conn, uint32_t key, size_t remote_rail);
+    void
+    reportRx() const;
 #ifdef HAVE_CUDA
     nixl_status_t
     addWithCuda(Thread &th, int device_id, uint64_t addr, uint64_t value);
@@ -227,6 +277,30 @@ private:
     bool rail_per_thread_ = true; // efa_proxy_rail_policy: "thread" (default) or "ring"
     uint64_t idle_poll_ns_ = 0; // efa_proxy_idle_poll_us (0: poll on every pass)
     bool profile_ = false; // NIXL_EFA_PROXY_PROFILE: per-stage timers, logged at shutdown
+    bool rx_trace_ = false; // NIXL_EFA_PROXY_RXTRACE: log early receiver-ordering events
+    // efa_proxy_ordering: put -> atomicAdd order kept by the sender's fence (default)
+    // or by the target (receiver).
+    bool receiver_order_ = false;
+    // Test-only (ignored in NDEBUG builds): sender ordering with puts carrying
+    // remote CQ data to the target's proxy data EPs (efa_proxy_test_put_imm), and
+    // atomicAdds sent without waiting for anything (efa_proxy_test_fence_off: no
+    // ordering at all).
+    bool test_put_imm_ = false;
+    bool test_fence_off_ = false;
+    size_t test_data_rx_post_ = 0; // efa_proxy_test_data_rx_post: receives per data EP
+    // efa_proxy_rx_flush (receiver ordering, default on): flush GPUDirect RDMA writes
+    // to the counter's GPU before applying adds whose puts arrived. A put's CQ entry
+    // only says the NIC wrote it: without the flush the GPU was seen to read a put
+    // still in flight after its counter moved (the counter write takes another path).
+    bool rx_flush_ = true;
+    size_t data_rx_size_ = 0; // efa_proxy_data_rx_size: data EP receive queue size
+    // Puts carry remote CQ data to proxy data EPs; this proxy also accepts them.
+    bool imm_puts_ = false;
+    // efa_proxy_rx_thread: the thread that counts a put with remote CQ data is the
+    // ring's (ring, default) or the one polling the destination rail (rail).
+    bool rx_by_rail_ = false;
+    uint64_t incarnation_ = 0; // published; peers restart their ring counts with it
+    std::vector<uint32_t> rx_rails_; // data CQs every thread polls when imm_puts_
     std::unique_ptr<Inject> inject_; // NIXL_EFA_PROXY_INJECT: tests only, off under NDEBUG
     std::vector<std::unique_ptr<Thread>> thread_state_;
 
@@ -254,6 +328,11 @@ private:
     std::mutex regions_write_mutex_; // serializes registration changes
     std::multimap<uintptr_t, Region> regions_;
     std::unique_ptr<CounterMap> counters_;
+
+    // Target-side ring state, shared by the thread that counts a ring's puts and
+    // the owners of its counters; never freed while the proxy lives.
+    std::mutex rx_rings_mutex_;
+    std::unordered_map<uint32_t, std::unique_ptr<RxRing>> rx_rings_;
 };
 
 #endif // HAVE_NIXL_DEVICE_API
