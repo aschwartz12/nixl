@@ -1,0 +1,93 @@
+10:52:32.485832 tid=2632854 HSDIAG 10 av-insert-begin 10
+10:52:33.196558 tid=2632854 HSDIAG 10 av-insert-end 10 ms=710
+10:52:33.871042 tid=2632854 HSDIAG 10 load-begin 0
+10:52:33.871069 tid=2632854 HSDIAG 10 load-locked 0
+10:52:33.871076 tid=2632854 HSDIAG 10 av-insert-begin 0
+10:52:34.576898 tid=2632854 HSDIAG 10 av-insert-end 0 ms=705
+10:52:34.576934 tid=2632854 HSDIAG 10 create 0 drained=0
+10:52:34.584166 tid=2632854 HSDIAG 10 send-> 0 idx=1 piggy=3326 st=0
+10:52:34.584270 tid=2632854 HSDIAG 10 load-begin 1
+10:52:34.584275 tid=2632854 HSDIAG 10 load-locked 1
+10:52:34.584279 tid=2632854 HSDIAG 10 av-insert-begin 1
+10:52:34.603213 tid=2632854 HSDIAG 10 av-insert-end 1 ms=18
+10:52:34.603232 tid=2632854 HSDIAG 10 create 1 drained=0
+10:52:34.603280 tid=2632854 HSDIAG 10 send-> 1 idx=2 piggy=3326 st=0
+10:52:34.603309 tid=2632854 HSDIAG 10 load-begin 2
+10:52:34.603313 tid=2632854 HSDIAG 10 load-locked 2
+10:52:34.603316 tid=2632854 HSDIAG 10 av-insert-begin 2
+10:52:34.622181 tid=2632854 HSDIAG 10 av-insert-end 2 ms=18
+10:52:34.622196 tid=2632854 HSDIAG 10 create 2 drained=0
+10:52:34.622229 tid=2632854 HSDIAG 10 send-> 2 idx=3 piggy=3326 st=0
+10:52:34.622256 tid=2632854 HSDIAG 10 load-begin 3
+10:52:34.622260 tid=2632854 HSDIAG 10 load-locked 3
+10:52:34.622262 tid=2632854 HSDIAG 10 av-insert-begin 3
+10:52:34.641119 tid=2632854 HSDIAG 10 av-insert-end 3 ms=18
+10:52:34.641136 tid=2632854 HSDIAG 10 create 3 drained=0
+10:52:34.641169 tid=2632854 HSDIAG 10 send-> 3 idx=4 piggy=3326 st=0
+10:52:34.641195 tid=2632854 HSDIAG 10 load-begin 4
+10:52:34.641198 tid=2632854 HSDIAG 10 load-locked 4
+10:52:34.641201 tid=2632854 HSDIAG 10 av-insert-begin 4
+10:52:35.353987 tid=2632854 HSDIAG 10 av-insert-end 4 ms=712
+10:52:35.354016 tid=2632854 HSDIAG 10 create 4 drained=0
+10:52:35.354066 tid=2632854 HSDIAG 10 send-> 4 idx=5 piggy=3326 st=0
+10:52:35.354107 tid=2632854 HSDIAG 10 load-begin 5
+10:52:35.354113 tid=2632854 HSDIAG 10 load-locked 5
+10:52:35.354118 tid=2632854 HSDIAG 10 av-insert-begin 5
+10:52:35.380451 tid=2633505 HSDIAG 10 recv<- 0 idx=5 piggy=0
+10:52:35.381987 tid=2632854 HSDIAG 10 av-insert-end 5 ms=27
+10:52:35.382004 tid=2632854 HSDIAG 10 create 5 drained=0
+10:52:35.382022 tid=2633505 HSDIAG 10 hs-locked<- 0
+10:52:35.382029 tid=2633505 HSDIAG 10 applied<- 0
+10:52:35.382043 tid=1116083 HSDIAG 0 send-> 10 idx=5 piggy=0 st=0
+10:52:35.382145 tid=1116071 HSDIAG 1 send-> 10 idx=5 piggy=0 st=0
+10:52:35.386027 tid=2632854 HSDIAG 10 recv<- 1 idx=5 piggy=0
+10:52:35.386048 tid=2632854 HSDIAG 10 hs-locked<- 1
+10:52:35.386052 tid=2632854 HSDIAG 10 applied<- 1
+10:52:35.403864 tid=2632854 HSDIAG 10 send-> 5 idx=6 piggy=3326 st=0
+10:52:35.403905 tid=2632854 HSDIAG 10 load-begin 6
+10:52:35.403909 tid=2632854 HSDIAG 10 load-locked 6
+10:52:35.403912 tid=2632854 HSDIAG 10 av-insert-begin 6
+10:52:35.408368 tid=2633505 HSDIAG 10 recv<- 2 idx=7 piggy=0
+10:52:35.410007 tid=1116077 HSDIAG 2 send-> 10 idx=7 piggy=0 st=0
+10:52:35.423414 tid=2632854 HSDIAG 10 av-insert-end 6 ms=19
+10:52:35.423427 tid=2632854 HSDIAG 10 create 6 drained=0
+10:52:35.423442 tid=2633505 HSDIAG 10 hs-locked<- 2
+10:52:35.423454 tid=2633505 HSDIAG 10 applied<- 2
+10:52:35.423458 tid=2632854 HSDIAG 10 send-> 6 idx=7 piggy=3326 st=0
+10:52:35.423482 tid=2632854 HSDIAG 10 load-begin 7
+10:52:35.423486 tid=2632854 HSDIAG 10 load-locked 7
+10:52:35.423488 tid=2632854 HSDIAG 10 av-insert-begin 7
+10:52:35.423522 tid=2633505 HSDIAG 10 recv<- 7 idx=10 piggy=3327
+10:52:35.425650 tid=3399571 HSDIAG 7 send-> 10 idx=10 piggy=3327 st=0
+10:52:35.426017 tid=3399568 HSDIAG 6 send-> 10 idx=10 piggy=3326 st=0
+10:52:35.431452 tid=3399570 HSDIAG 4 send-> 10 idx=11 piggy=3325 st=0
+10:52:35.442216 tid=2632854 HSDIAG 10 av-insert-end 7 ms=18
+10:52:35.442229 tid=2632854 HSDIAG 10 create 7 drained=0
+10:52:35.442245 tid=2633505 HSDIAG 10 hs-locked<- 7
+10:52:35.442256 tid=2633505 HSDIAG 10 applied<- 7
+10:52:35.442260 tid=2632854 HSDIAG 10 send-> 7 idx=8 piggy=3326 st=0
+10:52:35.442284 tid=2632854 HSDIAG 10 load-begin 8
+10:52:35.442291 tid=2632854 HSDIAG 10 load-locked 8
+10:52:35.442293 tid=2632854 HSDIAG 10 av-insert-begin 8
+10:52:35.444025 tid=3399569 HSDIAG 9 send-> 10 idx=10 piggy=3329 st=0
+10:52:35.446429 tid=1116075 HSDIAG 3 send-> 10 idx=10 piggy=0 st=0
+10:52:35.455730 tid=2632852 HSDIAG 5 send-> 10 idx=11 piggy=0 st=0
+10:52:36.166760 tid=3399569 HSDIAG 9 wait<- 10
+10:52:36.170866 tid=1473348 HSDIAG 13 send-> 10 idx=11 piggy=3326 st=0
+10:52:36.172672 tid=1473347 HSDIAG 12 send-> 10 idx=11 piggy=3325 st=0
+10:52:36.185636 tid=1473346 HSDIAG 15 send-> 10 idx=11 piggy=3329 st=0
+10:52:36.187617 tid=1473345 HSDIAG 14 send-> 10 idx=11 piggy=3327 st=0
+10:52:36.527472 tid=1473348 HSDIAG 13 wait<- 10
+10:52:36.532678 tid=1473346 HSDIAG 15 wait<- 10
+10:52:36.537028 tid=1473345 HSDIAG 14 wait<- 10
+10:52:36.541195 tid=1473347 HSDIAG 12 wait<- 10
+10:53:36.167220 tid=3399569 HSDIAG 9 waitdone<- 10 ok=false
+10:53:36.167258 tid=3399569 Handshake from peer '10' not received after 60s; connection cannot be established.
+10:53:36.528330 tid=1473348 HSDIAG 13 waitdone<- 10 ok=false
+10:53:36.528365 tid=1473348 Handshake from peer '10' not received after 60s; connection cannot be established.
+10:53:36.533683 tid=1473346 HSDIAG 15 waitdone<- 10 ok=false
+10:53:36.533725 tid=1473346 Handshake from peer '10' not received after 60s; connection cannot be established.
+10:53:36.537835 tid=1473345 HSDIAG 14 waitdone<- 10 ok=false
+10:53:36.537874 tid=1473345 Handshake from peer '10' not received after 60s; connection cannot be established.
+10:53:36.541222 tid=1473347 HSDIAG 12 waitdone<- 10 ok=false
+10:53:36.541269 tid=1473347 Handshake from peer '10' not received after 60s; connection cannot be established.

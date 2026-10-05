@@ -1,0 +1,9 @@
+job=7687420 nodes=pool0-[0237,0331,0729,1223] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_16.json
+rx5-ep16ring-7687420.log === mode=base params=: per-run means ['6.33', '5.70'] median 6.01 GB/s; runs without a result: 1
+rx5-ep16ring-7687420.log === mode=basering params=efa_proxy_rail_policy=ring: per-run means ['4.73'] median 4.73 GB/s; runs without a result: 2
+rx5-ep16ring-7687420.log === mode=new params=: per-run means ['6.42', '5.61', '5.83'] median 5.83 GB/s; runs without a result: 0
+rx5-ep16ring-7687420.log === mode=newring params=efa_proxy_rail_policy=ring: per-run means ['4.60', '4.53', '4.57'] median 4.57 GB/s; runs without a result: 0
+handshake timeouts per run:
+  mode=base rep=2 6
+  mode=basering rep=1 14
+  mode=basering rep=3 14

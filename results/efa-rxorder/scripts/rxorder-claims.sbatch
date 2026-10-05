@@ -53,6 +53,7 @@ run() {
 
 params() {
     case $1 in
+    new) echo "" ;;
     sender) echo "efa_proxy_ordering=sender" ;;
     rxrail) echo "efa_proxy_ordering=receiver,efa_proxy_rx_thread=rail" ;;
     fenceoff) echo "efa_proxy_ordering=sender,efa_proxy_test_fence_off=1" ;;
@@ -94,7 +95,7 @@ for rep in $(seq 1 "${reps}"); do
         done
     fi
     if [[ " ${parts} " == *" inject "* ]]; then
-        for mode in fenceoff sender rxrail; do
+        for mode in ${INJECT_MODES:-fenceoff sender rxrail}; do
             run "${mode}-inject-${rep}" NIXL_PROXY_BENCH_BACKEND_PARAMS="$(params ${mode})" "${ord[@]}" \
                 NIXL_EFA_PROXY_INJECT=eagain_every=3
         done

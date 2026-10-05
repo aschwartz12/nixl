@@ -18,6 +18,8 @@
 # Env:
 #   MODES   ordering modes, run in this order within each repetition (default: base)
 #             base      baseline build (BASE_BUILD, efa-cpu-proxy 5a762a8)
+#             new       study build, receiver-side ordering only (defaults)
+#             newflush  new, with the GPUDirect RDMA flush forced on
 #             sender    study build, efa_proxy_ordering=sender (the default)
 #             imm       study build, sender ordering + test-only immediate-data puts
 #             imm4k     imm with 4096-entry data EP receive queues (efa_proxy_data_rx_size)
@@ -96,6 +98,8 @@ mode_build() {
 mode_params() {
     case $1 in
     base) echo "" ;;
+    new) echo "" ;;
+    newflush) echo "efa_proxy_rx_flush=1" ;;
     sender) echo "efa_proxy_ordering=sender" ;;
     imm) echo "efa_proxy_ordering=sender,efa_proxy_test_put_imm=1" ;;
     imm4k) echo "efa_proxy_ordering=sender,efa_proxy_test_put_imm=1,efa_proxy_data_rx_size=4096" ;;

@@ -1,0 +1,11 @@
+# back-pressure ordering check, mode new (7cd04926), job 7686344
+new-inject-1 exit=0
+new-inject-2 exit=0
+new-inject-3 exit=0
+new-inject-4 exit=0
+new-inject-5 exit=0
+new-inject-1: mismatches=0,regressions=0,torn=0,timed_out=0
+new-inject-2: mismatches=0,regressions=0,torn=0,timed_out=0
+new-inject-3: mismatches=0,regressions=0,torn=0,timed_out=0
+new-inject-4: mismatches=0,regressions=0,torn=0,timed_out=0
+new-inject-5: mismatches=0,regressions=0,torn=0,timed_out=0

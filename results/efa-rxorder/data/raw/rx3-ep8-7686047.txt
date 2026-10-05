@@ -1,0 +1,4 @@
+job=7686047 nodes=pool0-[0911,1140] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_8.json
+rx3-ep8-7686047.log === mode=base params=: per-run means ['14.27', '14.29', '14.16'] median 14.27 GB/s; runs without a result: 0
+rx3-ep8-7686047.log === mode=new params=: per-run means ['13.82', '13.57', '13.86'] median 13.82 GB/s; runs without a result: 0
+handshake timeouts per run:

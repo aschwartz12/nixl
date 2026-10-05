@@ -129,20 +129,26 @@ def ep_summary(paths):
         with open(path) as f:
             for line in f:
                 if line.startswith("=== install=") or line.startswith("=== mode="):
-                    if cur:
+                    if label is not None:
                         runs.append((label, cur))
                     label, cur = re.sub(r" rep=\d+", "", line.strip()), []
                 m = re.search(r"Dispatch \+ combine bandwidth: ([0-9.]+) GB/s", line)
                 if m:
                     cur.append(float(m.group(1)))
-        if cur:
+        if label is not None:
             runs.append((label, cur))
         by_label = collections.defaultdict(list)
+        failed = collections.Counter()
         for label, vals in runs:
-            by_label[label].append(statistics.mean(vals))
-        for label, means in by_label.items():
+            if vals:
+                by_label[label].append(statistics.mean(vals))
+            else:
+                failed[label] += 1  # hung (step time limit) or failed before any result
+        for label in dict.fromkeys(l for l, _ in runs):
+            means = by_label[label]
+            median = f" median {statistics.median(means):.2f} GB/s" if means else ""
             print(f"{os.path.basename(path)} {label}: per-run means {['%.2f' % m for m in means]}"
-                  f" median {statistics.median(means):.2f} GB/s")
+                  f"{median}; runs without a result: {failed[label]}")
 
 
 SWEEP_RE = re.compile(

@@ -12,6 +12,9 @@ logs: `results/efa-rxorder/data/`; scripts: `results/efa-rxorder/scripts/`.
 
 ## Recommendation
 
+> Superseded: receiver-side ordering is now the only mode (sender fence removed); see
+> "Receiver-only implementation" at the end.
+
 1. The per-write cost at the target is ~0.03 us to decode and count an entry, plus
    ~0.22-0.26 us of `fi_cq_read` per entry (0.34-0.37 us per entry for the whole CQ
    sweep with 4 threads): well below the ~1 us bar, in the 0.2-0.4 us range.
@@ -288,3 +291,126 @@ after 60s"): 1 hang in 9 receiver runs at 16 ranks, 0 in 6 sender runs.
 **Fault plan (rank killed mid-dispatch)**: inconclusive. On 2026-10-05 it failed before
 its first phase for every build and mode, including 5a762a8, which passed it the day
 before (jobs 7684250, 7684381, 7684447).
+
+## Receiver-only implementation (after the study)
+
+Decision: remove the sender fence; receiver-side ordering (rail-affine, per-epoch
+counts) is the only mode. Commits: 6bcd3f8b (implementation), fd7a0e55 and 7cd04926
+(two code-review passes), 0c253377 (connection-setup deadlock). Design, wire encoding
+and thread/endpoint mapping: `src/plugins/libfabric/EFA_PROXY_RECEIVER_ORDERING.md`.
+Baseline below ("base") is `efa-cpu-proxy` 5a762a8 (sender fence). Data:
+`results/efa-rxorder/data/raw/rx{3,4,5}-*`, `hsdiag16b-*`.
+
+**Tests** (each of fd7a0e55, 7cd04926, 0c253377): unit 162/162; device gtests 19/19
+(ordering under injected back-pressure, failed puts/atomics and ring aborts, handshake
+during metadata load); atomic and fault gtests 3 x 7. Two-node ordering check with
+injected back-pressure (`eagain_every=3`), 5 runs each on fd7a0e55 and 7cd04926: no
+data missing at signal time.
+
+**Micro-benchmarks** (two nodes, one GPU each, one allocation, 3 runs; job 7686044,
+fd7a0e55):
+
+| | base | receiver-only |
+|---|---|---|
+| ping-pong, 8 B put+signal each way (us) | 114.8 | 58.4 |
+| 8 B put+signal, completion at the sender (us) | 75.8 | 48.3 |
+| 64 KiB put+signal at the sender (us) | 88.4 | 60.9 |
+| ordering check, 4 ch (signals/s) | 50192 | 58948 (+17%) |
+| pipelined 64 KiB / 1 MiB, 4 ch (Gbit/s) | 290.8 / 389.8 | 287.3 / 389.7 |
+| target cores busy, ordering check / 16 KiB puts + host writes | - | 0.65 / 0.23 |
+
+(In that allocation the base build's host-write benchmark made no progress after its
+first trial in 3 of 3 runs; the receiver-only build's completed: 212.9 Gbit/s at 1 MiB.
+Not investigated. Job 7686343, 7cd04926: ping-pong 119.5 -> 60.5 us, signals/s
+47232 -> 57854.)
+
+### The connection-setup hang
+
+About one 16-rank nixl_ep run in four hung ("Handshake from peer 'N' not received
+after 60s"), in every build. Two engine bugs:
+
+1. A handshake that arrived between `handleHandshake()`'s peer lookup and its buffering
+   was lost (separate critical sections). Fixed in 6bcd3f8b; deterministic gtest
+   (`ProxyConnectionTest.HandshakeDuringMetadataLoad`: 60 s failure before, < 1 ms
+   after). The 16-rank hang persisted (2 of 8 runs, job 7686801).
+2. Agent-tagged handshake logs (`hsdiag.patch`) showed the peer everyone waited for
+   frozen: its application thread stopped inside `insertAllAddresses` for one peer
+   (`av-insert-begin` without `av-insert-end`), its proxy thread 0 at the same moment,
+   and peers sending to it spun on `-FI_EAGAIN`. Stacks of all its threads, printed
+   on a signal (`hang-dump-watch.sh`; ptrace is not allowed on these nodes):
+
+   ```
+   main:     nixlAgent::loadRemoteMD -> ... -> insertAllAddresses -> insertAddress ->
+             fi_av_insert -> libfabric.so.1 -> pthread_mutex_lock
+   proxy 0:  ProxyWorker::runOnce -> nixlLibfabricProxy::progress -> progressActiveRails ->
+             progressCompletionQueue -> fi_cq_read -> libfabric.so.1 -> pthread_mutex_lock
+   ```
+
+   A lock-order deadlock in the efa provider of libfabric 2.1 (EFA installer and NGC
+   container): the CQ read inserts a peer it does not know yet (the handshake it just
+   received) under the domain's SRX lock, and `fi_av_insert` takes the AV locks first.
+   libfabric 2.5's `efa_av.c` takes the SRX lock first in `fi_av_insert` "to prevent
+   deadlocks". Fixed in 0c253377: the engine's AV inserts and removals run under the
+   rail's endpoint lock, which every engine CQ read holds.
+
+| 16 ranks, hung runs | before 0c253377 | 0c253377 |
+|---|---|---|
+| base (5a762a8) | 1 of 1, 1 of 4 (jobs 7685206, 7686046) | 1 of 5 (job 7687222), 3 of 6 (7687420) |
+| receiver-only | 3 of 8 (7686046, flush on and off), 1 of 6 (7686595), 2 of 8 (7686801) | 0 of 5 (7687222), 0 of 6 (7687420) |
+
+(Job 7687420 includes runs with `efa_proxy_rail_policy=ring`. At the earlier rate of
+about one in four, 11 runs without a hang happen by chance with probability ~4%.)
+
+### The 16-rank throughput loss
+
+| nixl_ep, dispatch+combine (GB/s) | base | receiver-only | |
+|---|---|---|---|
+| 8 ranks, job 7686047 (fd7a0e55) | 14.27 (14.16-14.29) | 13.82 (13.57-13.86) | -3.2% |
+| 8 ranks, profiled, job 7686683 | 13.59 (13.58-13.60) | 13.10 (13.10-13.11) | -3.6% |
+| 8 ranks, job 7687223 (0c253377) | 8.70 (8.28-9.84) | 7.57 (6.79-9.07) | slow, noisy allocation |
+| 16 ranks, job 7687222 (0c253377) | 11.77 (11.43-11.96) | 11.22 (10.84-11.34) | -4.7% |
+| 16 ranks, job 7687420 (0c253377, slow allocation) | 6.01 (5.70-6.33) | 5.83 (5.61-6.42) | -3.0% |
+
+- The GPUDirect RDMA flush is no longer issued on Hopper/x86 (NCCL's rule,
+  `efa_proxy_rx_flush` overrides): about 3 of the 6.5-7.8 points measured before.
+- Where the rest goes (8 ranks, same allocation, mean per operation, job 7686854): a
+  signal (atomicAdd) completes 31 us sooner (232.7 -> 201.7 us submit to completion:
+  the saved round trip), but puts take 3-4% longer (post -> done 164.1 -> 169.4 us,
+  submit -> completion 181.3 -> 188.1 us). nixl_ep is bandwidth-bound, so it is the
+  puts that count.
+- Not the proxy CPU: the two proxy threads that carry nixl_ep's traffic are ~10% busy,
+  7 points of it counting puts (~300 ns each, ~113k per thread per 0.48 s); the other
+  two are idle (nixl_ep uses 2 channels: channel = local expert, 2 experts per rank).
+- Not the network: EFA hw counters per 16-rank run are identical in both builds
+  (3.90 M RDMA writes, 43.6 GB, 6.28 M packets each way) with no drops or retransmits
+  (job 7687222).
+- It is the write-with-immediate: each put now makes the target NIC write a completion,
+  and the step 2 sweep already measured that cost in a plain stream (sender fence,
+  4 threads): 0.878 -> 0.865 M writes/s at 16 KiB (-1.5%), 291 -> 285 Gbit/s at 64 KiB
+  (-2%). With EFA's unordered delivery, receiver-side ordering needs one per put.
+- Spreading a ring's puts over all of the GPU's rails (`efa_proxy_rail_policy=ring`)
+  would use the rails nixl_ep leaves idle, but costs more than it gains: 16 ranks, job
+  7687420, base 6.01 -> 4.73 GB/s, receiver-only 5.83 -> 4.57 GB/s (-22%; more threads
+  per rail domain, which serializes on its lock). The default stays `thread`.
+- So the remaining 3-5% at 8-16 ranks is the price of per-write immediates, against
+  signals that complete about a round trip sooner (2x lower put+signal latency in the
+  micro-benchmarks). Recovering it would take a hybrid (sender fence for bandwidth-bound
+  epochs), which this change deliberately removed.
+
+**Commands** (scripts in `results/efa-rxorder/scripts/`; same nodes and environment as
+above):
+
+- Builds and tests: `BUILD_DIR=build/nixl-rxorder scripts/build.sh`,
+  `BUILD_DIR=build/nixl-rxorder-ctr INSTALL_DIR=build/nixl-rxorder-ctr-install scripts/ctr-build.sh`
+  (in the container), `srun --cpus-per-task=24 scripts/rx-tests.sh`.
+- Micro-benchmarks: `MODES="base new" SUITES="c1 c4 ord ordp host conc" REPS=3 sbatch scripts/rxorder.sbatch`;
+  ordering under back-pressure: `PARTS=inject INJECT_MODES=new REPS=5 sbatch scripts/rxorder-claims.sbatch`.
+- nixl_ep: `EP_HWC_DIR=<dir> EP_PLAN=scripts/static_16.json REPS=5 EP_MODES="base new" sbatch --nodes=4 --gpus-per-node=4 scripts/ep-modes.sbatch`
+  (8 ranks: `--nodes=2`, `static_8.json`; each run is limited to `EP_STEP_MINUTES`=5 so a
+  hang costs one run, not the job); summaries `rxorder_summarize.py --ep <log>` and
+  `hwc_summarize.py <dir>` (EFA hw counter deltas per run).
+- Profiles: `NIXL_EFA_PROXY_PROFILE=1` (the base build prints its report at
+  `NIXL_LOG_LEVEL=INFO`).
+- Hang diagnosis: build with `scripts/hsdiag.patch` (agent-tagged handshake logs and a
+  stack dump on signal 44), run `EP_MODES=new` at 16 ranks, and
+  `scripts/hang-dump-watch.sh <job id>` alongside.

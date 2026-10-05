@@ -1,0 +1,218 @@
+--- a/src/plugins/libfabric/libfabric_backend.cpp
++++ b/src/plugins/libfabric/libfabric_backend.cpp
+@@ -41,6 +41,72 @@
+ #include <stdexcept>
+ #include <thread>
+ 
++#include <execinfo.h>
++#include <dirent.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
++namespace {
++std::atomic<int> g_hsdiag_bt_done{0};
++void hsdiagThreadBt(int) {
++    void *frames[64];
++    const int n = backtrace(frames, 64);
++    char comm[32] = {0};
++    char path[64];
++    const long tid = syscall(SYS_gettid);
++    snprintf(path, sizeof(path), "/proc/self/task/%ld/comm", tid);
++    int fd = open(path, O_RDONLY);
++    if (fd >= 0) {
++        ssize_t r = read(fd, comm, sizeof(comm) - 1);
++        if (r > 0 && comm[r - 1] == '\n') comm[r - 1] = 0;
++        close(fd);
++    }
++    char hdr[160];
++    const int len = snprintf(hdr, sizeof(hdr), "HSDIAG-BT begin pid=%d tid=%ld comm=%s frames=%d\n",
++                             getpid(), tid, comm, n);
++    ssize_t w = write(2, hdr, len);
++    backtrace_symbols_fd(frames, n, 2);
++    const int len2 = snprintf(hdr, sizeof(hdr), "HSDIAG-BT end pid=%d tid=%ld\n", getpid(), tid);
++    w = write(2, hdr, len2);
++    (void)w;
++    g_hsdiag_bt_done.store(1);
++}
++void hsdiagDumpAll(int) {
++    const long self = syscall(SYS_gettid);
++    DIR *d = opendir("/proc/self/task");
++    if (d == nullptr) return;
++    while (dirent *e = readdir(d)) {
++        if (e->d_name[0] == '.') continue;
++        const long tid = atol(e->d_name);
++        if (tid == self) { hsdiagThreadBt(0); continue; }
++        g_hsdiag_bt_done.store(0);
++        if (syscall(SYS_tgkill, getpid(), tid, SIGRTMIN + 11) != 0) continue;
++        for (int i = 0; i < 2000 && g_hsdiag_bt_done.load() == 0; ++i) {
++            struct timespec ts = {0, 100000};
++            nanosleep(&ts, nullptr);
++        }
++    }
++    closedir(d);
++}
++void hsdiagInstall() {
++    static std::atomic<bool> done{false};
++    if (done.exchange(true)) return;
++    void *f[2];
++    backtrace(f, 2); // load the unwinder outside a signal handler
++    struct sigaction sa = {};
++    sa.sa_handler = hsdiagDumpAll;
++    sa.sa_flags = SA_RESTART;
++    sigaction(SIGRTMIN + 10, &sa, nullptr);
++    sa.sa_handler = hsdiagThreadBt;
++    sigaction(SIGRTMIN + 11, &sa, nullptr);
++    NIXL_WARN << "HSDIAG backtrace dump on signal " << (SIGRTMIN + 10) << " pid " << getpid();
++}
++} // namespace
++
+ /****************************************
+  * Neuron Address Query
+  *****************************************/
+@@ -509,6 +575,7 @@
+       runtime_(FI_HMEM_SYSTEM) {
+ 
+     NIXL_INFO << "Initializing Libfabric Backend";
++    hsdiagInstall();
+ 
+     // this is required for loading rail selection policy by configuration
+     if (rail_manager_.init(getCustomParams()) != NIXL_SUCCESS) {
+@@ -785,13 +852,14 @@
+     }
+ 
+     std::shared_ptr<nixlLibfabricConnection> conn_for_handshake;
++    NIXL_WARN << "HSDIAG " << localAgent << " load-begin " << remote_agent;
+     {
+         std::lock_guard<std::mutex> lock(connection_state_mutex_);
++        NIXL_WARN << "HSDIAG " << localAgent << " load-locked " << remote_agent;
+ 
+         bool already_exists = (connections_.find(remote_agent) != connections_.end());
+         if (already_exists) {
+-            NIXL_INFO << "Connection for " << remote_agent
+-                      << " already exists, skipping duplicate loadRemoteConnInfo";
++            NIXL_WARN << "HSDIAG " << localAgent << " load-exists " << remote_agent;
+             return NIXL_SUCCESS;
+         }
+ 
+@@ -910,8 +978,13 @@
+     conn->remote_rail_ep_names_ = data_rail_endpoints;
+ 
+     // Process all rails in one operation
++    NIXL_WARN << "HSDIAG " << localAgent << " av-insert-begin " << agent_name;
++    const auto hs_t0 = std::chrono::steady_clock::now();
+     nixl_status_t data_status = rail_manager_.insertAllAddresses(
+         data_rail_endpoints, conn->rail_remote_addr_list_, conn->src_ep_names_);
++    NIXL_WARN << "HSDIAG " << localAgent << " av-insert-end " << agent_name << " ms="
++              << std::chrono::duration_cast<std::chrono::milliseconds>(
++                     std::chrono::steady_clock::now() - hs_t0).count();
+     if (data_status != NIXL_SUCCESS) {
+         NIXL_ERROR << "insertAllAddresses failed for rails with status: " << data_status;
+         return data_status;
+@@ -936,6 +1009,8 @@
+                 pending_inbound_handshakes_.erase(hit);
+             }
+         }
++        NIXL_WARN << "HSDIAG " << localAgent << " create " << agent_name
++                  << " drained=" << (buffered ? 1 : 0);
+         if (buffered) {
+             {
+                 std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
+@@ -978,6 +1053,7 @@
+     // Wait for the peer's inbound handshake so we know our agent_idx at their side.
+     if (conn->remoteAgent_ != localAgent &&
+         !conn->handshake_received_.load(std::memory_order_acquire)) {
++        NIXL_WARN << "HSDIAG " << localAgent << " wait<- " << remote_agent;
+ 
+         using namespace std::chrono_literals;
+         const auto deadline = std::chrono::steady_clock::now() +
+@@ -1002,6 +1078,8 @@
+             }
+         }
+ 
++        NIXL_WARN << "HSDIAG " << localAgent << " waitdone<- " << remote_agent << " ok="
++                  << conn->handshake_received_.load(std::memory_order_acquire);
+         if (!conn->handshake_received_.load(std::memory_order_acquire)) {
+             NIXL_ERROR << "Handshake from peer '" << remote_agent << "' not received after "
+                        << NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S
+--- a/src/plugins/libfabric/libfabric_handshake.cpp
++++ b/src/plugins/libfabric/libfabric_handshake.cpp
+@@ -102,13 +102,14 @@
+     std::memcpy(req->buffer, payload.data(), payload.size());
+     req->buffer_size = payload.size();
+ 
+-    NIXL_DEBUG << "Sending handshake to '" << conn.remoteAgent_ << "' assigned_idx=" << assigned_idx
+-               << " (my agent_name='" << my_name
+-               << "', piggybacked_conn_info_len=" << piggybacked_conn_info.size() << ")";
+-    return rail_manager_.postControlMessage(nixlLibfabricRailManager::ControlMessageType::HANDSHAKE,
+-                                            req,
+-                                            conn.rail_remote_addr_list_.at(kRailId)[0],
+-                                            /*agent_idx=*/0 /* not used for handshake decode */);
++    const nixl_status_t hs_st =
++        rail_manager_.postControlMessage(nixlLibfabricRailManager::ControlMessageType::HANDSHAKE,
++                                         req,
++                                         conn.rail_remote_addr_list_.at(kRailId)[0],
++                                         /*agent_idx=*/0 /* not used for handshake decode */);
++    NIXL_WARN << "HSDIAG " << my_name << " send-> " << conn.remoteAgent_ << " idx=" << assigned_idx
++              << " piggy=" << piggybacked_conn_info.size() << " st=" << hs_st;
++    return hs_st;
+ }
+ 
+ uint16_t
+@@ -151,7 +152,7 @@
+     }
+     uint8_t has_conn = 0;
+     if (sd.getBuf(NIXL_HANDSHAKE_TAG_HAS_CONN, &has_conn, sizeof(has_conn)) != NIXL_SUCCESS) {
+-        NIXL_ERROR << "Handshake missing 'has_conn' field";
++        NIXL_ERROR << "HSDIAG Handshake missing 'has_conn' field";
+         return;
+     }
+     // The handshake may optionally carry the sender's connection info, for peers that
+@@ -165,9 +166,8 @@
+         }
+     }
+ 
+-    NIXL_DEBUG << "Received handshake from peer '" << peer_agent_name
+-               << "' assigned_idx=" << assigned_idx
+-               << " piggybacked_conn_info_len=" << piggybacked_conn_info.size();
++    NIXL_WARN << "HSDIAG " << localAgent << " recv<- " << peer_agent_name << " idx=" << assigned_idx
++              << " piggy=" << piggybacked_conn_info.size();
+ 
+     // Process the decoded handshake. Look the peer up and, if it is unknown, buffer
+     // the handshake under the lock createAgentConnection() holds while it drains the
+@@ -176,6 +176,7 @@
+     std::shared_ptr<nixlLibfabricConnection> conn;
+     {
+         std::lock_guard<std::mutex> lock(connection_state_mutex_);
++        NIXL_WARN << "HSDIAG " << localAgent << " hs-locked<- " << peer_agent_name;
+         auto it = connections_.find(peer_agent_name);
+         if (it != connections_.end() && it->second) {
+             conn = it->second;
+@@ -189,6 +190,7 @@
+             testHandshakeDelay();
+             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
+             pending_inbound_handshakes_[peer_agent_name] = assigned_idx;
++            NIXL_WARN << "HSDIAG " << localAgent << " buffered<- " << peer_agent_name;
+             NIXL_DEBUG << "Buffered handshake from not-yet-known peer '" << peer_agent_name
+                        << "' (assigned_idx=" << assigned_idx
+                        << "); will apply on createAgentConnection";
+@@ -206,6 +208,8 @@
+         } else {
+             nixl_status_t load_status =
+                 this->loadRemoteConnInfo(peer_agent_name, piggybacked_conn_info);
++            NIXL_WARN << "HSDIAG " << localAgent << " piggyload " << peer_agent_name
++                      << " st=" << load_status;
+             if (load_status != NIXL_SUCCESS) {
+                 NIXL_ERROR << "Failed to loadRemoteConnInfo() received with handshake. "
+                            << "peer agent: " << peer_agent_name
+@@ -215,6 +219,7 @@
+                     // buffered handshake as part of connection creation.
+         }
+     } else {
++        NIXL_WARN << "HSDIAG " << localAgent << " applied<- " << peer_agent_name;
+         conn->handshake_cv_.notify_all();
+         NIXL_INFO << "Handshake stored: peer='" << peer_agent_name
+                   << "' assigned_idx=" << assigned_idx

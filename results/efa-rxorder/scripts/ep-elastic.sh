@@ -3,7 +3,8 @@
 # PyTorch 25.11 container; one task per node. Node 0 hosts the TCP store and
 # rank server; other nodes join it.
 # Env: EP_PLAN (tests/elastic/*.json), EP_PROCS (processes per node), EP_MASTER
-# (node 0's host name), EP_ARGS (extra elastic.py arguments), NIXL_EP_BACKEND.
+# (node 0's host name), EP_ARGS (extra elastic.py arguments), NIXL_EP_BACKEND,
+# EP_HWC_DIR (snapshot EFA hw counters before/after into it; EP_RUN_LABEL names them).
 set -uo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "${script_dir}/ctr-env.sh"
@@ -29,7 +30,16 @@ echo "node=$(hostname) nodeid=${SLURM_NODEID:-0} master=${EP_MASTER:-self} backe
      "plan=${plan} procs=${EP_PROCS:-4} gpus=$(nvidia-smi -L | wc -l)" \
      "channels=${NIXL_EP_PROXY_CHANNELS:-default} workers=${NIXL_EP_PROXY_WORKER_COUNT:-default}" \
      "params=${NIXL_EP_BACKEND_PARAMS:-}"
+hwc() { # EFA hardware counters of every device, one "<device> <counter> <value>" per line
+    [[ -n ${EP_HWC_DIR:-} ]] || return 0
+    mkdir -p "${EP_HWC_DIR}"
+    for c in /sys/class/infiniband/*/ports/1/hw_counters/*; do
+        echo "$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$c")")")")") $(basename "$c") $(cat "$c")"
+    done > "${EP_HWC_DIR}/$(hostname)-${EP_RUN_LABEL:-run}-$1.txt" 2>/dev/null
+}
+hwc before
 python3 "${args[@]}"
 rc=$?
+hwc after
 echo "node=$(hostname) elastic.py exit=${rc}"
 exit ${rc}

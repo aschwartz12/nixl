@@ -1,0 +1,14 @@
+| counter (sum over nodes, per run) | base | new |
+|---|---|---|
+| rdma_write_wrs | 3.896e+06 (n=4) | 3.896e+06 (n=5) |
+| rdma_write_bytes | 4.362e+10 (n=4) | 4.362e+10 (n=5) |
+| rdma_write_recv_bytes | 4.362e+10 (n=4) | 4.362e+10 (n=5) |
+| send_wrs | 2.483e+05 (n=4) | 2.483e+05 (n=5) |
+| recv_wrs | 2.483e+05 (n=4) | 2.483e+05 (n=5) |
+| rx_pkts | 6.275e+06 (n=4) | 6.275e+06 (n=5) |
+| tx_pkts | 6.275e+06 (n=4) | 6.275e+06 (n=5) |
+| rx_drops | 0 (n=4) | 0 (n=5) |
+| retrans_pkts | 0 (n=4) | 0 (n=5) |
+| retrans_timeout_events | 0 (n=4) | 0 (n=5) |
+| unresponsive_remote_events | 0 (n=4) | 0 (n=5) |
+| impaired_remote_conn_events | 0 (n=4) | 0 (n=5) |

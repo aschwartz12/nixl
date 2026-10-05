@@ -1,0 +1,76 @@
+# 8 ranks, NIXL_EFA_PROXY_PROFILE=1 + INFO, base (5a762a8) vs new (fd7a0e55), job 7686854, rep 1 of each; mean over the 8 processes
+== base
+  atomic <=64B done->collect       mean 0.46 us (n=8 processes)
+  atomic <=64B post->done          mean 91.96 us (n=8 processes)
+  atomic <=64B residence           mean 232.73 us (n=8 processes)
+  atomic <=64B submit->post        mean 140.31 us (n=8 processes)
+  atomic apply                     mean 7.39 us (n=8 processes)
+  cq poll                          mean 0.17 us (n=8 processes)
+  pass period                      mean 2.08 us (n=8 processes)
+  put <=64KiB done->collect        mean 16.41 us (n=8 processes)
+  put <=64KiB post->done           mean 164.10 us (n=8 processes)
+  put <=64KiB residence            mean 181.28 us (n=8 processes)
+  put <=64KiB submit->post         mean 0.78 us (n=8 processes)
+== new
+  atomic <=64B done->collect       mean 2.95 us (n=8 processes)
+  atomic <=64B post->done          mean 195.82 us (n=8 processes)
+  atomic <=64B residence           mean 201.72 us (n=8 processes)
+  atomic <=64B submit->post        mean 2.96 us (n=8 processes)
+  atomic apply                     mean 9.72 us (n=8 processes)
+  cq poll                          mean 0.28 us (n=8 processes)
+  pass period                      mean 2.05 us (n=8 processes)
+  put <=64KiB done->collect        mean 17.88 us (n=8 processes)
+  put <=64KiB post->done           mean 169.36 us (n=8 processes)
+  put <=64KiB residence            mean 188.06 us (n=8 processes)
+  put <=64KiB submit->post         mean 0.82 us (n=8 processes)
+  rx order wait                    mean 65.34 us (n=8 processes)
+
+# new (fd7a0e55), job 7686683 rep 1: per-thread busy (EFA proxy cpu) and receive cost (EFA proxy rx), 8 processes
+EFA proxy cpu: thread 0: events=227280 busy_ms=49.7 window_ms=481.3 busy_pct=10.3
+EFA proxy cpu: thread 0: events=232028 busy_ms=51.6 window_ms=481.4 busy_pct=10.7
+EFA proxy cpu: thread 0: events=232192 busy_ms=48.3 window_ms=480.2 busy_pct=10.1
+EFA proxy cpu: thread 0: events=234800 busy_ms=49.4 window_ms=481.5 busy_pct=10.3
+EFA proxy cpu: thread 0: events=236068 busy_ms=50.2 window_ms=481.0 busy_pct=10.4
+EFA proxy cpu: thread 0: events=238000 busy_ms=48.2 window_ms=480.1 busy_pct=10.0
+EFA proxy cpu: thread 0: events=240336 busy_ms=48.9 window_ms=479.9 busy_pct=10.2
+EFA proxy cpu: thread 0: events=243328 busy_ms=52.2 window_ms=481.1 busy_pct=10.8
+EFA proxy cpu: thread 1: events=221104 busy_ms=47.8 window_ms=481.1 busy_pct=9.9
+EFA proxy cpu: thread 1: events=226852 busy_ms=49.8 window_ms=480.9 busy_pct=10.4
+EFA proxy cpu: thread 1: events=229200 busy_ms=50.7 window_ms=480.2 busy_pct=10.6
+EFA proxy cpu: thread 1: events=230924 busy_ms=50.6 window_ms=480.0 busy_pct=10.5
+EFA proxy cpu: thread 1: events=232272 busy_ms=51.6 window_ms=481.1 busy_pct=10.7
+EFA proxy cpu: thread 1: events=235088 busy_ms=51.4 window_ms=481.2 busy_pct=10.7
+EFA proxy cpu: thread 1: events=235312 busy_ms=48.7 window_ms=481.4 busy_pct=10.1
+EFA proxy cpu: thread 1: events=238976 busy_ms=49.6 window_ms=479.5 busy_pct=10.4
+EFA proxy cpu: thread 2: events=2856 busy_ms=12.1 window_ms=475.8 busy_pct=2.5
+EFA proxy cpu: thread 2: events=3456 busy_ms=12.6 window_ms=474.9 busy_pct=2.6
+EFA proxy cpu: thread 2: events=3756 busy_ms=13.6 window_ms=476.0 busy_pct=2.9
+EFA proxy cpu: thread 2: events=3804 busy_ms=13.8 window_ms=475.9 busy_pct=2.9
+EFA proxy cpu: thread 2: events=3828 busy_ms=13.9 window_ms=475.9 busy_pct=2.9
+EFA proxy cpu: thread 2: events=3840 busy_ms=13.4 window_ms=475.9 busy_pct=2.8
+EFA proxy cpu: thread 2: events=3888 busy_ms=14.2 window_ms=475.9 busy_pct=3.0
+EFA proxy cpu: thread 2: events=4140 busy_ms=14.1 window_ms=476.1 busy_pct=3.0
+EFA proxy cpu: thread 3: events=1956 busy_ms=9.9 window_ms=475.3 busy_pct=2.1
+EFA proxy cpu: thread 3: events=2016 busy_ms=9.2 window_ms=474.3 busy_pct=1.9
+EFA proxy cpu: thread 3: events=2292 busy_ms=10.4 window_ms=475.5 busy_pct=2.2
+EFA proxy cpu: thread 3: events=2316 busy_ms=10.5 window_ms=475.6 busy_pct=2.2
+EFA proxy cpu: thread 3: events=2340 busy_ms=10.7 window_ms=475.7 busy_pct=2.2
+EFA proxy cpu: thread 3: events=2604 busy_ms=11.1 window_ms=475.6 busy_pct=2.3
+EFA proxy cpu: thread 3: events=2604 busy_ms=11.2 window_ms=475.9 busy_pct=2.4
+EFA proxy cpu: thread 3: events=2688 busy_ms=11.2 window_ms=475.6 busy_pct=2.4
+EFA proxy rx: thread 0: entries=110852 reads=27977 sweeps=27636 window_ms=481.3 sweep_ns_per_entry=300.3 read_ns_per_entry=178.9 decode_ns_per_entry=69.3 entries_per_read=4.0 busy_pct=6.9 flushes=0
+EFA proxy rx: thread 0: entries=112896 reads=28774 sweeps=28351 window_ms=481.3 sweep_ns_per_entry=297.7 read_ns_per_entry=179.1 decode_ns_per_entry=62.8 entries_per_read=3.9 busy_pct=7.0 flushes=0
+EFA proxy rx: thread 0: entries=113152 reads=25659 sweeps=25289 window_ms=480.2 sweep_ns_per_entry=288.3 read_ns_per_entry=178.8 decode_ns_per_entry=62.0 entries_per_read=4.4 busy_pct=6.8 flushes=0
+EFA proxy rx: thread 0: entries=114456 reads=27631 sweeps=27266 window_ms=481.0 sweep_ns_per_entry=289.0 read_ns_per_entry=177.5 decode_ns_per_entry=64.7 entries_per_read=4.1 busy_pct=6.9 flushes=0
+EFA proxy rx: thread 0: entries=115108 reads=26539 sweeps=26194 window_ms=481.0 sweep_ns_per_entry=294.0 read_ns_per_entry=174.2 decode_ns_per_entry=69.2 entries_per_read=4.3 busy_pct=7.0 flushes=0
+EFA proxy rx: thread 0: entries=116072 reads=25779 sweeps=25403 window_ms=480.1 sweep_ns_per_entry=293.1 read_ns_per_entry=177.6 decode_ns_per_entry=67.3 entries_per_read=4.5 busy_pct=7.1 flushes=0
+EFA proxy rx: thread 0: entries=117176 reads=26428 sweeps=26000 window_ms=479.9 sweep_ns_per_entry=287.1 read_ns_per_entry=175.8 decode_ns_per_entry=65.3 entries_per_read=4.4 busy_pct=7.0 flushes=0
+EFA proxy rx: thread 0: entries=118560 reads=28282 sweeps=27928 window_ms=481.1 sweep_ns_per_entry=293.6 read_ns_per_entry=177.9 decode_ns_per_entry=64.8 entries_per_read=4.2 busy_pct=7.2 flushes=0
+EFA proxy rx: thread 1: entries=107808 reads=27137 sweeps=26893 window_ms=481.0 sweep_ns_per_entry=289.3 read_ns_per_entry=177.9 decode_ns_per_entry=61.9 entries_per_read=4.0 busy_pct=6.5 flushes=0
+EFA proxy rx: thread 1: entries=110824 reads=28956 sweeps=28705 window_ms=480.9 sweep_ns_per_entry=311.9 read_ns_per_entry=190.4 decode_ns_per_entry=70.9 entries_per_read=3.8 busy_pct=7.2 flushes=0
+EFA proxy rx: thread 1: entries=111524 reads=27241 sweeps=26984 window_ms=480.2 sweep_ns_per_entry=305.2 read_ns_per_entry=188.1 decode_ns_per_entry=65.8 entries_per_read=4.1 busy_pct=7.1 flushes=0
+EFA proxy rx: thread 1: entries=112524 reads=27538 sweeps=27271 window_ms=479.9 sweep_ns_per_entry=305.0 read_ns_per_entry=185.8 decode_ns_per_entry=68.0 entries_per_read=4.1 busy_pct=7.2 flushes=0
+EFA proxy rx: thread 1: entries=113076 reads=27204 sweeps=26855 window_ms=481.1 sweep_ns_per_entry=311.6 read_ns_per_entry=188.0 decode_ns_per_entry=68.7 entries_per_read=4.2 busy_pct=7.3 flushes=0
+EFA proxy rx: thread 1: entries=114456 reads=28229 sweeps=27893 window_ms=481.1 sweep_ns_per_entry=308.5 read_ns_per_entry=184.9 decode_ns_per_entry=69.9 entries_per_read=4.1 busy_pct=7.3 flushes=0
+EFA proxy rx: thread 1: entries=114632 reads=25122 sweeps=24835 window_ms=481.2 sweep_ns_per_entry=292.8 read_ns_per_entry=172.7 decode_ns_per_entry=68.9 entries_per_read=4.6 busy_pct=7.0 flushes=0
+EFA proxy rx: thread 1: entries=116276 reads=26436 sweeps=26116 window_ms=479.4 sweep_ns_per_entry=294.2 read_ns_per_entry=181.0 decode_ns_per_entry=63.1 entries_per_read=4.4 busy_pct=7.1 flushes=0

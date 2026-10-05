@@ -1,0 +1,26 @@
+# rx3-micro job 7686044 ()
+base-host-1 exit=143
+base-host-2 exit=143
+base-host-3 exit=143
+| Metric | base | new |
+|---|---|---|
+| ping-pong 8 B (us) | 114.8 (114.0-115.2, n=3) | 58.4 (58.3-59.0, n=3) |
+| put 8 B (us) | 38.3 (38.0-38.3, n=3) | 38.3 (38.2-39.1, n=3) |
+| put+signal 8 B at sender (us) | 75.8 (75.3-76.3, n=3) | 48.3 (48.2-49.3, n=3) |
+| put+signal 64 KiB at sender (us) | 88.4 (87.8-89.1, n=3) | 60.9 (60.8-61.6, n=3) |
+| pipelined 1 MiB, 1 ch (Gbit/s) | 356.4 (356.3-356.6, n=3) | 354.5 (354.3-354.9, n=3) |
+| pipelined 64 KiB, 1 ch (Gbit/s) | 118.0 (117.7-118.6, n=3) | 116.9 (116.4-117.1, n=3) |
+| pipelined 8 KiB, 1 ch (Gbit/s) | 15.7 (15.6-15.8, n=3) | 15.8 (15.7-15.8, n=3) |
+| batch-signal 64 KiB, 1 ch (Gbit/s) | 94.6 (94.3-94.6, n=3) | 111.7 (111.7-111.9, n=3) |
+| pipelined 1 MiB, 4 ch (Gbit/s) | 389.8 (389.7-389.8, n=3) | 389.7 (389.7-389.8, n=3) |
+| pipelined 64 KiB, 4 ch (Gbit/s) | 290.8 (290.7-291.2, n=3) | 287.3 (287.2-287.3, n=3) |
+| pipelined 8 KiB, 4 ch (Gbit/s) | 58.9 (58.3-59.3, n=3) | 59.0 (58.9-59.0, n=3) |
+| ordering check, 4 ch (signals/s) | 50192 (49106-50456, n=3) | 58948 (57809-63039, n=3) |
+| ordering check, profiled (signals/s) | 47860 (47825-48158, n=3) | 54774 (53914-56026, n=3) |
+| target cores busy, ordering check | - | 0.65 (0.63-0.66, n=3) |
+| sender cores busy, ordering check | - | 2.04 (2.01-2.08, n=3) |
+| target cores busy, 16 KiB puts + host writes | - | 0.23 (0.21-0.23, n=3) |
+| host 1 MiB writes, proxy idle (Gbit/s) | - | 212.9 (201.5-218.3, n=3) |
+| host 64 KiB writes, proxy idle (Gbit/s) | 195.6 (192.0-199.2, n=2) | 183.8 (177.4-185.6, n=3) |
+| host 1 MiB writes during device 16 KiB puts (Gbit/s) | - | 187.4 (184.5-199.9, n=3) |
+| device 16 KiB puts, 4 ch, during host writes (Gbit/s) | - | 61.4 (58.1-63.3, n=3) |
