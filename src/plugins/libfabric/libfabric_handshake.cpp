@@ -32,8 +32,8 @@
 
 namespace {
 // Tests only (ignored in NDEBUG builds): NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS stalls
-// handleHandshake() for an unknown peer between its lookup and buffering, where a
-// concurrent createAgentConnection() can interleave.
+// handleHandshake() for an unknown peer after its lookup, before buffering (under the
+// connection lock), where a concurrent createAgentConnection() used to interleave.
 void
 testHandshakeDelay() {
 #ifndef NDEBUG

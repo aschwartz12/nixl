@@ -236,9 +236,9 @@ private:
     postCtl(Thread &th, const PendingCtl &ctl);
     nixl_status_t
     applyAtomic(Thread &th, uint64_t addr, uint64_t value);
-    /** Make completed RDMA writes to the GPU of @p addr visible to it (efa_proxy_rx_flush). */
+    /** Make completed RDMA writes visible to every GPU with registered memory. */
     nixl_status_t
-    flushRdmaWrites(Thread &th, uint64_t addr);
+    flushRdmaWrites(Thread &th);
 #ifdef HAVE_CUDA
     nixl_status_t
     addWithCuda(Thread &th, int device_id, uint64_t addr, uint64_t value);
@@ -326,6 +326,7 @@ private:
 
     std::mutex regions_write_mutex_; // serializes registration changes
     std::multimap<uintptr_t, Region> regions_;
+    std::vector<int> vram_devices_; // GPUs with registered memory; under the region locks
     std::unique_ptr<CounterMap> counters_;
 
     // Receive-side ring state by key, shared by the thread counting a ring's puts

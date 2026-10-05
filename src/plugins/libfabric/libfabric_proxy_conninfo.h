@@ -59,6 +59,8 @@ inline constexpr char kRailsTag[] = "efa_proxy_data_rails";
 inline constexpr char kRailTagPrefix[] = "efa_proxy_data_rail_";
 inline constexpr char kDataEpTagPrefix[] = "efa_proxy_data_ep_";
 inline constexpr char kIncarnationTag[] = "efa_proxy_incarnation";
+/** Rail numbers and counts above this are malformed (EFA nodes have tens of rails). */
+inline constexpr uint64_t kMaxRails = 1024;
 
 /** A proxy's endpoints, as published. */
 struct ProxyEps {
@@ -129,7 +131,7 @@ parse(const std::string &blob, ProxyEps &eps) {
         return NIXL_ERR_MISMATCH;
     }
     uint64_t threads = 0;
-    if (!detail::getCount(sd, kThreadsTag, threads) || threads == 0) {
+    if (!detail::getCount(sd, kThreadsTag, threads) || threads == 0 || threads > kMaxRails) {
         return NIXL_ERR_MISMATCH;
     }
     ProxyEps out;
@@ -141,13 +143,13 @@ parse(const std::string &blob, ProxyEps &eps) {
         out.home.push_back(std::move(name));
     }
     uint64_t rails = 0;
-    if (!detail::getCount(sd, kRailsTag, rails) || rails == 0) {
+    if (!detail::getCount(sd, kRailsTag, rails) || rails == 0 || rails > kMaxRails) {
         return NIXL_ERR_MISMATCH; // every proxy receives puts on some rail
     }
     for (uint64_t i = 0; i < rails; ++i) {
         uint64_t rail = 0;
         std::string name;
-        if (!detail::getCount(sd, kRailTagPrefix + std::to_string(i), rail) || rail > UINT32_MAX ||
+        if (!detail::getCount(sd, kRailTagPrefix + std::to_string(i), rail) || rail >= kMaxRails ||
             !detail::getName(sd, kDataEpTagPrefix + std::to_string(i), name)) {
             return NIXL_ERR_MISMATCH;
         }

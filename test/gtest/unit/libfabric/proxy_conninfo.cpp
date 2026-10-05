@@ -171,6 +171,19 @@ TEST(LibfabricProxyConnInfoTest, MalformedProxySectionsAreRejected) {
         sd.addStr(ci::kIncarnationTag, "7");
         bad.push_back(sd.exportStr());
     }
+    for (const std::string rail : {std::to_string(ci::kMaxRails), std::string("4294967296")}) {
+        nixlSerDes sd = base("1"); // rail number beyond any NIC: would size per-rail tables
+        sd.addBuf(std::string(ci::kEpTagPrefix) + "0", eps.home[0].data(), eps.home[0].size());
+        sd.addStr(ci::kRailsTag, "1");
+        sd.addStr(std::string(ci::kRailTagPrefix) + "0", rail);
+        sd.addBuf(std::string(ci::kDataEpTagPrefix) + "0", eps.data[0].data(), eps.data[0].size());
+        sd.addStr(ci::kIncarnationTag, "7");
+        bad.push_back(sd.exportStr());
+    }
+    {
+        nixlSerDes sd = base(std::to_string(ci::kMaxRails + 1)); // absurd thread count
+        bad.push_back(sd.exportStr());
+    }
 
     for (size_t i = 0; i < bad.size(); ++i) {
         ci::ProxyEps parsed = eps;
