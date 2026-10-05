@@ -69,6 +69,12 @@ constexpr uint64_t kHandshakeTimeoutNs = 60ull * 1000 * 1000 * 1000;
 constexpr uint32_t kAckScanInterval = 4096;
 /** Period of the scan for overdue target-side atomicAdds. */
 constexpr uint64_t kDeferredScanNs = 1000ull * 1000 * 1000;
+/**
+ * Longest a thread applies atomicAdds before it polls its CQs again (the rest wait
+ * for the next pass): its receive CQs fill meanwhile, with no back-pressure on the
+ * senders (kRxCqSize), and applies can be slow (a GDRCopy pin, CUDA copies).
+ */
+constexpr uint64_t kDrainBudgetNs = 1000ull * 1000;
 /** Default for efa_proxy_idle_poll_us: how often an idle thread polls its CQs. */
 constexpr uint64_t kDefaultIdlePollUs = 2;
 /** quiesce() gives up on a ring that has not drained by then (fatal in the runtime). */
@@ -265,6 +271,7 @@ struct nixlLibfabricProxy::RecvBuf {
 struct nixlLibfabricProxy::CtlBuf {
     OpCtx op; // must stay first
     wire::anyMsg msg;
+    fi_addr_t dest = FI_ADDR_UNSPEC; // while in flight (dropPeer() keeps its AV entry)
 };
 
 /** A control message (ack or ring abort) waiting for a send buffer or queue room. */
@@ -1221,7 +1228,9 @@ nixlLibfabricProxy::submit(const nixlBackendProxySubmission &sub,
     }
 
 #ifdef HAVE_CUDA
-    if (sub.local.mem_type == VRAM_SEG && th.cuda_dev != static_cast<int>(sub.local.desc.devId)) {
+    // Puts only: an atomicAdd's submission has no local buffer (its desc is unset).
+    if (is_put && sub.local.mem_type == VRAM_SEG &&
+        th.cuda_dev != static_cast<int>(sub.local.desc.devId)) {
         if (cudaSetDevice(static_cast<int>(sub.local.desc.devId)) == cudaSuccess) {
             th.cuda_dev = static_cast<int>(sub.local.desc.devId);
         }
@@ -1908,6 +1917,7 @@ nixlLibfabricProxy::pollCq(Thread &th, struct fid_cq *cq, uint32_t rail, uint64_
                     handleRecv(th, reinterpret_cast<RecvBuf *>(op), entries[i].len);
                     break;
                 case OpCtx::Kind::CTL:
+                    reinterpret_cast<CtlBuf *>(op)->dest = FI_ADDR_UNSPEC;
                     th.free_ctls.push_back(reinterpret_cast<CtlBuf *>(op));
                     break;
                 case OpCtx::Kind::FRAG: {
@@ -1956,6 +1966,7 @@ nixlLibfabricProxy::pollCq(Thread &th, struct fid_cq *cq, uint32_t rail, uint64_
                 case OpCtx::Kind::CTL:
                     // This message is lost: an ack's atomicAdd fails by timeout at the
                     // sender; an abort's adds expire at the target.
+                    reinterpret_cast<CtlBuf *>(op)->dest = FI_ADDR_UNSPEC;
                     th.free_ctls.push_back(reinterpret_cast<CtlBuf *>(op));
                     break;
                 case OpCtx::Kind::FRAG:
@@ -2145,7 +2156,19 @@ nixlLibfabricProxy::handleAtomic(Thread &th, const wire::atomicAddMsg &msg) {
     }
     RxOwned &owned = th.owned[ring];
     owned.ring = ring;
-    owned.adds.emplace(msg.seq, RxOwned::Add{msg, reply, nowNs()});
+    if (msg.seq < ring->applied.load(std::memory_order_acquire) ||
+        !owned.adds.emplace(msg.seq, RxOwned::Add{msg, reply, nowNs()}).second) {
+        // A seq already applied or already waiting (a broken sender; the transport
+        // delivers once): fail it rather than let it block the ring's later adds.
+        NIXL_ERROR << "EFA proxy: duplicate atomicAdd record (ring " << std::hex << msg.ring
+                   << std::dec << ", seq " << msg.seq << "); failing it";
+        if (owned.adds.empty()) {
+            th.owned.erase(ring);
+        }
+        sendCtl(th,
+                PendingCtl{reply, wire::msgType::ATOMIC_ACK, msg.token, NIXL_ERR_INVALID_PARAM, 0, 0});
+        return;
+    }
     // Applied by drainDeferred() in this same pass, batched with the others.
 }
 
@@ -2243,6 +2266,7 @@ nixlLibfabricProxy::postCtl(Thread &th, const PendingCtl &ctl) {
         return false;
     }
     if (rc == 0) {
+        buf->dest = ctl.dest;
         th.free_ctls.pop_back();
     } else {
         NIXL_ERROR << "EFA proxy: control send failed: " << fi_strerror(-rc)
@@ -2294,7 +2318,9 @@ nixlLibfabricProxy::drainDeferred(Thread &th) {
     // another thread ends the run; once that thread applied it, a later round (or
     // pass) continues.
     std::vector<std::pair<RxOwned *, Adds::iterator>> ready;
-    for (;;) {
+    const uint64_t deadline = nowNs() + kDrainBudgetNs;
+    bool over_budget = false;
+    while (!over_budget) {
         ready.clear();
         for (auto it = th.owned.begin(); it != th.owned.end();) {
             RxOwned &owned = it->second;
@@ -2355,6 +2381,10 @@ nixlLibfabricProxy::drainDeferred(Thread &th) {
             sendCtl(th,
                     PendingCtl{add->second.reply, wire::msgType::ATOMIC_ACK, msg.token, status, 0, 0});
             owned->adds.erase(add);
+            if (nowNs() >= deadline) {
+                over_budget = true; // the batch's rest stays waiting, still in order
+                break;
+            }
         }
     }
 
@@ -2427,13 +2457,13 @@ nixlLibfabricProxy::flushRdmaWrites(Thread &th) {
     }
     const uint64_t start = th.prof ? nowNs() : 0;
     for (const int device : devices) {
-        if (th.cuda_dev != device) {
-            if (cudaSetDevice(device) != cudaSuccess) {
-                NIXL_ERROR << "EFA proxy: cudaSetDevice(" << device << ") failed before a flush";
-                return NIXL_ERR_BACKEND;
-            }
-            th.cuda_dev = device;
+        // Always set: the runtime also switches this thread's device (th.cuda_dev
+        // may be stale), and a flush must target the right GPU.
+        if (cudaSetDevice(device) != cudaSuccess) {
+            NIXL_ERROR << "EFA proxy: cudaSetDevice(" << device << ") failed before a flush";
+            return NIXL_ERR_BACKEND;
         }
+        th.cuda_dev = device;
         if (cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
                                                cudaFlushGPUDirectRDMAWritesToOwner) !=
             cudaSuccess) {
@@ -2706,10 +2736,18 @@ nixlLibfabricProxy::dropPeer(Thread &th, PeerAddrs &pa) {
         if (addr == FI_ADDR_UNSPEC) {
             continue;
         }
-        // An ack route (acks queued or in flight) or a live peer may share it.
+        // An ack route (acks queued or in flight), a live peer, or a control
+        // message still queued or in flight to it (a ring abort) may use it: removed,
+        // the entry could be reused for another agent while that message is sent.
         bool used = false;
         for (const auto &route : th.reply_addrs) {
             used = used || route.second == addr;
+        }
+        for (const auto &ctl : th.pending_ctls) {
+            used = used || ctl.dest == addr;
+        }
+        for (const auto &buf : th.ctls) {
+            used = used || buf.dest == addr;
         }
         for (const auto &[conn, other] : th.peers) {
             if (&other != &pa && !other.conn.expired()) {

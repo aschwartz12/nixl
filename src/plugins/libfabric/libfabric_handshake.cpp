@@ -179,6 +179,12 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
         auto it = connections_.find(peer_agent_name);
         if (it != connections_.end() && it->second) {
             conn = it->second;
+            // Applied under the lock too: a reconnect could otherwise replace the
+            // connection between the lookup and here, and the new one would wait
+            // for a handshake that went to the old one.
+            std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
+            conn->local_agent_idx_at_remote_ = assigned_idx;
+            conn->handshake_received_.store(true, std::memory_order_release);
         } else {
             testHandshakeDelay();
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
@@ -209,11 +215,6 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
                     // buffered handshake as part of connection creation.
         }
     } else {
-        {
-            std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
-            conn->local_agent_idx_at_remote_ = assigned_idx;
-            conn->handshake_received_.store(true, std::memory_order_release);
-        }
         conn->handshake_cv_.notify_all();
         NIXL_INFO << "Handshake stored: peer='" << peer_agent_name
                   << "' assigned_idx=" << assigned_idx
