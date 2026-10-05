@@ -58,7 +58,6 @@ if cuda_dep.found() and not rocm_dep.found()
         'libfabric_proxy.cpp',
         'libfabric_proxy.h',
         'libfabric_proxy_conninfo.h',
-        'libfabric_proxy_fence.h',
         'libfabric_proxy_profile.h',
         'libfabric_proxy_wire.h',
     ]

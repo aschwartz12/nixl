@@ -20,37 +20,45 @@
 #include <cstdint>
 
 /**
- * Messages between EFA proxy threads, sent over their home endpoints. A sender's
- * atomicAdd goes to the counter's owner thread at the target, which applies it and
- * answers with an ack carrying the result; the sender completes the atomicAdd only
- * then. Dependency-free so tests can include it.
+ * What EFA proxy threads put on the wire. Dependency-free so tests can include it.
  *
- * Receiver-side ordering (efa_proxy_ordering=receiver) also tags every put
- * fragment with 32 bits of remote CQ data (ringImm()): its ring's random key and
- * its epoch, the index of the atomicAdd that follows it (modulo kRingEpochs).
- * The target counts fragments per (ring, epoch slot). An atomicAdd leaves at once,
- * carrying its index (seq) and how many fragments its epoch slot has received in
- * total once its own puts are in; its counter's owner applies it once that slot
- * count and all earlier atomicAdds of the ring are in. Counting per epoch matters:
- * puts after an atomicAdd can arrive before puts ahead of it (other rails, retry
- * queues), and must not satisfy it. A slot is reused kRingEpochs atomicAdds later,
- * which a ring with at most kRingEpochs requests in flight cannot reach early.
+ * put -> atomicAdd ordering is kept by the target (receiver-side ordering):
+ *
+ *  - Every put fragment is an RDMA write carrying 32 bits of remote CQ data,
+ *    putImm(): its ring's key and its epoch, the index of the atomicAdd that will
+ *    follow it on the ring (mod kEpochs). The target thread that polls the rail it
+ *    lands on counts it per (ring, epoch slot).
+ *  - An atomicAdd leaves at once as an atomicAddMsg to the counter's owner thread
+ *    (counterOwner()), with its index on the ring (seq) and the fragment count its
+ *    epoch slot reaches once its own puts are in (expected_puts). The owner applies
+ *    it when that count is reached and the ring's previous atomicAdd was applied,
+ *    then acks; the sender completes the atomicAdd on the ack.
+ *  - A ring key names one sender ring at one target, deterministically:
+ *    ringKey(the sender's index at the target, a ring id). The sender allocates
+ *    ring ids per target, one per (runtime ring, target), and a fresh one when a
+ *    failed ring is used again, so its counts start over at the target.
+ *  - Slot s of a ring is reused kEpochs atomicAdds later; a ring with at most
+ *    kEpochs requests in flight cannot get there before atomicAdd s was applied.
+ *
+ * Control messages (atomicAdd, ack, ring abort) go between the threads' control
+ * EPs; puts go to the data EP of the thread that receives on the destination rail.
  */
 namespace nixlLibfabricProxyWire {
 
 /** Bumped on any layout or protocol change; also published in the connection info. */
-inline constexpr uint16_t kVersion = 3;
+inline constexpr uint16_t kVersion = 4;
 
 /** Room for a libfabric endpoint name (LF_EP_NAME_MAX_LEN, checked by the proxy). */
 inline constexpr uint32_t kMaxEpName = 56;
 
-enum class msgType : uint16_t { ATOMIC_ADD = 1, ATOMIC_ACK = 2 };
+/** Epoch slots per ring: the put immediate's low bits. */
+inline constexpr uint32_t kEpochBits = 8;
+inline constexpr uint32_t kEpochs = 1u << kEpochBits;
+/** Ring key fields (24 bits): the sender's index at the target, then a ring id. */
+inline constexpr uint32_t kMaxSenderIndex = 0xff; // the engine's NIXL_AGENT_INDEX_MASK
+inline constexpr uint32_t kRingIds = 0x10000;
 
-/** What an atomicAdd waits for at the target before it is applied. */
-enum class orderMode : uint16_t {
-    NONE = 0, // apply on arrival: the sender held it until its ring's puts completed
-    RING = 1, // apply once the ring's counts reach expected_puts and seq
-};
+enum class msgType : uint16_t { ATOMIC_ADD = 1, ATOMIC_ACK = 2, RING_ABORT = 3 };
 
 struct msgHeader {
     uint16_t version;
@@ -64,15 +72,11 @@ struct atomicAddMsg {
     uint64_t remote_addr;
     uint64_t value;
     uint64_t token; // sender's request, echoed in the ack
+    uint32_t ring; // ringKey() of the sender's ring
     uint32_t reply_name_len;
-    orderMode order;
-    uint16_t reserved;
-    // orderMode::RING only:
-    uint32_t ring; // the sender ring's key
-    uint32_t reserved2;
-    uint64_t expected_puts; // fragments of the slot of epoch seq once this add's are in
-    uint64_t seq; // index of this add among the ring's atomicAdds to this target
-    uint8_t reply_name[kMaxEpName]; // sender's home endpoint, where the ack goes
+    uint64_t seq; // index of this add among the ring's atomicAdds
+    uint64_t expected_puts; // count of slot seq % kEpochs once this add's puts are in
+    uint8_t reply_name[kMaxEpName]; // sender's control endpoint, where the ack goes
 };
 
 /** Counter owner -> sender, after the add was applied or failed. */
@@ -83,12 +87,46 @@ struct atomicAckMsg {
     uint32_t reserved;
 };
 
-/** One receive buffer holds either message. */
+/**
+ * Sender -> every proxy thread of the target: the ring failed at the sender, so its
+ * atomicAdds from first_seq on will never be satisfiable (or are not wanted). The
+ * owners drop them without applying (no ack: the sender already failed them) and
+ * forget the ring once nothing of it waits.
+ */
+struct ringAbortMsg {
+    msgHeader hdr;
+    uint32_t ring;
+    uint32_t reserved;
+    uint64_t first_seq;
+};
+
+/** One receive buffer holds any message. */
 union anyMsg {
     msgHeader hdr;
     atomicAddMsg add;
     atomicAckMsg ack;
+    ringAbortMsg abort;
 };
+
+constexpr uint32_t
+ringKey(uint32_t sender_index, uint32_t ring_id) {
+    return (sender_index & kMaxSenderIndex) << 16 | (ring_id & (kRingIds - 1));
+}
+
+constexpr uint32_t
+putImm(uint32_t ring_key, uint64_t epoch) {
+    return ring_key << kEpochBits | static_cast<uint32_t>(epoch & (kEpochs - 1));
+}
+
+constexpr uint32_t
+immRing(uint32_t imm) {
+    return imm >> kEpochBits;
+}
+
+constexpr uint32_t
+immSlot(uint32_t imm) {
+    return imm & (kEpochs - 1);
+}
 
 /** Deterministic mixer: every sender must pick the same owner for a counter. */
 constexpr uint64_t
@@ -105,30 +143,13 @@ counterOwner(uint64_t addr, uint32_t threads) {
     return static_cast<uint32_t>(mix64(addr >> 3) % threads);
 }
 
-/** Remote CQ data of a put fragment: a 24-bit ring key, then 8 bits of epoch. */
-inline constexpr uint32_t kRingEpochBits = 8;
-inline constexpr uint32_t kRingEpochs = 1u << kRingEpochBits;
-inline constexpr uint32_t kMaxRingKey = (1u << (32 - kRingEpochBits)) - 1;
-
+/**
+ * Proxy thread of a target with @p threads proxy threads that receives (polls and
+ * counts) the puts landing on its receive rail number @p rail_index.
+ */
 constexpr uint32_t
-ringImm(uint32_t ring_key, uint64_t epoch) {
-    return ring_key << kRingEpochBits | static_cast<uint32_t>(epoch & (kRingEpochs - 1));
-}
-
-constexpr uint32_t
-immRing(uint32_t imm) {
-    return imm >> kRingEpochBits;
-}
-
-constexpr uint32_t
-immSlot(uint32_t imm) {
-    return imm & (kRingEpochs - 1);
-}
-
-/** Proxy thread of a target with @p threads proxy threads that receives a ring's puts. */
-constexpr uint32_t
-ringThread(uint32_t ring_key, uint32_t threads) {
-    return static_cast<uint32_t>(mix64(ring_key) % threads);
+railThread(uint32_t rail_index, uint32_t threads) {
+    return rail_index % threads;
 }
 
 } // namespace nixlLibfabricProxyWire

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -40,7 +41,6 @@
 #include "libfabric_backend.h"
 #include "libfabric_connection.h"
 #include "libfabric_proxy_conninfo.h"
-#include "libfabric_proxy_fence.h"
 #include "libfabric_proxy_profile.h"
 #include "serdes/serdes.h"
 
@@ -55,14 +55,20 @@ namespace {
 
 /** Upper bound on rails a single put is striped over. */
 constexpr size_t kMaxStripes = 8;
-/** Posted receive buffers per proxy thread for incoming atomicAdd records and acks. */
+/** Posted receive buffers per proxy thread for control messages. */
 constexpr size_t kRecvPoolSize = 1024;
-/** Ack send buffers per proxy thread; acks beyond them wait in a queue. */
-constexpr size_t kAckPoolSize = 1024;
+/** Control send buffers (acks, ring aborts) per proxy thread; more wait in a queue. */
+constexpr size_t kCtlPoolSize = 1024;
 /** An atomicAdd whose ack has not arrived by then failed (its target died). */
 constexpr uint64_t kAckTimeoutNs = 10ull * 1000 * 1000 * 1000;
+/** A target-side atomicAdd still waiting for its ring by then is dropped. */
+constexpr uint64_t kDeferredTimeoutNs = kAckTimeoutNs;
+/** Requests wait this long for the engine handshake with their target. */
+constexpr uint64_t kHandshakeTimeoutNs = 60ull * 1000 * 1000 * 1000;
 /** Passes between scans for overdue acks while any atomicAdd awaits one. */
 constexpr uint32_t kAckScanInterval = 4096;
+/** Period of the scan for overdue target-side atomicAdds. */
+constexpr uint64_t kDeferredScanNs = 1000ull * 1000 * 1000;
 /** Default for efa_proxy_idle_poll_us: how often an idle thread polls its CQs. */
 constexpr uint64_t kDefaultIdlePollUs = 2;
 /** quiesce() gives up on a ring that has not drained by then (fatal in the runtime). */
@@ -81,18 +87,17 @@ constexpr size_t kCqSize = 16384;
  * Proxy EP queue sizes. The provider allocates, faults in and registers each EP's
  * packet pools in one chunk sized by these the first time the EP is used (the
  * defaults, 4096 tx / 8192 rx, are ~36 MB and ~72 MB and took 5-20 ms under the
- * domain lock). Writes need no receive buffers, so only a thread's control EP
- * (atomicAdd records and acks) gets a real receive queue; posts beyond the
- * transmit queues wait in the retry queues.
+ * domain lock). Writes with remote CQ data need no posted receives on EFA devices
+ * with unsolicited write receive (checked at init); posts beyond the transmit
+ * queues wait in the retry queues.
  */
 constexpr size_t kTxSize = 1024;
 constexpr size_t kCtlTxSize = 1024;
 constexpr size_t kCtlRxSize = 1024;
-constexpr size_t kIdleRxSize = 64;
-/** RecvBuf::rail of the control EP's receive buffers. */
-constexpr uint32_t kCtlRail = std::numeric_limits<uint32_t>::max();
+constexpr size_t kDataRxSize = 64;
 
 namespace wire = nixlLibfabricProxyWire;
+namespace ci = nixlLibfabricProxyConnInfo;
 static_assert(LF_EP_NAME_MAX_LEN <= wire::kMaxEpName, "endpoint names must fit in a message");
 
 uint64_t
@@ -121,7 +126,7 @@ struct NameHash {
  * op_context says what completed.
  */
 struct nixlLibfabricProxy::OpCtx {
-    enum class Kind : uint8_t { FRAG, RECV, ACK };
+    enum class Kind : uint8_t { FRAG, RECV, CTL };
 
     struct fi_context2 ctx; // must stay first: op_context points here
     Kind kind;
@@ -140,20 +145,17 @@ struct nixlLibfabricProxy::Request {
     uint32_t generation = 0; // bumped per allocation, so late acks of a reused slot are ignored
     uint16_t frags_left = 0; // an atomicAdd counts its send and its ack
     bool in_use = false;
+    bool counted = false; // in ring->outstanding until it completes
+    bool is_atomic = false;
     bool awaiting_ack = false; // atomicAdd record posted, the owner's ack not received yet
     nixl_status_t status = NIXL_IN_PROG;
-    RingFence *fence = nullptr;
-    nixlLibfabricRingFence<Request>::Epoch *epoch = nullptr;
-    fi_addr_t dest = FI_ADDR_UNSPEC; // atomic target (owner thread's home EP)
+    Ring *ring = nullptr;
+    TxRing *tx = nullptr; // the ring's counts towards the request's target
+    uint64_t seq = 0; // a put: its epoch (the next atomicAdd's index); an atomicAdd: its index
+    fi_addr_t dest = FI_ADDR_UNSPEC; // atomicAdd: the counter owner's control EP
     uint64_t ack_deadline = 0; // nowNs() by which the ack must arrive
-    wire::atomicAddMsg msg{}; // atomic send buffer; the request pool is registered memory
+    wire::atomicAddMsg msg{}; // atomicAdd send buffer; the request pool is registered memory
     bool inject_cq_error = false; // NIXL_EFA_PROXY_INJECT: fail its first completion
-    // Receiver ordering and fence-off modes: counted in fence->outstanding instead
-    // of the fence's epochs.
-    bool counted = false;
-    bool is_atomic = false;
-    TxRing *tx = nullptr; // receiver ordering: the ring's sender-side counts
-    uint64_t rx_seq = 0; // a put: its epoch; an atomicAdd: its index on the ring
 
     uint64_t
     token() const noexcept {
@@ -169,71 +171,89 @@ struct nixlLibfabricProxy::Request {
 };
 
 /**
- * Sender-side counts of one (target incarnation, channel) for receiver ordering.
- * They outlive the ring's fence (quiesce), since the target's counts do; after a
- * failure the target may never see some counted put, so the next fence re-keys
- * the ring (fresh counts on both sides).
+ * Sender-side counts of one runtime ring towards one target incarnation. They
+ * outlive the ring (quiesce), since the target's counts do. After a failure the
+ * target may never see some counted put, so the ring's next use takes a new key
+ * (fresh counts on both sides).
  */
 struct nixlLibfabricProxy::TxRing {
-    uint32_t key = 0; // random, 24 bits (wire::ringImm())
-    uint64_t atomics = 0; // atomicAdds sent to the target; the epoch of the next puts
-    std::array<uint64_t, wire::kRingEpochs> slot_puts{}; // fragments sent per epoch slot
+    uint32_t key = 0; // wire::ringKey(): the sender's index at the target, a ring id
+    uint64_t atomics = 0; // atomicAdds sent; the epoch of the puts that follow
+    std::array<uint64_t, wire::kEpochs> slot_puts{}; // fragments sent per epoch slot
     uint32_t inflight = 0; // requests not complete yet
-    nixl_status_t error = NIXL_SUCCESS; // sticky until re-keyed
+    nixl_status_t error = NIXL_SUCCESS; // sticky until the next use re-keys the ring
+    bool ready = false; // key assigned (the engine handshake gave the sender's index)
+    uint64_t aborted_from = std::numeric_limits<uint64_t>::max(); // abort sent from this seq
+    std::weak_ptr<nixlLibfabricConnection> conn; // the target (for ring aborts)
 };
 
-/** Target-side state of one sender ring: what its next atomicAdd waits for. */
+/** Target-side state of one sender ring, shared between proxy threads. */
 struct nixlLibfabricProxy::RxRing {
     // Put fragments arrived per epoch slot (release by the counting thread).
-    std::array<std::atomic<uint64_t>, wire::kRingEpochs> received{};
+    std::array<std::atomic<uint64_t>, wire::kEpochs> received{};
     std::atomic<uint64_t> applied{0}; // atomicAdds applied or failed, in seq order
     std::atomic<int32_t> error{NIXL_SUCCESS}; // first failed atomicAdd: later ones fail
-    std::mutex sender_mutex;
-    std::string sender; // reply EP of the first atomicAdd (detects key collisions)
+    // The sender aborted the ring from this seq on (UINT64_MAX: not aborted).
+    std::atomic<uint64_t> aborted_from{std::numeric_limits<uint64_t>::max()};
 };
 
-/** A receiver-ordered atomicAdd waiting for its ring. */
-struct nixlLibfabricProxy::Deferred {
-    RxRing *ring;
-    wire::atomicAddMsg msg;
-    fi_addr_t reply;
-    uint64_t arrived;
-    bool data_ready = false; // its ring's puts arrived (seen before the flush below)
-    bool flushed = false; // GPUDirect RDMA writes flushed since data_ready
+/** An owner thread's atomicAdds of one ring that wait for it, by seq. */
+struct nixlLibfabricProxy::RxOwned {
+    struct Add {
+        wire::atomicAddMsg msg;
+        fi_addr_t reply;
+        uint64_t arrived;
+        bool flushed = false; // GPUDirect RDMA writes flushed after its puts were counted
+    };
+
+    RxRing *ring = nullptr;
+    std::map<uint64_t, Add> adds;
 };
 
-struct nixlLibfabricProxy::RingFence {
-    nixlLibfabricRingFence<Request> order;
+/** A request waiting for the engine handshake with its target. */
+struct nixlLibfabricProxy::Parked {
+    nixlBackendProxySubmission sub;
+    Request *req;
+    uint64_t since;
+};
+
+/** One runtime ring (channel, peer slot) at the sender. */
+struct nixlLibfabricProxy::Ring {
+    uint32_t channel = 0;
+    uint64_t index = 0; // channel * max_peers + peer slot
     uint32_t next_rail = 0; // unstriped puts rotate over the buffer's rails
-    // Receiver ordering and fence-off: requests in flight, and the first failure
-    // (later atomicAdds fail, as with the fence).
-    uint32_t outstanding = 0;
-    nixl_status_t error = NIXL_SUCCESS;
-    TxRing *tx = nullptr;
+    uint32_t outstanding = 0; // requests in flight, parked ones included
+    nixl_status_t error = NIXL_SUCCESS; // first failure: later atomicAdds fail
+    // Last target and its counts (most rings have one target).
     const nixlLibfabricConnection *tx_conn = nullptr;
+    TxRing *tx = nullptr;
+    bool multi_target_warned = false;
+    std::deque<Parked> parked; // in ring order, behind a pending handshake
 
     [[nodiscard]] bool
     idle() const {
-        return order.idle() && outstanding == 0;
+        return outstanding == 0;
     }
 };
 
 struct nixlLibfabricProxy::RecvBuf {
     OpCtx op; // must stay first
-    uint32_t rail = kCtlRail; // whose EP it is posted on: a data rail, or the control EP
     wire::anyMsg msg;
 };
 
-struct nixlLibfabricProxy::AckBuf {
+struct nixlLibfabricProxy::CtlBuf {
     OpCtx op; // must stay first
-    wire::atomicAckMsg msg;
+    wire::anyMsg msg;
 };
 
-/** An ack waiting for a send buffer or transmit queue room. */
-struct nixlLibfabricProxy::PendingAck {
+/** A control message (ack or ring abort) waiting for a send buffer or queue room. */
+struct nixlLibfabricProxy::PendingCtl {
     fi_addr_t dest;
-    uint64_t token;
-    nixl_status_t status;
+    wire::msgType type;
+    uint64_t token; // ack
+    nixl_status_t status; // ack
+    uint32_t ring; // abort
+    uint64_t first_seq; // abort
 };
 
 struct nixlLibfabricProxy::PendingPost {
@@ -247,25 +267,25 @@ struct nixlLibfabricProxy::PendingPost {
     fi_addr_t dest;
     uint64_t raddr;
     uint64_t rkey;
+    bool has_imm = false; // a write with remote CQ data (to a proxy data EP)
+    uint32_t imm = 0;
     uint64_t queued_at = 0; // entry into the retry queue (profiling only)
     bool inject_error = false; // NIXL_EFA_PROXY_INJECT: fail this post
-    bool has_imm = false; // a write with remote CQ data
-    uint32_t imm = 0;
-    uint64_t rx_index = 0; // the fragment's epoch (tracing)
 };
 
 struct nixlLibfabricProxy::PeerAddrs {
     // Expired once the connection is gone; its address may then be reused.
     std::weak_ptr<const nixlLibfabricConnection> conn;
     // Inserted into this thread's AVs on first use; FI_ADDR_UNSPEC until then.
-    // rail_ep[local_rail][remote_ep] -> remote engine EP in that rail's AV
+    // rail_ep[local_rail][remote_ep] -> remote engine EP (peers without a proxy)
     std::vector<std::vector<fi_addr_t>> rail_ep;
-    // home[remote_thread] -> remote proxy home EP in this thread's home-rail AV
+    // home[remote_thread] -> its control EP, in this thread's control AV
     std::vector<fi_addr_t> home;
-    // data_ep[local_rail][remote_thread * remote_rails + remote_rail] -> remote proxy
-    // data EP in that rail's AV (puts with remote CQ data); sized on first use
+    // data_ep[local_rail][data_index] -> the remote data EP receiving on the remote's
+    // data rail number data_index, in that local rail's AV
     std::vector<std::vector<fi_addr_t>> data_ep;
-    bool warned_no_data_eps = false;
+    // data_index[remote_rail]: its position among the remote's data rails, or -1
+    std::vector<int> data_index;
 };
 
 struct nixlLibfabricProxy::RailRes {
@@ -277,11 +297,7 @@ struct nixlLibfabricProxy::RailRes {
     bool virt_addr = true;
     uint64_t posts = 0; // profiling only
     uint64_t cq_reads = 0; // profiling only
-    std::array<char, LF_EP_NAME_MAX_LEN> name{}; // published when imm_puts_
-    // efa_proxy_test_data_rx_post: receives posted on this data EP
-    std::vector<nixlLibfabricProxy::RecvBuf> rx;
-    struct fid_mr *rx_mr = nullptr;
-    void *rx_desc = nullptr;
+    std::string name; // the data EP's name (published for the receive rails)
 };
 
 struct nixlLibfabricProxy::Thread {
@@ -291,9 +307,9 @@ struct nixlLibfabricProxy::Thread {
     // Held while this thread applies an add; registration changes take all of them.
     std::mutex regions_lock;
     std::vector<RailRes> rails;
-    // Data CQs worth polling: every rail this thread has written on (control
-    // traffic has its own CQ). The rail domains are FI_THREAD_SAFE, so skipping
-    // idle CQs also avoids taking their domain locks.
+    // Data CQs this thread polls: the receive rails it owns, plus every rail it has
+    // written on (its write completions). The rail domains are FI_THREAD_SAFE, so
+    // skipping other CQs also avoids taking their domain locks.
     std::vector<uint32_t> poll_rails;
     std::vector<bool> polled;
     uint32_t passes = 0;
@@ -302,17 +318,15 @@ struct nixlLibfabricProxy::Thread {
     uint64_t cq_error_report = 0; // time of the last report, 0 before the first
     std::unique_ptr<nixlLibfabricProxyProfile> prof; // NIXL_EFA_PROXY_PROFILE only
     uint64_t last_pass = 0;
-    // Control EP on the home rail, with its own CQ and AV (EFA does not share
-    // them between EPs): atomicAdd records and acks have their own send queue,
-    // so they never wait behind bulk writes. Every control address (counter
-    // owners, ack destinations) lives in ctl_av.
+    // Control EP on the home rail, with its own CQ and AV (EFA does not share them
+    // between EPs): atomicAdd records, acks and ring aborts never wait behind bulk
+    // writes. Every control address (counter owners, ack destinations) is in ctl_av.
     struct fid_ep *ctl_ep = nullptr;
     struct fid_cq *ctl_cq = nullptr;
     struct fid_av *ctl_av = nullptr;
     struct fi_info *ctl_info = nullptr;
     uint64_t ctl_cq_reads = 0; // profiling only
-    std::array<char, LF_EP_NAME_MAX_LEN> home_name{}; // the control EP's name
-    size_t home_name_len = 0;
+    std::string home_name; // the control EP's name
 
     std::vector<Request> reqs;
     std::vector<Request *> free_reqs;
@@ -323,40 +337,41 @@ struct nixlLibfabricProxy::Thread {
     struct fid_mr *recv_mr = nullptr;
     void *recv_desc = nullptr;
 
-    std::vector<AckBuf> acks;
-    std::vector<AckBuf *> free_acks;
-    struct fid_mr *ack_mr = nullptr;
-    void *ack_desc = nullptr;
-    std::deque<PendingAck> pending_acks; // in arrival order
-    // Senders' home endpoints, by name, in the home rail's AV (where acks go).
+    std::vector<CtlBuf> ctls;
+    std::vector<CtlBuf *> free_ctls;
+    struct fid_mr *ctl_mr = nullptr;
+    void *ctl_desc = nullptr;
+    std::deque<PendingCtl> pending_ctls; // in order
+    // Senders' control endpoints, by name, in ctl_av (where acks go).
     std::unordered_map<std::string, fi_addr_t, NameHash, std::equal_to<>> reply_addrs;
     // atomicAdds whose ack is outstanding (entries go stale once acked; pruned on scans).
     std::vector<Request *> awaiting;
     uint32_t ack_scan = 0;
 
     // Back-pressured posts per rail, plus one for the control EP (last): a full
-    // transmit queue does not hold back the others (the fence, not posting
-    // order, orders a ring).
+    // transmit queue does not hold back the others (the target, not posting order,
+    // orders a ring).
     std::vector<std::deque<PendingPost>> retry;
     size_t retry_count = 0;
     std::vector<RecvBuf *> recv_retry; // receive buffers the EP could not take yet
-    std::unordered_map<uint64_t, RingFence> fences;
+    std::unordered_map<uint64_t, Ring> rings; // by channel * max_peers + peer
+    std::vector<uint64_t> parked_rings; // rings with parked requests
     std::unordered_map<const nixlLibfabricConnection *, PeerAddrs> peers;
     int cuda_dev = -1;
 
-    // Receiver ordering, sender side: counts per (peer, incarnation, ring).
-    std::map<std::tuple<std::string, uint64_t, uint32_t>, TxRing> tx_rings;
-    std::mt19937 rng{std::random_device{}()};
-    // Target side: rings by key (shared RxRing objects, cached), the atomicAdds
-    // this thread owns that wait for their rings, and whether the last CQ sweep
-    // found remote CQ data (the thread then keeps polling on every pass).
+    // Sender side: counts per (target, incarnation, runtime ring).
+    std::map<std::tuple<std::string, uint64_t, uint64_t>, TxRing> tx_rings;
+    // Target side: rings by key (shared RxRing objects, cached), the atomicAdds this
+    // thread owns that wait for their rings, and whether the last CQ sweep found
+    // remote CQ data (the thread then keeps polling on every pass).
     std::unordered_map<uint32_t, RxRing *> rx_cache;
     uint32_t rx_last_key = 0;
     RxRing *rx_last = nullptr;
-    std::vector<Deferred> deferred;
+    std::unordered_map<RxRing *, RxOwned> owned;
+    uint64_t next_deferred_scan = 0;
     bool rx_active = false;
 
-    // Profiling of the remote CQ data path (NIXL_EFA_PROXY_PROFILE only).
+    // Profiling (NIXL_EFA_PROXY_PROFILE only).
     struct RxStats {
         uint64_t entries = 0; // CQ entries with remote CQ data
         uint64_t reads = 0; // fi_cq_read calls that returned any
@@ -366,13 +381,11 @@ struct nixlLibfabricProxy::Thread {
         uint64_t sweep_ns = 0; // in those sweeps
         uint64_t first = 0; // first and last entry (nowNs)
         uint64_t last = 0;
-        uint64_t consumed_rx = 0; // entries that consumed a posted data-EP receive
-        uint64_t deferred = 0; // atomicAdds that had to wait at the target
+        uint64_t flushes = 0; // GPUDirect RDMA write flushes before atomicAdds
     } rx_stats;
-
     uint64_t sweep_imm = 0; // entries found in the current sweep
-    // Profiling, any ordering mode: time in progress() passes that did work (read a
-    // CQ entry or applied a deferred add), and the span from the first to the last.
+    // Time in progress() passes that did work (read a CQ entry or applied an add),
+    // and the span from the first to the last.
     uint64_t events = 0;
     uint64_t busy_ns = 0;
     uint64_t busy_first = 0;
@@ -383,6 +396,7 @@ struct nixlLibfabricProxy::Thread {
     std::unordered_map<int, cudaStream_t> streams;
 #endif
 };
+
 
 /**
  * Host access to VRAM counters for the target-side add. GDRCopy maps each 64 KB
@@ -621,9 +635,20 @@ struct nixlLibfabricProxy::Inject {
 
 nixlLibfabricProxy::nixlLibfabricProxy(nixlLibfabricEngine &engine) : engine_(engine) {
     const nixl_b_params_t &params = engine_.getCustomParams();
-    if (params.count("efa_proxy_delivery_complete") != 0) {
-        NIXL_WARN << "EFA proxy: efa_proxy_delivery_complete is no longer supported; puts always "
-                  << "use FI_DELIVERY_COMPLETE, which the put -> atomicAdd ordering relies on";
+    for (const char *gone : {"efa_proxy_delivery_complete",
+                             "efa_proxy_rx_thread",
+                             "efa_proxy_data_rx_size",
+                             "efa_proxy_test_put_imm",
+                             "efa_proxy_test_fence_off",
+                             "efa_proxy_test_data_rx_post"}) {
+        if (params.count(gone) != 0) {
+            NIXL_WARN << "EFA proxy: " << gone << " is no longer supported; ignored";
+        }
+    }
+    if (auto order = params.find("efa_proxy_ordering");
+        order != params.end() && order->second != "receiver") {
+        NIXL_WARN << "EFA proxy: efa_proxy_ordering=" << order->second
+                  << " is no longer supported: put -> atomicAdd order is kept at the target";
     }
     idle_poll_ns_ = kDefaultIdlePollUs * 1000;
     if (auto idle = params.find("efa_proxy_idle_poll_us"); idle != params.end()) {
@@ -635,8 +660,7 @@ nixlLibfabricProxy::nixlLibfabricProxy(nixlLibfabricEngine &engine) : engine_(en
                       << "'; using " << kDefaultIdlePollUs;
         }
     }
-    auto it = params.find("efa_proxy_rail_policy");
-    if (it != params.end()) {
+    if (auto it = params.find("efa_proxy_rail_policy"); it != params.end()) {
         if (it->second == "ring") {
             rail_per_thread_ = false;
         } else if (it->second != "thread") {
@@ -644,79 +668,18 @@ nixlLibfabricProxy::nixlLibfabricProxy(nixlLibfabricEngine &engine) : engine_(en
                       << "'; using 'thread'";
         }
     }
+    if (auto it = params.find("efa_proxy_rx_flush"); it != params.end()) {
+        if (it->second == "1" || it->second == "0") {
+            rx_flush_param_ = it->second == "1" ? 1 : 0;
+        } else {
+            NIXL_WARN << "EFA proxy: invalid efa_proxy_rx_flush '" << it->second
+                      << "'; using the platform default";
+        }
+    }
     const char *profile = std::getenv("NIXL_EFA_PROXY_PROFILE");
     profile_ = profile != nullptr && *profile != '\0' && std::string(profile) != "0";
-    const char *rx_trace = std::getenv("NIXL_EFA_PROXY_RXTRACE");
-    rx_trace_ = rx_trace != nullptr && *rx_trace != '\0' && std::string(rx_trace) != "0";
     inject_ = Inject::fromEnv();
     counters_ = std::make_unique<CounterMap>(!(inject_ && inject_->no_gdrcopy));
-
-    if (auto rx = params.find("efa_proxy_rx_thread"); rx != params.end()) {
-        if (rx->second == "rail") {
-            rx_by_rail_ = true;
-        } else if (rx->second != "ring") {
-            NIXL_WARN << "EFA proxy: unknown efa_proxy_rx_thread '" << rx->second
-                      << "'; using 'ring'";
-        }
-    }
-    if (auto order = params.find("efa_proxy_ordering"); order != params.end()) {
-        if (order->second == "receiver") {
-            receiver_order_ = true;
-        } else if (order->second != "sender") {
-            NIXL_WARN << "EFA proxy: unknown efa_proxy_ordering '" << order->second
-                      << "'; using 'sender'";
-        }
-    }
-    const auto count_param = [&params](const char *name, size_t &value) {
-        auto it = params.find(name);
-        if (it == params.end()) {
-            return false;
-        }
-        try {
-            value = std::stoull(it->second);
-        }
-        catch (const std::exception &) {
-            NIXL_WARN << "EFA proxy: invalid " << name << " '" << it->second << "'; ignored";
-            return false;
-        }
-        return true;
-    };
-    data_rx_size_ = kIdleRxSize;
-    count_param("efa_proxy_data_rx_size", data_rx_size_);
-    size_t rx_flush = 1;
-    count_param("efa_proxy_rx_flush", rx_flush);
-    rx_flush_ = rx_flush != 0;
-    size_t put_imm = 0, fence_off = 0;
-    const bool test_params = count_param("efa_proxy_test_put_imm", put_imm) |
-        count_param("efa_proxy_test_fence_off", fence_off) |
-        count_param("efa_proxy_test_data_rx_post", test_data_rx_post_);
-#ifdef NDEBUG
-    if (test_params) {
-        NIXL_WARN << "EFA proxy: efa_proxy_test_* parameters are ignored in NDEBUG builds";
-    }
-    put_imm = fence_off = test_data_rx_post_ = 0;
-#else
-    static_cast<void>(test_params);
-#endif
-    test_put_imm_ = put_imm != 0;
-    test_fence_off_ = fence_off != 0;
-    if (receiver_order_ && !rx_flush_) {
-        NIXL_WARN << "EFA proxy: efa_proxy_rx_flush=0: a receiver-ordered atomicAdd may become "
-                  << "visible to the GPU before the puts it orders (measurement only)";
-    }
-    if (test_fence_off_ && receiver_order_) {
-        NIXL_WARN << "EFA proxy: efa_proxy_test_fence_off applies to sender ordering; ignored";
-        test_fence_off_ = false;
-    }
-    if (test_fence_off_) {
-        NIXL_WARN << "EFA proxy: TEST ONLY: atomicAdds do not wait for earlier operations; "
-                  << "put -> atomicAdd ordering is NOT guaranteed";
-    }
-    if (test_put_imm_) {
-        NIXL_WARN << "EFA proxy: TEST ONLY: puts carry remote CQ data to the target's proxy "
-                  << "threads (sender-side ordering unchanged)";
-    }
-    imm_puts_ = receiver_order_ || test_put_imm_;
     incarnation_ = std::random_device{}() | static_cast<uint64_t>(std::random_device{}()) << 32;
 }
 
@@ -751,16 +714,26 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
         NIXL_ERROR << "EFA proxy: needs at least one thread and one rail";
         return NIXL_ERR_INVALID_PARAM;
     }
+    if (config.ring_depth > wire::kEpochs) {
+        // A ring's epoch slots are reused every kEpochs atomicAdds.
+        NIXL_ERROR << "EFA proxy: supports a ring depth of at most " << wire::kEpochs << ", not "
+                   << config.ring_depth;
+        return NIXL_ERR_INVALID_PARAM;
+    }
 
-    // Home rails (atomicAdd records) on the EFA devices next to this process's
-    // GPU, so signals stay off the other GPUs' NICs; all rails without a GPU.
+    // Home rails (control EPs) and receive rails on the EFA devices next to this
+    // process's GPU, where its GPU buffers are registered; all rails without a GPU.
     std::vector<size_t> home_rails;
+    int cc_major = 0;
 #ifdef HAVE_CUDA
     int dev = 0;
     char bus_id[32] = {};
     if (cudaGetDevice(&dev) == cudaSuccess &&
         cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), dev) == cudaSuccess) {
         home_rails = engine_.rail_manager_.railsForAccelerator(bus_id);
+    }
+    if (cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        cc_major = 0;
     }
 #endif
     if (home_rails.empty()) {
@@ -772,12 +745,14 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
     for (size_t r : home_rails) {
         rx_rails_.push_back(static_cast<uint32_t>(r));
     }
-    if (receiver_order_ && config.ring_depth > wire::kRingEpochs) {
-        // Epoch slots are reused every kRingEpochs atomicAdds of a ring.
-        NIXL_ERROR << "EFA proxy: receiver ordering supports a ring depth of at most "
-                   << wire::kRingEpochs << ", not " << config.ring_depth;
-        return NIXL_ERR_INVALID_PARAM;
-    }
+    // As NCCL (ncclTopoNeedFlush): GPUDirect RDMA writes need a flush before a
+    // dependent signal only before Hopper, and on C2C (aarch64) platforms.
+#if defined(__aarch64__)
+    const bool flush_default = true;
+#else
+    const bool flush_default = cc_major < 9;
+#endif
+    rx_flush_ = rx_flush_param_ < 0 ? flush_default : rx_flush_param_ == 1;
 
     for (uint32_t t = 0; t < threads_; ++t) {
         auto th = std::make_unique<Thread>();
@@ -788,7 +763,7 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
         th->home = static_cast<uint32_t>(home_rails[t % home_rails.size()]);
         th->rails.resize(rails_);
         th->retry.resize(rails_ + 1);
-        th->polled.assign(rails_, false); // data CQs join poll_rails once posted on
+        th->polled.assign(rails_, false);
 
         for (size_t r = 0; r < rails_; ++r) {
             RailRes &rr = th->rails[r];
@@ -801,7 +776,7 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
                 return NIXL_ERR_BACKEND;
             }
             rr.info->tx_attr->size = std::min(rr.info->tx_attr->size, kTxSize);
-            rr.info->rx_attr->size = std::min(rr.info->rx_attr->size, data_rx_size_);
+            rr.info->rx_attr->size = std::min(rr.info->rx_attr->size, kDataRxSize);
             rr.virt_addr = (rr.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0;
 
             struct fi_cq_attr cq_attr = {};
@@ -829,8 +804,10 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
                 ret = fi_enable(rr.ep);
             }
             if (!ret) {
-                size_t len = rr.name.size();
-                ret = fi_getname(&rr.ep->fid, rr.name.data(), &len);
+                std::array<char, LF_EP_NAME_MAX_LEN> name{};
+                size_t len = name.size();
+                ret = fi_getname(&rr.ep->fid, name.data(), &len);
+                rr.name.assign(name.data(), std::min(len, name.size()));
             }
             if (ret) {
                 NIXL_ERROR << "EFA proxy: endpoint setup failed for thread " << t << " rail " << r
@@ -875,9 +852,10 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
                 ret = fi_enable(th->ctl_ep);
             }
             if (!ret) {
-                size_t len = th->home_name.size();
-                ret = fi_getname(&th->ctl_ep->fid, th->home_name.data(), &len);
-                th->home_name_len = len;
+                std::array<char, LF_EP_NAME_MAX_LEN> name{};
+                size_t len = name.size();
+                ret = fi_getname(&th->ctl_ep->fid, name.data(), &len);
+                th->home_name.assign(name.data(), std::min(len, name.size()));
             }
             if (ret) {
                 NIXL_ERROR << "EFA proxy: control endpoint setup failed for thread " << t << ": "
@@ -913,11 +891,11 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
         for (auto &buf : th->recvs) {
             buf.op.kind = OpCtx::Kind::RECV;
         }
-        th->acks.resize(kAckPoolSize);
-        th->free_acks.reserve(kAckPoolSize);
-        for (auto &buf : th->acks) {
-            buf.op.kind = OpCtx::Kind::ACK;
-            th->free_acks.push_back(&buf);
+        th->ctls.resize(kCtlPoolSize);
+        th->free_ctls.reserve(kCtlPoolSize);
+        for (auto &buf : th->ctls) {
+            buf.op.kind = OpCtx::Kind::CTL;
+            th->free_ctls.push_back(&buf);
         }
         struct fid_domain *home_domain = th->rails[th->home].domain;
         int ret = fi_mr_reg(home_domain,
@@ -942,13 +920,13 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
         }
         if (!ret) {
             ret = fi_mr_reg(home_domain,
-                            th->acks.data(),
-                            th->acks.size() * sizeof(AckBuf),
+                            th->ctls.data(),
+                            th->ctls.size() * sizeof(CtlBuf),
                             FI_SEND,
                             0,
                             0,
                             0,
-                            &th->ack_mr,
+                            &th->ctl_mr,
                             nullptr);
         }
         if (ret) {
@@ -959,7 +937,7 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
         }
         th->req_desc = fi_mr_desc(th->req_mr);
         th->recv_desc = fi_mr_desc(th->recv_mr);
-        th->ack_desc = fi_mr_desc(th->ack_mr);
+        th->ctl_desc = fi_mr_desc(th->ctl_mr);
 
         for (auto &buf : th->recvs) {
             if (postRecv(*th, &buf) == NIXL_ERR_BACKEND) {
@@ -968,78 +946,32 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
             }
         }
 
-        // Puts with remote CQ data arrive on the data EPs of the rails next to
-        // the GPU (where GPU buffers are registered): their CQs are polled too, by
-        // every thread, or with efa_proxy_rx_thread=rail only by the rail's own.
-        if (imm_puts_) {
-            for (size_t i = 0; i < rx_rails_.size(); ++i) {
-                const uint32_t r = rx_rails_[i];
-                if (rx_by_rail_ && i % threads_ != t) {
-                    continue;
-                }
-                if (!th->polled[r]) {
-                    th->polled[r] = true;
-                    th->poll_rails.push_back(r);
-                }
-            }
-        }
-        for (size_t r = 0; test_data_rx_post_ != 0 && r < rails_; ++r) {
-            if (!th->polled[r]) {
-                continue;
-            }
-            RailRes &rr = th->rails[r];
-            rr.rx.resize(test_data_rx_post_);
-            int rc = fi_mr_reg(rr.domain,
-                               rr.rx.data(),
-                               rr.rx.size() * sizeof(RecvBuf),
-                               FI_RECV,
-                               0,
-                               0,
-                               0,
-                               &rr.rx_mr,
-                               nullptr);
-            if (rc) {
-                NIXL_ERROR << "EFA proxy: fi_mr_reg failed for data receives: " << fi_strerror(-rc);
-                releaseThread(*th);
-                return NIXL_ERR_BACKEND;
-            }
-            rr.rx_desc = fi_mr_desc(rr.rx_mr);
-            for (auto &buf : rr.rx) {
-                buf.op.kind = OpCtx::Kind::RECV;
-                buf.rail = static_cast<uint32_t>(r);
-                if (postRecv(*th, &buf) == NIXL_ERR_BACKEND) {
-                    releaseThread(*th);
-                    return NIXL_ERR_BACKEND;
-                }
+        // The receive rails this thread owns: it polls their data CQs from the start
+        // (puts arrive there before this thread posts anything on them).
+        for (size_t i = 0; i < rx_rails_.size(); ++i) {
+            const uint32_t r = rx_rails_[i];
+            if (wire::railThread(static_cast<uint32_t>(i), threads_) == t && !th->polled[r]) {
+                th->polled[r] = true;
+                th->poll_rails.push_back(r);
             }
         }
         thread_state_.push_back(std::move(th));
     }
 
-    const fi_info *ctl = thread_state_[0]->ctl_info;
-    NIXL_INFO << "EFA proxy: EP queues: transmit " << kTxSize << " and receive " << kIdleRxSize
-              << " (at most) on data EPs; transmit " << ctl->tx_attr->size << " and receive "
-              << ctl->rx_attr->size << " on control EPs";
-    std::string homes;
+    std::string homes, receivers;
     for (const auto &th : thread_state_) {
         homes += (homes.empty() ? "" : ",") + std::to_string(th->home);
     }
+    for (size_t i = 0; i < rx_rails_.size(); ++i) {
+        receivers += (receivers.empty() ? "" : ",") + std::to_string(rx_rails_[i]) + ":" +
+            std::to_string(wire::railThread(static_cast<uint32_t>(i), threads_));
+    }
     NIXL_INFO << "EFA proxy: " << threads_ << " thread(s) x " << rails_
-              << " rail(s) = " << threads_ * rails_ << " endpoint(s); home rails " << homes
-              << "; small puts per " << (rail_per_thread_ ? "thread" : "ring")
-              << " rail; idle poll every " << idle_poll_ns_ / 1000 << " us; ordering "
-              << (receiver_order_     ? "receiver" :
-                      test_fence_off_ ? "none (test)" :
-                                        "sender")
-              << (test_put_imm_ ? " with remote CQ data puts (test)" : "")
-              << (imm_puts_ ? (rx_by_rail_ ? ", counted by rail" : ", counted by ring") : "")
-              << "; fabric "
-              << (ctl->fabric_attr && ctl->fabric_attr->name ? ctl->fabric_attr->name : "?")
-              << ", data EP receive queue " << data_rx_size_ << ", " << test_data_rx_post_
-              << " receive(s) posted per data EP"
-              << (receiver_order_ ? (rx_flush_ ? "; GPUDirect RDMA writes flushed before adds" :
-                                                 "; GPUDirect RDMA writes NOT flushed") :
-                                    "");
+              << " rail(s); control EPs on rails " << homes << "; puts received on rail:thread "
+              << receivers << "; small puts per " << (rail_per_thread_ ? "thread" : "ring")
+              << " rail; idle poll every " << idle_poll_ns_ / 1000 << " us; GPUDirect RDMA "
+              << (rx_flush_ ? "flushed" : "not flushed") << " before atomicAdds (compute "
+              << cc_major << ".x)";
     return NIXL_SUCCESS;
 }
 
@@ -1079,27 +1011,24 @@ nixlLibfabricProxy::releaseThread(Thread &th) {
     }
     close(th.req_mr ? &th.req_mr->fid : nullptr);
     close(th.recv_mr ? &th.recv_mr->fid : nullptr);
-    close(th.ack_mr ? &th.ack_mr->fid : nullptr);
-    for (auto &rr : th.rails) {
-        close(rr.rx_mr ? &rr.rx_mr->fid : nullptr);
-        rr.rx_mr = nullptr;
-    }
+    close(th.ctl_mr ? &th.ctl_mr->fid : nullptr);
     th.req_mr = nullptr;
     th.recv_mr = nullptr;
-    th.ack_mr = nullptr;
+    th.ctl_mr = nullptr;
     th.retry.clear();
     th.retry_count = 0;
     th.recv_retry.clear();
-    th.pending_acks.clear();
+    th.pending_ctls.clear();
     th.reply_addrs.clear();
     th.awaiting.clear();
     th.poll_rails.clear();
-    th.fences.clear();
+    th.rings.clear();
+    th.parked_rings.clear();
     th.peers.clear();
     th.tx_rings.clear();
     th.rx_cache.clear();
     th.rx_last = nullptr;
-    th.deferred.clear();
+    th.owned.clear();
 #ifdef HAVE_CUDA
     for (auto &[device, stream] : th.streams) {
         if (stream != nullptr) {
@@ -1114,32 +1043,65 @@ nixl_status_t
 nixlLibfabricProxy::shutdown() {
     // Runs after the runtime has joined every proxy thread.
     if (profile_ && !thread_state_.empty()) {
-        nixlLibfabricProxyProfile total;
-        for (const auto &th : thread_state_) {
-            total.merge(*th->prof);
-        }
-        for (const std::string &line : total.report()) {
-            NIXL_INFO << "EFA proxy profile: " << line;
-        }
-        reportRx();
+        report();
     }
     for (auto &th : thread_state_) {
-        if (!th->deferred.empty()) {
-            NIXL_WARN << "EFA proxy: thread " << th->id << ": " << th->deferred.size()
-                      << " receiver-ordered atomicAdd(s) still waiting at shutdown";
-        }
         if (th->cq_errors != 0) {
             NIXL_ERROR << "EFA proxy: thread " << th->id << ": " << th->cq_errors
                        << " CQ error(s) since the last report";
         }
-        if (!th->pending_acks.empty()) {
-            NIXL_WARN << "EFA proxy: thread " << th->id << ": " << th->pending_acks.size()
-                      << " atomicAdd ack(s) not sent at shutdown";
+        size_t waiting = 0;
+        for (const auto &[ring, owned] : th->owned) {
+            waiting += owned.adds.size();
+        }
+        if (waiting != 0) {
+            NIXL_WARN << "EFA proxy: thread " << th->id << ": " << waiting
+                      << " atomicAdd(s) still waiting for their rings at shutdown";
+        }
+        if (!th->pending_ctls.empty()) {
+            NIXL_WARN << "EFA proxy: thread " << th->id << ": " << th->pending_ctls.size()
+                      << " control message(s) not sent at shutdown";
         }
         releaseThread(*th);
     }
     thread_state_.clear();
     return NIXL_SUCCESS;
+}
+
+void
+nixlLibfabricProxy::report() const {
+    // Straight to stderr: the summary is wanted without turning on INFO logging.
+    nixlLibfabricProxyProfile total;
+    for (const auto &th : thread_state_) {
+        total.merge(*th->prof);
+    }
+    for (const std::string &line : total.report()) {
+        std::fprintf(stderr, "EFA proxy profile: %s\n", line.c_str());
+    }
+    for (const auto &th : thread_state_) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(1);
+        if (th->busy_ns != 0) {
+            const double window = double(th->busy_last - th->busy_first);
+            out << "EFA proxy cpu: thread " << th->id << ": events=" << th->events
+                << " busy_ms=" << th->busy_ns / 1e6 << " window_ms=" << window / 1e6
+                << " busy_pct=" << (window > 0 ? 100.0 * th->busy_ns / window : 0.0) << "\n";
+        }
+        const auto &st = th->rx_stats;
+        if (st.entries != 0 || st.flushes != 0) {
+            const double window = st.last > st.first ? double(st.last - st.first) : 0.0;
+            const double entries = st.entries != 0 ? double(st.entries) : 1.0;
+            out << "EFA proxy rx: thread " << th->id << ": entries=" << st.entries
+                << " reads=" << st.reads << " sweeps=" << st.sweeps << " window_ms=" << window / 1e6
+                << " sweep_ns_per_entry=" << double(st.sweep_ns) / entries
+                << " read_ns_per_entry=" << double(st.read_ns) / entries
+                << " decode_ns_per_entry=" << double(st.decode_ns) / entries
+                << " entries_per_read=" << double(st.entries) / std::max<uint64_t>(st.reads, 1)
+                << " busy_pct=" << (window > 0 ? 100.0 * double(st.sweep_ns) / window : 0.0)
+                << " flushes=" << st.flushes << "\n";
+        }
+        std::fputs(out.str().c_str(), stderr);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1156,15 +1118,15 @@ nixlLibfabricProxy::allocRequest(Thread &th) {
     req->in_use = true;
     ++req->generation;
     req->frags_left = 0;
-    req->awaiting_ack = false;
-    req->status = NIXL_IN_PROG;
-    req->fence = nullptr;
-    req->epoch = nullptr;
-    req->dest = FI_ADDR_UNSPEC;
-    req->inject_cq_error = false;
     req->counted = false;
     req->is_atomic = false;
+    req->awaiting_ack = false;
+    req->status = NIXL_IN_PROG;
+    req->ring = nullptr;
     req->tx = nullptr;
+    req->seq = 0;
+    req->dest = FI_ADDR_UNSPEC;
+    req->inject_cq_error = false;
     req->t_post = 0;
     req->t_done = 0;
     return req;
@@ -1206,38 +1168,29 @@ nixl_status_t
 nixlLibfabricProxy::submit(const nixlBackendProxySubmission &sub,
                            nixlBackendProxyRequest &request) {
     Thread &th = ownerOf(sub.channel_id);
-    const uint32_t t = th.id;
-    const uint64_t ring_key =
+    const uint64_t ring_index =
         static_cast<uint64_t>(sub.channel_id) * config_.max_peers + sub.peer_index;
-    RingFence &fence = th.fences[ring_key];
-    // A put that fails before joining the fence must still fail the atomicAdd
-    // that closes its epoch, or the target would get a signal without the data.
-    const auto fail_put = [&](nixl_status_t status) {
-        if (sub.opcode == nixl_proxy_opcode_t::PUT) {
-            if (receiver_order_) {
-                // Never counted, so no atomicAdd sent so far waits for it: only
-                // later ones must fail.
-                if (fence.error == NIXL_SUCCESS) {
-                    fence.error = status;
-                }
-            } else if (!test_fence_off_) {
-                fence.order.complete(fence.order.addPut(), status);
-                releaseFence(th, fence);
-            }
-        }
-        return status;
-    };
+    auto [it, created] = th.rings.try_emplace(ring_index);
+    Ring &ring = it->second;
+    if (created) {
+        ring.channel = sub.channel_id;
+        ring.index = ring_index;
+    }
+    const bool is_put = sub.opcode == nixl_proxy_opcode_t::PUT;
 
     Request *req = allocRequest(th);
     if (!req) {
-        NIXL_ERROR << "EFA proxy: request pool exhausted on thread " << t;
-        return fail_put(NIXL_ERR_BACKEND);
+        NIXL_ERROR << "EFA proxy: request pool exhausted on thread " << th.id;
+        if (is_put && ring.error == NIXL_SUCCESS) {
+            ring.error = NIXL_ERR_BACKEND; // never signal after a put that did not leave
+        }
+        return NIXL_ERR_BACKEND;
     }
-    req->fence = &fence;
+    req->ring = &ring;
+    req->is_atomic = !is_put;
     if (th.prof) {
         req->t_submit = nixlLibfabricProxyProfile::now();
-        req->prof_op = sub.opcode == nixl_proxy_opcode_t::PUT ? nixlLibfabricProxyProfile::PUT :
-                                                                nixlLibfabricProxyProfile::ATOMIC;
+        req->prof_op = is_put ? nixlLibfabricProxyProfile::PUT : nixlLibfabricProxyProfile::ATOMIC;
         req->prof_class = static_cast<uint8_t>(nixlLibfabricProxyProfile::sizeClass(sub.size));
     }
 
@@ -1249,25 +1202,29 @@ nixlLibfabricProxy::submit(const nixlBackendProxySubmission &sub,
     }
 #endif
 
-    nixl_status_t status;
-    switch (sub.opcode) {
-    case nixl_proxy_opcode_t::PUT:
-        status = submitPut(th, sub, req);
-        break;
-    case nixl_proxy_opcode_t::ATOMIC_ADD:
-        status = submitAtomic(th, sub, req);
-        break;
-    default:
-        status = NIXL_ERR_NOT_SUPPORTED;
-        break;
+    // Behind requests parked for a handshake, so the ring keeps its order.
+    bool park = !ring.parked.empty();
+    nixl_status_t status = NIXL_SUCCESS;
+    if (!park) {
+        status = submitOp(th, ring, sub, req, park);
     }
-    if (status != NIXL_SUCCESS) {
+    if (park) {
+        if (ring.parked.empty()) {
+            th.parked_rings.push_back(ring_index);
+        }
+        ring.parked.push_back(Parked{sub, req, nowNs()});
+        req->counted = true;
+        ++ring.outstanding;
+    } else if (status != NIXL_SUCCESS) {
         freeRequest(th, req);
-        return fail_put(status);
+        if (is_put && ring.error == NIXL_SUCCESS) {
+            ring.error = status; // never signal after a put that did not leave
+        }
+        return status;
     }
 
     request.token = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(req));
-    request.context = t;
+    request.context = th.id;
     return NIXL_IN_PROG;
 }
 
@@ -1298,10 +1255,161 @@ nixlLibfabricProxy::checkCompletion(const nixlBackendProxyRequest &request) {
 }
 
 nixl_status_t
-nixlLibfabricProxy::submitPut(Thread &th, const nixlBackendProxySubmission &sub, Request *req) {
+nixlLibfabricProxy::submitOp(Thread &th,
+                             Ring &ring,
+                             const nixlBackendProxySubmission &sub,
+                             Request *req,
+                             bool &parked) {
+    parked = false;
+    auto *remote = static_cast<nixlLibfabricPublicMetadata *>(sub.remote.desc.metadataP);
+    if (!remote || !remote->conn_) {
+        NIXL_ERROR << "EFA proxy: operation without libfabric metadata";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const auto &conn = remote->conn_;
+    TxRing *tx = nullptr;
+    if (!conn->remote_proxy_ep_names_.empty()) {
+        nixl_status_t status = NIXL_SUCCESS;
+        tx = txRing(th, ring, conn, status);
+        if (status != NIXL_SUCCESS) {
+            return status;
+        }
+        if (tx == nullptr) {
+            parked = true; // the handshake with the target has not arrived yet
+            return NIXL_SUCCESS;
+        }
+    }
+    switch (sub.opcode) {
+    case nixl_proxy_opcode_t::PUT:
+        return submitPut(th, ring, sub, req, tx);
+    case nixl_proxy_opcode_t::ATOMIC_ADD:
+        if (tx == nullptr) {
+            NIXL_ERROR << "EFA proxy: peer " << conn->remoteAgent_
+                       << " published no (compatible) device proxy; atomicAdd unavailable";
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+        return submitAtomic(th, ring, sub, req, tx);
+    default:
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+}
+
+nixlLibfabricProxy::TxRing *
+nixlLibfabricProxy::txRing(Thread &th,
+                           Ring &ring,
+                           const std::shared_ptr<nixlLibfabricConnection> &conn,
+                           nixl_status_t &status) {
+    TxRing *tx = ring.tx;
+    if (tx == nullptr || ring.tx_conn != conn.get()) {
+        if (ring.tx_conn != nullptr && ring.tx_conn != conn.get() && !ring.multi_target_warned) {
+            ring.multi_target_warned = true;
+            NIXL_WARN << "EFA proxy: ring (channel " << ring.channel << ", slot "
+                      << ring.index % config_.max_peers << ") carries operations to more than "
+                      << "one agent; an atomicAdd is ordered only after the puts to its own "
+                      << "target";
+        }
+        tx = &th.tx_rings[std::make_tuple(
+            conn->remoteAgent_, conn->remote_proxy_incarnation_, ring.index)];
+        if (tx->error != NIXL_SUCCESS && tx->inflight == 0) {
+            // Failed before: some counted put may never have reached the target, so
+            // the counts are no longer shared. Start over under a new key.
+            *tx = TxRing{};
+        }
+        ring.tx = tx;
+        ring.tx_conn = conn.get();
+        tx->conn = conn;
+    }
+    if (tx->ready) {
+        return tx;
+    }
+    // The key holds the sender's index at the target, which the engine handshake
+    // carries; requests wait for it (they are parked) rather than guess.
+    uint32_t sender_index = 0;
+    if (conn->remoteAgent_ != engine_.localAgent) {
+        if (!conn->handshake_received_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        sender_index = conn->local_agent_idx_at_remote_;
+    }
+    if (sender_index > wire::kMaxSenderIndex || conn->remote_proxy_data_rails_.empty()) {
+        NIXL_ERROR << "EFA proxy: cannot order operations to " << conn->remoteAgent_ << " (index "
+                   << sender_index << ", " << conn->remote_proxy_data_rails_.size()
+                   << " receive rail(s))";
+        status = NIXL_ERR_NOT_SUPPORTED;
+        return nullptr;
+    }
+    uint32_t ring_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(ring_ids_mutex_);
+        uint32_t &next =
+            next_ring_id_[std::make_pair(conn->remoteAgent_, conn->remote_proxy_incarnation_)];
+        if (next >= wire::kRingIds) {
+            NIXL_ERROR << "EFA proxy: ring ids towards " << conn->remoteAgent_ << " exhausted";
+            status = NIXL_ERR_BACKEND;
+            return nullptr;
+        }
+        ring_id = next++;
+    }
+    tx->key = wire::ringKey(sender_index, ring_id);
+    tx->ready = true;
+    return tx;
+}
+
+void
+nixlLibfabricProxy::replayParked(Thread &th, uint64_t now_ns) {
+    for (size_t i = 0; i < th.parked_rings.size();) {
+        auto it = th.rings.find(th.parked_rings[i]);
+        if (it == th.rings.end()) {
+            th.parked_rings[i] = th.parked_rings.back();
+            th.parked_rings.pop_back();
+            continue;
+        }
+        Ring &ring = it->second;
+        while (!ring.parked.empty()) {
+            Parked &p = ring.parked.front();
+            // Uncounted while it is tried again; submitOp counts it once it leaves.
+            p.req->counted = false;
+            --ring.outstanding;
+            bool park = false;
+            nixl_status_t status = submitOp(th, ring, p.sub, p.req, park);
+            if (park && now_ns - p.since < kHandshakeTimeoutNs) {
+                p.req->counted = true;
+                ++ring.outstanding;
+                break;
+            }
+            if (park) {
+                NIXL_ERROR << "EFA proxy: no engine handshake with the target of ring (channel "
+                           << ring.channel << ") after " << kHandshakeTimeoutNs / 1000000000
+                           << " s; failing its requests";
+                status = NIXL_ERR_REMOTE_DISCONNECT;
+            }
+            if (status != NIXL_SUCCESS) {
+                p.req->status = status;
+                p.req->frags_left = 0;
+                if (!p.req->is_atomic && ring.error == NIXL_SUCCESS) {
+                    ring.error = status;
+                }
+            }
+            ring.parked.pop_front();
+        }
+        if (ring.parked.empty()) {
+            th.parked_rings[i] = th.parked_rings.back();
+            th.parked_rings.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+nixl_status_t
+nixlLibfabricProxy::submitPut(Thread &th,
+                              Ring &ring,
+                              const nixlBackendProxySubmission &sub,
+                              Request *req,
+                              TxRing *tx) {
     auto *local = static_cast<nixlLibfabricPrivateMetadata *>(sub.local.desc.metadataP);
     auto *remote = static_cast<nixlLibfabricPublicMetadata *>(sub.remote.desc.metadataP);
-    if (!local || !remote || !remote->conn_) {
+    if (!local) {
         NIXL_ERROR << "EFA proxy: put without libfabric metadata";
         return NIXL_ERR_INVALID_PARAM;
     }
@@ -1315,6 +1423,7 @@ nixlLibfabricProxy::submitPut(Thread &th, const nixlBackendProxySubmission &sub,
     if (!peer) {
         return NIXL_ERR_BACKEND;
     }
+    const nixlLibfabricConnection &conn = *remote->conn_;
 
     const size_t size = sub.size;
     if (size == 0) {
@@ -1322,36 +1431,19 @@ nixlLibfabricProxy::submitPut(Thread &th, const nixlBackendProxySubmission &sub,
         return NIXL_SUCCESS;
     }
 
-    // Puts with remote CQ data go to the data EPs of the target threads that
-    // count them (rxThread()).
-    TxRing *tx = nullptr;
-    if (imm_puts_) {
-        const auto &data = remote->conn_->remote_proxy_data_ep_names_;
-        if (data.empty()) {
-            if (!peer->warned_no_data_eps) {
-                peer->warned_no_data_eps = true;
-                NIXL_ERROR << "EFA proxy: peer " << remote->conn_->remoteAgent_
-                           << " does not accept puts with remote CQ data (receiver ordering)";
-            }
-            return NIXL_ERR_NOT_SUPPORTED;
-        }
-        tx = txRing(
-            th, *req->fence, remote->conn_, sub.channel_id * config_.max_peers + sub.peer_index);
-    }
-
     // Same rule as the host path: stripe at or above the threshold over >1 rail.
     // Smaller puts go to one rail each (unstripedRail()).
     const bool stripe = size >= engine_.striping_threshold_ && lrails.size() > 1;
     const size_t nfrag = stripe ? std::min(lrails.size(), kMaxStripes) : 1;
     const size_t chunk = size / nfrag;
-    const size_t first = stripe ? 0 : unstripedRail(th, *req->fence, lrails.size());
+    const size_t first = stripe ? 0 : unstripedRail(th, ring, lrails.size());
 
-    // Resolve every destination before the request joins the fence.
+    // Resolve every destination before anything is counted or posted.
     std::array<PendingPost, kMaxStripes> posts{};
     for (size_t i = 0; i < nfrag; ++i) {
         const size_t sel = first + i;
         const size_t rail = lrails[sel];
-        const size_t rep = reps[sel % reps.size()];
+        size_t rep = reps[sel % reps.size()];
         const size_t off = stripe ? i * chunk : 0;
         const size_t len = stripe ? (i + 1 == nfrag ? size - off : chunk) : size;
         const uint64_t target = sub.remote.desc.addr + off;
@@ -1363,14 +1455,33 @@ nixlLibfabricProxy::submitPut(Thread &th, const nixlBackendProxySubmission &sub,
         pp.local = reinterpret_cast<void *>(sub.local.desc.addr + off);
         pp.len = len;
         pp.desc = fi_mr_desc(local->rail_mr_list_[rail]);
-        pp.dest = tx ?
-            dataAddr(th, *peer, *remote->conn_, rail, rxThread(*remote->conn_, tx->key, rep), rep) :
-            railAddr(th, *peer, *remote->conn_, rail, rep);
-        pp.raddr = th.rails[rail].virt_addr ? target : target - remote->remote_buf_addr_;
+        if (tx != nullptr) {
+            // To the data EP receiving on the destination rail; a buffer rail the
+            // target does not receive on (e.g. host memory on other rails) is
+            // replaced by one of the buffer's rails it does receive on.
+            int index = rep < peer->data_index.size() ? peer->data_index[rep] : -1;
+            for (size_t k = 1; index < 0 && k < reps.size(); ++k) {
+                const size_t alt = reps[(sel + k) % reps.size()];
+                if (alt < peer->data_index.size() && peer->data_index[alt] >= 0) {
+                    rep = alt;
+                    index = peer->data_index[alt];
+                }
+            }
+            if (index < 0) {
+                NIXL_ERROR << "EFA proxy: no rail of the destination buffer at "
+                           << conn.remoteAgent_ << " receives puts (receive rails are those "
+                           << "next to its GPU)";
+                return NIXL_ERR_NOT_SUPPORTED;
+            }
+            pp.dest = dataAddr(th, *peer, conn, rail, static_cast<size_t>(index));
+            pp.has_imm = true;
+            pp.imm = wire::putImm(tx->key, tx->atomics);
+        } else {
+            pp.dest = railAddr(th, *peer, conn, rail, rep);
+        }
+        const uint64_t base = remote->remote_buf_addr_;
+        pp.raddr = th.rails[rail].virt_addr ? target : target - base;
         pp.rkey = remote->rail_remote_key_list_[rep];
-        pp.has_imm = tx != nullptr;
-        pp.imm = tx ? wire::ringImm(tx->key, tx->atomics) : 0;
-        pp.rx_index = tx ? tx->atomics : 0;
         if (pp.dest == FI_ADDR_UNSPEC) {
             return NIXL_ERR_BACKEND;
         }
@@ -1383,18 +1494,14 @@ nixlLibfabricProxy::submitPut(Thread &th, const nixlBackendProxySubmission &sub,
     }
 
     req->frags_left = static_cast<uint16_t>(nfrag);
-    if (tx) {
-        // Counted when sent: the next atomicAdd waits for nfrag more in its slot.
+    req->counted = true;
+    ++ring.outstanding;
+    if (tx != nullptr) {
+        // The next atomicAdd's slot waits for nfrag more.
         req->tx = tx;
-        req->rx_seq = tx->atomics;
-        tx->slot_puts[tx->atomics % wire::kRingEpochs] += nfrag;
+        req->seq = tx->atomics;
+        tx->slot_puts[tx->atomics % wire::kEpochs] += nfrag;
         ++tx->inflight;
-    }
-    if (receiver_order_ || test_fence_off_) {
-        req->counted = true;
-        ++req->fence->outstanding;
-    } else {
-        req->epoch = req->fence->order.addPut();
     }
     for (size_t i = 0; i < nfrag; ++i) {
         post(th, std::move(posts[i]));
@@ -1403,91 +1510,62 @@ nixlLibfabricProxy::submitPut(Thread &th, const nixlBackendProxySubmission &sub,
 }
 
 nixl_status_t
-nixlLibfabricProxy::submitAtomic(Thread &th, const nixlBackendProxySubmission &sub, Request *req) {
+nixlLibfabricProxy::submitAtomic(Thread &th,
+                                 Ring &ring,
+                                 const nixlBackendProxySubmission &sub,
+                                 Request *req,
+                                 TxRing *tx) {
     auto *remote = static_cast<nixlLibfabricPublicMetadata *>(sub.remote.desc.metadataP);
-    if (!remote || !remote->conn_) {
-        NIXL_ERROR << "EFA proxy: atomicAdd without libfabric metadata";
-        return NIXL_ERR_INVALID_PARAM;
-    }
     PeerAddrs *peer = peerAddrs(th, remote->conn_);
     if (!peer) {
         return NIXL_ERR_BACKEND;
     }
-    if (peer->home.empty()) {
-        NIXL_ERROR << "EFA proxy: peer " << remote->conn_->remoteAgent_
-                   << " did not publish proxy endpoints; atomicAdd unavailable";
-        return NIXL_ERR_NOT_SUPPORTED;
+    const nixlLibfabricConnection &conn = *remote->conn_;
+
+    // Never signal after a failure on the ring (as with the fence it replaces).
+    const nixl_status_t error = ring.error != NIXL_SUCCESS ? ring.error : tx->error;
+    if (error != NIXL_SUCCESS) {
+        req->status = error;
+        req->frags_left = 0;
+        return NIXL_SUCCESS;
     }
 
     // All senders must agree on one owner thread per counter at the target.
-    const uint32_t owner =
-        wire::counterOwner(sub.remote.desc.addr, static_cast<uint32_t>(peer->home.size()));
-    req->dest = homeAddr(th, *peer, *remote->conn_, owner);
+    const uint32_t owner = wire::counterOwner(
+        sub.remote.desc.addr, static_cast<uint32_t>(conn.remote_proxy_ep_names_.size()));
+    req->dest = homeAddr(th, *peer, conn, owner);
     if (req->dest == FI_ADDR_UNSPEC) {
         return NIXL_ERR_BACKEND;
     }
-    NIXL_DEBUG << "EFA proxy: atomicAdd " << sub.value << " to " << std::hex << sub.remote.desc.addr
-               << std::dec << " -> " << remote->conn_->remoteAgent_ << " proxy thread " << owner
-               << " (fi_addr " << req->dest << ")";
     req->msg = wire::atomicAddMsg{};
     req->msg.hdr = wire::msgHeader{wire::kVersion, wire::msgType::ATOMIC_ADD, 0};
     req->msg.remote_addr = sub.remote.desc.addr;
     req->msg.value = sub.value;
     req->msg.token = req->token();
-    req->msg.reply_name_len = static_cast<uint32_t>(th.home_name_len);
-    std::memcpy(req->msg.reply_name, th.home_name.data(), th.home_name_len);
-    req->msg.order = wire::orderMode::NONE;
-    req->is_atomic = true;
+    req->msg.ring = tx->key;
+    req->msg.seq = tx->atomics++;
+    req->msg.expected_puts = tx->slot_puts[req->msg.seq % wire::kEpochs];
+    req->msg.reply_name_len = static_cast<uint32_t>(th.home_name.size());
+    std::memcpy(req->msg.reply_name, th.home_name.data(), th.home_name.size());
+    NIXL_DEBUG << "EFA proxy: atomicAdd " << sub.value << " to " << std::hex << sub.remote.desc.addr
+               << " ring " << tx->key << std::dec << " seq " << req->msg.seq << " expecting "
+               << req->msg.expected_puts << " -> " << conn.remoteAgent_ << " thread " << owner;
+
+    req->tx = tx;
+    req->seq = req->msg.seq;
     // Completes on its send and on the owner's ack (the add applied, or why not).
     req->frags_left = 2;
-
-    if (receiver_order_) {
-        // Sent at once; the owner applies it after the ring's earlier puts and
-        // atomicAdds reached the target.
-        RingFence &fence = *req->fence;
-        TxRing *tx =
-            txRing(th, fence, remote->conn_, sub.channel_id * config_.max_peers + sub.peer_index);
-        const nixl_status_t error = fence.error != NIXL_SUCCESS ? fence.error : tx->error;
-        if (error != NIXL_SUCCESS) {
-            req->status = error; // never signal after a failure on the ring
-            req->frags_left = 0;
-            return NIXL_SUCCESS;
-        }
-        req->msg.order = wire::orderMode::RING;
-        req->msg.ring = tx->key;
-        req->msg.seq = tx->atomics++;
-        req->msg.expected_puts = tx->slot_puts[req->msg.seq % wire::kRingEpochs];
-        req->tx = tx;
-        req->rx_seq = req->msg.seq;
-        if (rx_trace_ && req->rx_seq < 8) {
-            NIXL_INFO << "RXTRACE t=" << nowNs() << " atomic key=" << std::hex << tx->key
-                      << std::dec << " seq=" << req->rx_seq
-                      << " expected=" << req->msg.expected_puts << " addr=" << std::hex
-                      << req->msg.remote_addr << std::dec;
-        }
-        req->counted = true;
-        ++fence.outstanding;
-        ++tx->inflight;
-        sendAtomic(th, req);
-        return NIXL_SUCCESS;
-    }
-    if (test_fence_off_) {
-        req->counted = true;
-        ++req->fence->outstanding;
-        sendAtomic(th, req);
-        return NIXL_SUCCESS;
-    }
-
-    // Close the ring's open epoch with this atomic; later puts join a new one.
-    req->fence->order.addAtomic(req);
-    releaseFence(th, *req->fence);
+    req->counted = true;
+    ++ring.outstanding;
+    ++tx->inflight;
+    sendAtomic(th, req);
     return NIXL_SUCCESS;
 }
 
 size_t
-nixlLibfabricProxy::unstripedRail(const Thread &th, RingFence &fence, size_t nrails) const {
+nixlLibfabricProxy::unstripedRail(const Thread &th, Ring &ring, size_t nrails) const {
     if (!rail_per_thread_) {
-        return fence.next_rail++ % nrails; // every ring rotates over all rails
+        return ring.next_rail++ % nrails; // every ring rotates over all rails
     }
     // The buffer's rails are split among the proxy threads, and each thread
     // rotates over its share: a rail's domain (FI_THREAD_SAFE, one lock) and CQ
@@ -1497,26 +1575,49 @@ nixlLibfabricProxy::unstripedRail(const Thread &th, RingFence &fence, size_t nra
     }
     const size_t share =
         (nrails - th.id + threads_ - 1) / threads_; // i < nrails, i % threads_ == id
-    return th.id + (fence.next_rail++ % share) * threads_;
+    return th.id + (ring.next_rail++ % share) * threads_;
 }
 
-/* ---------------------------------------------------------------------------
- * Fence
- * ------------------------------------------------------------------------- */
-
 void
-nixlLibfabricProxy::releaseFence(Thread &th, RingFence &fence) {
-    fence.order.release(
-        [&](Request *atomic, nixlLibfabricRingFence<Request>::Epoch *epoch) {
-            // The next atomic on this ring waits for this one too (strict order).
-            atomic->epoch = epoch;
-            sendAtomic(th, atomic);
-        },
-        [](Request *atomic, nixl_status_t error) {
-            // An earlier op on this ring failed: never signal over bad data.
-            atomic->status = error;
-            atomic->frags_left = 0;
-        });
+nixlLibfabricProxy::failRing(Thread &th, Request *req, nixl_status_t status) {
+    // As the fence did: nothing on the ring signals after a failed operation.
+    if (req->ring != nullptr && req->ring->error == NIXL_SUCCESS) {
+        req->ring->error = status;
+    }
+    TxRing *tx = req->tx;
+    if (tx == nullptr) {
+        return;
+    }
+    if (tx->error == NIXL_SUCCESS) {
+        tx->error = status;
+    }
+    // A failed put of epoch e: atomicAdds e and later wait for it in vain. A failed
+    // atomicAdd s (lost, or failed at the target): later ones wait for it in vain.
+    const uint64_t first = req->seq;
+    for (size_t i = 0; i < th.awaiting.size(); ++i) {
+        Request *other = th.awaiting[i];
+        if (other != req && other->awaiting_ack && other->tx == tx && other->seq >= first) {
+            other->awaiting_ack = false;
+            completeFragment(th, other, status);
+        }
+    }
+    // Tell the target's threads to drop them too (once per ring and seq).
+    if (first >= tx->aborted_from || first >= tx->atomics) {
+        return;
+    }
+    tx->aborted_from = first;
+    auto conn = tx->conn.lock();
+    if (!conn) {
+        return;
+    }
+    PeerAddrs *peer = peerAddrs(th, conn);
+    for (size_t t = 0; peer != nullptr && t < conn->remote_proxy_ep_names_.size(); ++t) {
+        const fi_addr_t dest = homeAddr(th, *peer, *conn, t);
+        if (dest != FI_ADDR_UNSPEC) {
+            sendCtl(th,
+                    PendingCtl{dest, wire::msgType::RING_ABORT, 0, NIXL_SUCCESS, tx->key, first});
+        }
+    }
 }
 
 void
@@ -1554,8 +1655,7 @@ nixlLibfabricProxy::tryPost(Thread &th, const PendingPost &pp) {
     struct iovec iov = {pp.local, pp.len};
     void *desc = pp.desc;
     if (pp.kind == PendingPost::Kind::WRITE) {
-        // The fence releases a ring's atomicAdd once its puts complete, which is
-        // only safe if completion means the data is placed at the target.
+        // A put completes (to the GPU) only once its data is placed at the target.
         const uint64_t flags =
             FI_COMPLETION | FI_DELIVERY_COMPLETE | (pp.has_imm ? FI_REMOTE_CQ_DATA : 0);
         struct fi_rma_iov rma = {pp.raddr, pp.len, pp.rkey};
@@ -1583,13 +1683,6 @@ nixlLibfabricProxy::tryPost(Thread &th, const PendingPost &pp) {
 
 ssize_t
 nixlLibfabricProxy::postTimed(Thread &th, const PendingPost &pp) {
-    if (rx_trace_ && pp.has_imm && pp.rx_index < 8) {
-        const ssize_t rc = tryPost(th, pp);
-        NIXL_INFO << "RXTRACE t=" << nowNs() << " post key=" << std::hex << pp.imm << std::dec
-                  << " frag=" << pp.rx_index << " rail=" << pp.rail << " len=" << pp.len
-                  << " rc=" << rc << " thread=" << th.id;
-        return rc;
-    }
     if (!th.prof) {
         return tryPost(th, pp);
     }
@@ -1660,8 +1753,8 @@ nixlLibfabricProxy::drainRetries(Thread &th) {
             }
         }
     }
-    while (!th.pending_acks.empty() && postAck(th, th.pending_acks.front())) {
-        th.pending_acks.pop_front();
+    while (!th.pending_ctls.empty() && postCtl(th, th.pending_ctls.front())) {
+        th.pending_ctls.pop_front();
     }
     while (!th.recv_retry.empty()) {
         RecvBuf *buf = th.recv_retry.back();
@@ -1688,22 +1781,13 @@ nixlLibfabricProxy::completeFragment(Thread &th, Request *req, nixl_status_t sta
     }
     if (req->counted) {
         req->counted = false;
-        --req->fence->outstanding;
-        if (req->tx) {
-            --req->tx->inflight;
-        }
-        if (req->status != NIXL_SUCCESS && receiver_order_) {
-            failRing(th, req, req->status);
-        }
-        return;
+        --req->ring->outstanding;
     }
-    if (req->tx) {
-        --req->tx->inflight; // test-only puts with remote CQ data under the fence
+    if (req->tx != nullptr) {
+        --req->tx->inflight;
     }
-    if (RingFence *fence = req->fence) {
-        fence->order.complete(req->epoch, req->status);
-        req->epoch = nullptr;
-        releaseFence(th, *fence);
+    if (req->status != NIXL_SUCCESS) {
+        failRing(th, req, req->status);
     }
 }
 
@@ -1740,9 +1824,9 @@ nixlLibfabricProxy::expireAcks(Thread &th, uint64_t now_ns) {
 
 void
 nixlLibfabricProxy::pollCqs(Thread &th) {
-    const uint64_t start = th.prof && imm_puts_ ? nowNs() : 0;
+    const uint64_t start = th.prof ? nowNs() : 0;
     th.sweep_imm = 0;
-    // By index: completions release atomics, whose posts may extend the list.
+    // By index: completions may post, which may extend the list.
     for (size_t i = 0; i < th.poll_rails.size(); ++i) {
         const uint32_t r = th.poll_rails[i];
         pollCq(th, th.rails[r].cq, r, th.rails[r].cq_reads);
@@ -1758,114 +1842,94 @@ nixlLibfabricProxy::pollCqs(Thread &th) {
 void
 nixlLibfabricProxy::pollCq(Thread &th, struct fid_cq *cq, uint32_t rail, uint64_t &reads) {
     struct fi_cq_data_entry entries[kCqBatch];
-    {
-        const uint32_t r = rail; // rails_ names the control CQ
-        for (;;) {
-            const uint64_t read_start = th.prof ? nixlLibfabricProxyProfile::now() : 0;
-            const ssize_t n = fi_cq_read(cq, entries, kCqBatch);
-            if (th.prof) {
-                const uint64_t took = nixlLibfabricProxyProfile::now() - read_start;
-                if (took > kSlowCallNs) {
-                    NIXL_INFO << "EFA proxy profile: slow cq read: thread " << th.id << " rail "
-                              << r << " read #" << reads << " took " << took / 1000 << " us";
-                }
-                ++reads;
+    for (;;) {
+        const uint64_t read_start = th.prof ? nixlLibfabricProxyProfile::now() : 0;
+        const ssize_t n = fi_cq_read(cq, entries, kCqBatch);
+        if (th.prof) {
+            const uint64_t took = nixlLibfabricProxyProfile::now() - read_start;
+            if (took > kSlowCallNs) {
+                NIXL_INFO << "EFA proxy profile: slow cq read: thread " << th.id << " rail " << rail
+                          << " read #" << reads << " took " << took / 1000 << " us";
             }
-            if (n > 0) {
-                const uint64_t decode_start = th.prof && imm_puts_ ? nowNs() : 0;
-                uint64_t imm = 0;
-                th.events += static_cast<uint64_t>(n);
-                for (ssize_t i = 0; i < n; ++i) {
-                    if (entries[i].flags & FI_REMOTE_CQ_DATA) {
-                        // A put with remote CQ data landed: count it for its ring.
-                        ++imm;
-                        handleImm(th, static_cast<uint32_t>(entries[i].data));
-                        if (entries[i].op_context != nullptr) {
-                            // It consumed a posted receive (efa_proxy_test_data_rx_post).
-                            ++th.rx_stats.consumed_rx;
-                            if (test_data_rx_post_ != 0) {
-                                postRecv(th, static_cast<RecvBuf *>(entries[i].op_context));
-                            }
-                        }
-                        continue;
-                    }
-                    // Each context type starts with its OpCtx.
-                    auto *op = static_cast<OpCtx *>(entries[i].op_context);
-                    switch (op->kind) {
-                    case OpCtx::Kind::RECV:
-                        handleRecv(th, reinterpret_cast<RecvBuf *>(op), entries[i].len);
-                        break;
-                    case OpCtx::Kind::ACK:
-                        th.free_acks.push_back(reinterpret_cast<AckBuf *>(op));
-                        break;
-                    case OpCtx::Kind::FRAG: {
-                        auto *f = reinterpret_cast<Request::FragCtx *>(op);
-                        nixl_status_t status = NIXL_SUCCESS;
-                        if (rx_trace_ && f->owner->tx && !f->owner->is_atomic &&
-                            f->owner->rx_seq < 8) {
-                            NIXL_INFO << "RXTRACE t=" << nowNs() << " done key=" << std::hex
-                                      << f->owner->tx->key << std::dec
-                                      << " epoch=" << f->owner->rx_seq
-                                      << " frag=" << (f - f->owner->frag) << " rail=" << rail;
-                        }
-                        if (f->owner->inject_cq_error) {
-                            f->owner->inject_cq_error = false;
-                            NIXL_WARN << "EFA proxy: injected completion error";
-                            status = NIXL_ERR_BACKEND;
-                        }
-                        if (status == NIXL_SUCCESS) {
-                            completeFragment(th, f->owner, status);
-                        } else {
-                            failFragment(th, f->owner, status);
-                        }
-                        break;
-                    }
-                    }
+            ++reads;
+        }
+        if (n > 0) {
+            th.events += static_cast<uint64_t>(n);
+            const uint64_t decode_start = th.prof ? nowNs() : 0;
+            uint64_t imm = 0;
+            for (ssize_t i = 0; i < n; ++i) {
+                if (entries[i].flags & FI_REMOTE_CQ_DATA) {
+                    // A put landed on a rail this thread receives on: count it.
+                    ++imm;
+                    handleImm(th, static_cast<uint32_t>(entries[i].data));
+                    continue;
                 }
-                if (imm != 0) {
-                    th.sweep_imm += imm;
-                    if (decode_start != 0) {
-                        auto &st = th.rx_stats;
-                        const uint64_t end = nowNs();
-                        st.entries += imm;
-                        ++st.reads;
-                        st.read_ns += decode_start - read_start;
-                        st.decode_ns += end - decode_start;
-                        st.first = st.first != 0 ? st.first : decode_start;
-                        st.last = end;
+                // Each context type starts with its OpCtx.
+                auto *op = static_cast<OpCtx *>(entries[i].op_context);
+                switch (op->kind) {
+                case OpCtx::Kind::RECV:
+                    handleRecv(th, reinterpret_cast<RecvBuf *>(op), entries[i].len);
+                    break;
+                case OpCtx::Kind::CTL:
+                    th.free_ctls.push_back(reinterpret_cast<CtlBuf *>(op));
+                    break;
+                case OpCtx::Kind::FRAG: {
+                    auto *f = reinterpret_cast<Request::FragCtx *>(op);
+                    if (f->owner->inject_cq_error) {
+                        f->owner->inject_cq_error = false;
+                        NIXL_WARN << "EFA proxy: injected completion error";
+                        failFragment(th, f->owner, NIXL_ERR_BACKEND);
+                    } else {
+                        completeFragment(th, f->owner, NIXL_SUCCESS);
                     }
-                }
-                if (static_cast<size_t>(n) < kCqBatch) {
                     break;
                 }
-                continue;
-            }
-            if (n == -FI_EAVAIL) {
-                struct fi_cq_err_entry err = {};
-                if (fi_cq_readerr(cq, &err, 0) > 0) {
-                    reportCqError(th, r, err.err);
-                    auto *op = static_cast<OpCtx *>(err.op_context);
-                    if (op == nullptr) {
-                        continue;
-                    }
-                    switch (op->kind) {
-                    case OpCtx::Kind::RECV:
-                        postRecv(th, reinterpret_cast<RecvBuf *>(op));
-                        break;
-                    case OpCtx::Kind::ACK:
-                        // This ack is lost: the sender's atomicAdd fails by timeout.
-                        th.free_acks.push_back(reinterpret_cast<AckBuf *>(op));
-                        break;
-                    case OpCtx::Kind::FRAG:
-                        failFragment(
-                            th, reinterpret_cast<Request::FragCtx *>(op)->owner, NIXL_ERR_BACKEND);
-                        break;
-                    }
                 }
-                continue;
             }
-            break; // -FI_EAGAIN or another error: nothing more this pass
+            if (imm != 0) {
+                th.sweep_imm += imm;
+                if (decode_start != 0) {
+                    auto &st = th.rx_stats;
+                    const uint64_t end = nowNs();
+                    st.entries += imm;
+                    ++st.reads;
+                    st.read_ns += decode_start - read_start;
+                    st.decode_ns += end - decode_start;
+                    st.first = st.first != 0 ? st.first : decode_start;
+                    st.last = end;
+                }
+            }
+            if (static_cast<size_t>(n) < kCqBatch) {
+                break;
+            }
+            continue;
         }
+        if (n == -FI_EAVAIL) {
+            struct fi_cq_err_entry err = {};
+            if (fi_cq_readerr(cq, &err, 0) > 0) {
+                reportCqError(th, rail, err.err);
+                auto *op = static_cast<OpCtx *>(err.op_context);
+                if (op == nullptr) {
+                    continue;
+                }
+                switch (op->kind) {
+                case OpCtx::Kind::RECV:
+                    postRecv(th, reinterpret_cast<RecvBuf *>(op));
+                    break;
+                case OpCtx::Kind::CTL:
+                    // This message is lost: an ack's atomicAdd fails by timeout at the
+                    // sender; an abort's adds expire at the target.
+                    th.free_ctls.push_back(reinterpret_cast<CtlBuf *>(op));
+                    break;
+                case OpCtx::Kind::FRAG:
+                    failFragment(
+                        th, reinterpret_cast<Request::FragCtx *>(op)->owner, NIXL_ERR_BACKEND);
+                    break;
+                }
+            }
+            continue;
+        }
+        break; // -FI_EAGAIN or another error: nothing more this pass
     }
 }
 
@@ -1902,39 +1966,43 @@ nixlLibfabricProxy::progress(uint32_t channel, uint32_t peer) {
     const uint64_t events = th.events;
     // Every CQ read takes its rail domain's lock (FI_THREAD_SAFE) and progresses
     // the whole domain, so a thread spinning on idle CQs starves the engine's host
-    // transfers on the same rails. With nothing of its own outstanding, a thread
-    // polls at most every idle_poll_ns_: only an incoming atomicAdd can be waiting.
+    // transfers on the same rails. With nothing of its own outstanding and no puts
+    // landing, a thread polls at most every idle_poll_ns_.
     const bool busy = th.free_reqs.size() != th.reqs.size() || th.retry_count != 0 ||
-        !th.pending_acks.empty() || !th.recv_retry.empty() || !th.deferred.empty() || th.rx_active;
+        !th.pending_ctls.empty() || !th.recv_retry.empty() || !th.owned.empty() || th.rx_active ||
+        !th.parked_rings.empty();
     bool poll = true;
+    uint64_t now = 0;
     if (!busy && idle_poll_ns_ != 0) {
-        const uint64_t now = nowNs();
+        now = nowNs();
         poll = now >= th.next_idle_poll;
         if (poll) {
             th.next_idle_poll = now + idle_poll_ns_;
         }
     }
     if (poll) {
-        uint64_t poll_start = 0;
         if (th.prof) {
-            poll_start = nixlLibfabricProxyProfile::now();
+            const uint64_t start = nixlLibfabricProxyProfile::now();
             if (th.last_pass != 0) {
-                th.prof->add(nixlLibfabricProxyProfile::PASS_PERIOD, poll_start - th.last_pass);
+                th.prof->add(nixlLibfabricProxyProfile::PASS_PERIOD, start - th.last_pass);
             }
-            th.last_pass = poll_start;
+            th.last_pass = start;
         }
         drainRetries(th);
         pollCqs(th);
         if (th.prof) {
             th.prof->add(nixlLibfabricProxyProfile::CQ_POLL,
-                         nixlLibfabricProxyProfile::now() - poll_start);
+                         nixlLibfabricProxyProfile::now() - th.last_pass);
         }
         if (!th.awaiting.empty() && ++th.ack_scan % kAckScanInterval == 0) {
             expireAcks(th, nowNs());
         }
     }
-    if (!th.deferred.empty()) {
+    if (!th.owned.empty()) {
         drainDeferred(th);
+    }
+    if (!th.parked_rings.empty()) {
+        replayParked(th, now != 0 ? now : nowNs());
     }
     if (th.prof && th.events != events) {
         const uint64_t end = nowNs();
@@ -1954,12 +2022,12 @@ nixlLibfabricProxy::progress(uint32_t channel, uint32_t peer) {
 
 nixl_status_t
 nixlLibfabricProxy::quiesce(uint32_t channel, uint32_t peer) {
-    // Called after every owned ring has drained and published, so the ring's
-    // fence must already be idle; wait briefly for any trailing completion.
+    // Called after every owned ring has drained and published; wait briefly for
+    // any trailing completion.
     Thread &th = ownerOf(channel);
     const uint64_t key = static_cast<uint64_t>(channel) * config_.max_peers + peer;
-    auto it = th.fences.find(key);
-    if (it == th.fences.end()) {
+    auto it = th.rings.find(key);
+    if (it == th.rings.end()) {
         return NIXL_SUCCESS;
     }
     const auto deadline = std::chrono::steady_clock::now() + kQuiesceTimeout;
@@ -1967,8 +2035,11 @@ nixlLibfabricProxy::quiesce(uint32_t channel, uint32_t peer) {
         drainRetries(th);
         pollCqs(th);
         expireAcks(th, nowNs());
-        if (!th.deferred.empty()) {
+        if (!th.owned.empty()) {
             drainDeferred(th);
+        }
+        if (!th.parked_rings.empty()) {
+            replayParked(th, nowNs());
         }
     }
     if (!it->second.idle()) {
@@ -1976,26 +2047,25 @@ nixlLibfabricProxy::quiesce(uint32_t channel, uint32_t peer) {
                    << kQuiesceTimeout.count() << " s";
         return NIXL_ERR_BACKEND;
     }
-    th.fences.erase(it);
+    th.rings.erase(it);
     return NIXL_SUCCESS;
 }
 
 /* ---------------------------------------------------------------------------
- * Home endpoints: atomicAdd records and their acks (libfabric_proxy_wire.h)
+ * Control messages: atomicAdd records, acks, ring aborts (libfabric_proxy_wire.h)
  * ------------------------------------------------------------------------- */
 
 nixl_status_t
 nixlLibfabricProxy::postRecv(Thread &th, RecvBuf *buf) {
-    const bool ctl = buf->rail == kCtlRail;
     struct iovec iov = {&buf->msg, sizeof(wire::anyMsg)};
-    void *desc = ctl ? th.recv_desc : th.rails[buf->rail].rx_desc;
+    void *desc = th.recv_desc;
     struct fi_msg msg = {};
     msg.msg_iov = &iov;
     msg.desc = &desc;
     msg.iov_count = 1;
     msg.addr = FI_ADDR_UNSPEC;
     msg.context = &buf->op.ctx;
-    const ssize_t rc = fi_recvmsg(ctl ? th.ctl_ep : th.rails[buf->rail].ep, &msg, 0);
+    const ssize_t rc = fi_recvmsg(th.ctl_ep, &msg, 0);
     if (rc == 0) {
         return NIXL_SUCCESS;
     }
@@ -2017,6 +2087,8 @@ nixlLibfabricProxy::handleRecv(Thread &th, RecvBuf *buf, size_t len) {
         handleAtomic(th, msg.add);
     } else if (msg.hdr.type == wire::msgType::ATOMIC_ACK && len >= sizeof(wire::atomicAckMsg)) {
         handleAck(th, msg.ack);
+    } else if (msg.hdr.type == wire::msgType::RING_ABORT && len >= sizeof(wire::ringAbortMsg)) {
+        handleAbort(th, msg.abort);
     } else {
         NIXL_ERROR << "EFA proxy: dropped a malformed " << len << "-byte message of type "
                    << static_cast<int>(msg.hdr.type);
@@ -2026,59 +2098,18 @@ nixlLibfabricProxy::handleRecv(Thread &th, RecvBuf *buf, size_t len) {
 
 void
 nixlLibfabricProxy::handleAtomic(Thread &th, const wire::atomicAddMsg &msg) {
+    RxRing *ring = rxRing(th, msg.ring);
+    if (msg.seq >= ring->aborted_from.load(std::memory_order_acquire)) {
+        return; // the sender aborted the ring and already failed this atomicAdd
+    }
     const fi_addr_t reply = replyAddr(th, msg);
     if (reply == FI_ADDR_UNSPEC) {
         return; // logged; the sender fails the atomicAdd when its ack times out
     }
-    if (msg.order == wire::orderMode::NONE) {
-        applyAndAck(th, msg, reply);
-        return;
-    }
-    if (msg.order != wire::orderMode::RING || !imm_puts_) {
-        NIXL_ERROR << "EFA proxy: atomicAdd with ordering " << static_cast<int>(msg.order)
-                   << ", which this proxy does not accept (efa_proxy_ordering=receiver)";
-        sendAck(th, PendingAck{reply, msg.token, NIXL_ERR_NOT_SUPPORTED});
-        return;
-    }
-    RxRing *ring = rxRing(th, msg.ring);
-    {
-        // Ring keys are random per sender ring: tell a collision apart from a
-        // ring's later atomicAdds by the sender's reply EP.
-        const std::string_view name(reinterpret_cast<const char *>(msg.reply_name),
-                                    std::min<size_t>(msg.reply_name_len, wire::kMaxEpName));
-        std::lock_guard<std::mutex> lock(ring->sender_mutex);
-        if (ring->sender.empty()) {
-            ring->sender.assign(name);
-        } else if (ring->sender != name) {
-            NIXL_ERROR << "EFA proxy: two senders use ring key " << std::hex << msg.ring
-                       << "; failing the atomicAdd";
-            sendAck(th, PendingAck{reply, msg.token, NIXL_ERR_MISMATCH});
-            return;
-        }
-    }
-    th.deferred.push_back(Deferred{ring, msg, reply, nowNs()});
-    drainDeferred(th);
-    for (const Deferred &d : th.deferred) {
-        if (d.ring == ring && d.msg.token == msg.token) {
-            ++th.rx_stats.deferred; // still waiting for its ring
-            break;
-        }
-    }
-}
-
-void
-nixlLibfabricProxy::applyAndAck(Thread &th, const wire::atomicAddMsg &msg, fi_addr_t reply) {
-    const uint64_t start = th.prof ? nixlLibfabricProxyProfile::now() : 0;
-    const nixl_status_t status = applyAtomic(th, msg.remote_addr, msg.value);
-    if (th.prof) {
-        th.prof->add(nixlLibfabricProxyProfile::ATOMIC_APPLY,
-                     nixlLibfabricProxyProfile::now() - start);
-    }
-    if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "EFA proxy: atomicAdd to " << std::hex << msg.remote_addr << std::dec
-                   << " failed with status " << status << "; reporting it to the sender";
-    }
-    sendAck(th, PendingAck{reply, msg.token, status});
+    RxOwned &owned = th.owned[ring];
+    owned.ring = ring;
+    owned.adds.emplace(msg.seq, RxOwned::Add{msg, reply, nowNs()});
+    // Applied by drainDeferred() in this same pass, batched with the others.
 }
 
 void
@@ -2098,6 +2129,23 @@ nixlLibfabricProxy::handleAck(Thread &th, const wire::atomicAckMsg &ack) {
     completeFragment(th, &req, static_cast<nixl_status_t>(ack.status));
 }
 
+void
+nixlLibfabricProxy::handleAbort(Thread &th, const wire::ringAbortMsg &abort) {
+    RxRing *ring = rxRing(th, abort.ring);
+    uint64_t current = ring->aborted_from.load(std::memory_order_relaxed);
+    while (abort.first_seq < current &&
+           !ring->aborted_from.compare_exchange_weak(
+               current, abort.first_seq, std::memory_order_acq_rel)) {}
+    auto it = th.owned.find(ring);
+    if (it != th.owned.end()) {
+        auto &adds = it->second.adds;
+        adds.erase(adds.lower_bound(abort.first_seq), adds.end());
+        if (adds.empty()) {
+            th.owned.erase(it);
+        }
+    }
+}
+
 fi_addr_t
 nixlLibfabricProxy::replyAddr(Thread &th, const wire::atomicAddMsg &msg) {
     if (msg.reply_name_len == 0 || msg.reply_name_len > wire::kMaxEpName) {
@@ -2108,8 +2156,9 @@ nixlLibfabricProxy::replyAddr(Thread &th, const wire::atomicAddMsg &msg) {
     if (auto it = th.reply_addrs.find(name); it != th.reply_addrs.end()) {
         return it->second;
     }
+    const ci::EpName padded = ci::paddedName(std::string(name));
     fi_addr_t addr = FI_ADDR_UNSPEC;
-    if (fi_av_insert(th.ctl_av, msg.reply_name, 1, &addr, 0, nullptr) != 1) {
+    if (fi_av_insert(th.ctl_av, padded.data(), 1, &addr, 0, nullptr) != 1) {
         NIXL_ERROR << "EFA proxy: fi_av_insert failed for an atomicAdd sender";
         return FI_ADDR_UNSPEC;
     }
@@ -2118,43 +2167,199 @@ nixlLibfabricProxy::replyAddr(Thread &th, const wire::atomicAddMsg &msg) {
 }
 
 void
-nixlLibfabricProxy::sendAck(Thread &th, const PendingAck &ack) {
-    if (!th.pending_acks.empty() || !postAck(th, ack)) {
-        th.pending_acks.push_back(ack); // keep acks in order; drained from progress()
+nixlLibfabricProxy::sendCtl(Thread &th, const PendingCtl &ctl) {
+    if (!th.pending_ctls.empty() || !postCtl(th, ctl)) {
+        th.pending_ctls.push_back(ctl); // keep them in order; drained from progress()
     }
 }
 
 bool
-nixlLibfabricProxy::postAck(Thread &th, const PendingAck &ack) {
-    if (th.free_acks.empty()) {
+nixlLibfabricProxy::postCtl(Thread &th, const PendingCtl &ctl) {
+    if (th.free_ctls.empty()) {
         return false;
     }
-    AckBuf *buf = th.free_acks.back();
-    buf->msg = wire::atomicAckMsg{};
-    buf->msg.hdr = wire::msgHeader{wire::kVersion, wire::msgType::ATOMIC_ACK, 0};
-    buf->msg.token = ack.token;
-    buf->msg.status = static_cast<int32_t>(ack.status);
-
-    struct iovec iov = {&buf->msg, sizeof(buf->msg)};
-    void *desc = th.ack_desc;
+    CtlBuf *buf = th.free_ctls.back();
+    size_t len = 0;
+    if (ctl.type == wire::msgType::ATOMIC_ACK) {
+        buf->msg.ack = wire::atomicAckMsg{};
+        buf->msg.ack.hdr = wire::msgHeader{wire::kVersion, wire::msgType::ATOMIC_ACK, 0};
+        buf->msg.ack.token = ctl.token;
+        buf->msg.ack.status = static_cast<int32_t>(ctl.status);
+        len = sizeof(wire::atomicAckMsg);
+    } else {
+        buf->msg.abort = wire::ringAbortMsg{};
+        buf->msg.abort.hdr = wire::msgHeader{wire::kVersion, wire::msgType::RING_ABORT, 0};
+        buf->msg.abort.ring = ctl.ring;
+        buf->msg.abort.first_seq = ctl.first_seq;
+        len = sizeof(wire::ringAbortMsg);
+    }
+    struct iovec iov = {&buf->msg, len};
+    void *desc = th.ctl_desc;
     struct fi_msg msg = {};
     msg.msg_iov = &iov;
     msg.desc = &desc;
     msg.iov_count = 1;
-    msg.addr = ack.dest;
+    msg.addr = ctl.dest;
     msg.context = &buf->op.ctx;
     const ssize_t rc = fi_sendmsg(th.ctl_ep, &msg, FI_COMPLETION);
     if (rc == -FI_EAGAIN) {
         return false;
     }
     if (rc == 0) {
-        th.free_acks.pop_back();
+        th.free_ctls.pop_back();
     } else {
-        NIXL_ERROR << "EFA proxy: ack send failed: " << fi_strerror(-rc)
-                   << "; the sender's atomicAdd fails when its ack times out";
+        NIXL_ERROR << "EFA proxy: control send failed: " << fi_strerror(-rc)
+                   << (ctl.type == wire::msgType::ATOMIC_ACK ?
+                           "; the sender's atomicAdd fails when its ack times out" :
+                           "; the target's waiting atomicAdds expire");
     }
     return true;
 }
+
+/* ---------------------------------------------------------------------------
+ * Receive side: counting puts, applying atomicAdds in ring order
+ * ------------------------------------------------------------------------- */
+
+nixlLibfabricProxy::RxRing *
+nixlLibfabricProxy::rxRing(Thread &th, uint32_t ring_key) {
+    if (th.rx_last != nullptr && th.rx_last_key == ring_key) {
+        return th.rx_last;
+    }
+    RxRing *&cached = th.rx_cache[ring_key];
+    if (cached == nullptr) {
+        std::lock_guard<std::mutex> lock(rx_rings_mutex_);
+        std::unique_ptr<RxRing> &ring = rx_rings_[ring_key];
+        if (!ring) {
+            ring = std::make_unique<RxRing>();
+        }
+        cached = ring.get();
+    }
+    th.rx_last_key = ring_key;
+    th.rx_last = cached;
+    return cached;
+}
+
+void
+nixlLibfabricProxy::handleImm(Thread &th, uint32_t imm) {
+    // The data is in place once its CQ entry is: release it with the count.
+    rxRing(th, wire::immRing(imm))
+        ->received[wire::immSlot(imm)]
+        .fetch_add(1, std::memory_order_release);
+}
+
+void
+nixlLibfabricProxy::drainDeferred(Thread &th) {
+    using Adds = std::map<uint64_t, RxOwned::Add>;
+    // Rounds: take every ring's next atomicAdd (seq == applied) if this thread owns
+    // it and its epoch slot counted its puts; flush once for all of them (when
+    // flushing; only puts counted before the flush are covered by it); apply them
+    // in ring order. Applying one makes the ring's next seq applicable: it is
+    // looked at in the next round.
+    std::vector<std::pair<RxOwned *, Adds::iterator>> ready;
+    for (;;) {
+        ready.clear();
+        for (auto it = th.owned.begin(); it != th.owned.end();) {
+            RxOwned &owned = it->second;
+            RxRing &ring = *owned.ring;
+            const uint64_t aborted = ring.aborted_from.load(std::memory_order_acquire);
+            owned.adds.erase(owned.adds.lower_bound(aborted), owned.adds.end());
+            if (owned.adds.empty()) {
+                it = th.owned.erase(it);
+                continue;
+            }
+            const uint64_t next = ring.applied.load(std::memory_order_acquire);
+            auto add = owned.adds.begin();
+            if (add->first == next &&
+                ring.received[next % wire::kEpochs].load(std::memory_order_acquire) >=
+                    add->second.msg.expected_puts) {
+                ready.emplace_back(&owned, add);
+            }
+            ++it;
+        }
+        if (ready.empty()) {
+            break;
+        }
+        if (rx_flush_) {
+            bool flush = false;
+            for (auto &[owned, add] : ready) {
+                flush = flush || !add->second.flushed;
+            }
+            if (flush) {
+                const nixl_status_t status =
+                    flushRdmaWrites(th, ready.front().second->second.msg.remote_addr);
+                ++th.rx_stats.flushes;
+                for (auto &[owned, add] : ready) {
+                    add->second.flushed = true;
+                    if (status != NIXL_SUCCESS) {
+                        owned->ring->error.store(status, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+        const uint64_t now = nowNs();
+        for (auto &[owned, add] : ready) {
+            RxRing &ring = *owned->ring;
+            const wire::atomicAddMsg &msg = add->second.msg;
+            if (th.prof) {
+                th.prof->add(nixlLibfabricProxyProfile::RX_ORDER_WAIT, now - add->second.arrived);
+            }
+            auto status = static_cast<nixl_status_t>(ring.error.load(std::memory_order_relaxed));
+            if (status == NIXL_SUCCESS) {
+                const uint64_t start = th.prof ? nowNs() : 0;
+                status = applyAtomic(th, msg.remote_addr, msg.value);
+                if (th.prof) {
+                    th.prof->add(nixlLibfabricProxyProfile::ATOMIC_APPLY, nowNs() - start);
+                }
+                if (status != NIXL_SUCCESS) {
+                    NIXL_ERROR << "EFA proxy: atomicAdd to " << std::hex << msg.remote_addr
+                               << std::dec << " failed with status " << status
+                               << "; reporting it to the sender, later ones on its ring fail too";
+                    ring.error.store(status, std::memory_order_relaxed);
+                }
+            }
+            ++th.events;
+            // The ring's next atomicAdd may be another thread's: publish the add first.
+            ring.applied.store(msg.seq + 1, std::memory_order_release);
+            sendCtl(
+                th,
+                PendingCtl{add->second.reply, wire::msgType::ATOMIC_ACK, msg.token, status, 0, 0});
+            owned->adds.erase(add);
+        }
+    }
+
+    // Atomics that waited too long: their sender has failed them by now.
+    const uint64_t now = nowNs();
+    if (now < th.next_deferred_scan) {
+        return;
+    }
+    th.next_deferred_scan = now + kDeferredScanNs;
+    for (auto it = th.owned.begin(); it != th.owned.end();) {
+        auto &adds = it->second.adds;
+        for (auto add = adds.begin(); add != adds.end();) {
+            if (now - add->second.arrived < kDeferredTimeoutNs) {
+                ++add;
+                continue;
+            }
+            const RxRing &ring = *it->second.ring;
+            NIXL_ERROR << "EFA proxy: atomicAdd to " << std::hex << add->second.msg.remote_addr
+                       << " (ring " << add->second.msg.ring << std::dec << " seq " << add->first
+                       << ") still waited for its ring after " << kDeferredTimeoutNs / 1000000000
+                       << " s (slot count " << ring.received[add->first % wire::kEpochs].load()
+                       << " of " << add->second.msg.expected_puts << ", applied "
+                       << ring.applied.load() << "); dropping it";
+            sendCtl(th,
+                    PendingCtl{add->second.reply,
+                               wire::msgType::ATOMIC_ACK,
+                               add->second.msg.token,
+                               NIXL_ERR_REMOTE_DISCONNECT,
+                               0,
+                               0});
+            add = adds.erase(add);
+        }
+        it = adds.empty() ? th.owned.erase(it) : std::next(it);
+    }
+}
+
 
 const nixlLibfabricProxy::Region *
 nixlLibfabricProxy::findRegion(uint64_t addr) const {
@@ -2313,287 +2518,6 @@ nixlLibfabricProxy::onDeregister(uintptr_t addr, size_t len) {
         addr, len, [this](uintptr_t page, size_t size) { return regionOverlaps(page, size); });
 }
 
-/* ---------------------------------------------------------------------------
- * Receiver-side ordering (efa_proxy_ordering=receiver)
- * ------------------------------------------------------------------------- */
-
-nixlLibfabricProxy::TxRing *
-nixlLibfabricProxy::txRing(Thread &th,
-                           RingFence &fence,
-                           const std::shared_ptr<nixlLibfabricConnection> &conn,
-                           uint32_t ring) {
-    if (fence.tx != nullptr && fence.tx_conn == conn.get()) {
-        return fence.tx;
-    }
-    // Counts follow the target's (its incarnation), not this fence: a quiesced
-    // ring that comes back continues them. One per ring, so that at most
-    // ring_depth of its requests (<= kRingEpochs) are in flight.
-    TxRing &tx =
-        th.tx_rings[std::make_tuple(conn->remoteAgent_, conn->remote_proxy_incarnation_, ring)];
-    if (tx.key == 0 || (tx.error != NIXL_SUCCESS && tx.inflight == 0)) {
-        // New, or failed: a put counted here may never reach the target, so start
-        // over under a new key, which the target counts from zero.
-        std::uniform_int_distribution<uint32_t> id(1, wire::kMaxRingKey);
-        uint32_t key;
-        do {
-            key = id(th.rng);
-        } while (key == tx.key);
-        tx = TxRing{};
-        tx.key = key;
-    }
-    fence.tx = &tx;
-    fence.tx_conn = conn.get();
-    return &tx;
-}
-
-void
-nixlLibfabricProxy::failRing(Thread &th, Request *req, nixl_status_t status) {
-    // The fence's rule: the failed operation's ring sends no atomicAdd after it.
-    // Those already sent may wait at the target for a put that will never come
-    // (or a failed atomicAdd before them): fail them here instead of by timeout.
-    if (req->fence != nullptr && req->fence->error == NIXL_SUCCESS) {
-        req->fence->error = status;
-    }
-    TxRing *tx = req->tx;
-    if (tx == nullptr) {
-        return;
-    }
-    if (tx->error == NIXL_SUCCESS) {
-        tx->error = status;
-    }
-    // A failed put of epoch e: atomicAdds e and later; a failed atomicAdd s: after s.
-    const uint64_t first = req->is_atomic ? req->rx_seq + 1 : req->rx_seq;
-    for (size_t i = 0; i < th.awaiting.size(); ++i) {
-        Request *other = th.awaiting[i];
-        if (!other->awaiting_ack || other->tx != tx) {
-            continue;
-        }
-        if (other->rx_seq >= first) {
-            other->awaiting_ack = false;
-            completeFragment(th, other, status);
-        }
-    }
-}
-
-nixlLibfabricProxy::RxRing *
-nixlLibfabricProxy::rxRing(Thread &th, uint32_t ring_key) {
-    if (th.rx_last != nullptr && th.rx_last_key == ring_key) {
-        return th.rx_last;
-    }
-    RxRing *&cached = th.rx_cache[ring_key];
-    if (cached == nullptr) {
-        std::lock_guard<std::mutex> lock(rx_rings_mutex_);
-        std::unique_ptr<RxRing> &ring = rx_rings_[ring_key];
-        if (!ring) {
-            ring = std::make_unique<RxRing>();
-        }
-        cached = ring.get();
-    }
-    th.rx_last_key = ring_key;
-    th.rx_last = cached;
-    return cached;
-}
-
-void
-nixlLibfabricProxy::handleImm(Thread &th, uint32_t imm) {
-    // The data is in place once its CQ entry is: release it with the count.
-    const uint32_t slot = wire::immSlot(imm);
-    const uint64_t n =
-        rxRing(th, wire::immRing(imm))->received[slot].fetch_add(1, std::memory_order_release);
-    if (rx_trace_ && n < 32 && slot < 8) {
-        NIXL_INFO << "RXTRACE t=" << nowNs() << " imm key=" << std::hex << wire::immRing(imm)
-                  << std::dec << " slot=" << slot << " received=" << n + 1 << " thread=" << th.id;
-    }
-}
-
-bool
-nixlLibfabricProxy::tryApplyDeferred(Thread &th, Deferred &d) {
-    RxRing &ring = *d.ring;
-    if (!d.flushed || ring.applied.load(std::memory_order_acquire) != d.msg.seq) {
-        return false;
-    }
-    if (th.prof) {
-        th.prof->add(nixlLibfabricProxyProfile::RX_ORDER_WAIT, nowNs() - d.arrived);
-    }
-    auto status = static_cast<nixl_status_t>(ring.error.load(std::memory_order_relaxed));
-    if (rx_trace_ && d.msg.seq < 8) {
-        NIXL_INFO << "RXTRACE t=" << nowNs() << " apply key=" << std::hex << d.msg.ring << std::dec
-                  << " seq=" << d.msg.seq << " expected=" << d.msg.expected_puts
-                  << " received=" << ring.received[d.msg.seq % wire::kRingEpochs].load()
-                  << " thread=" << th.id;
-    }
-    if (status == NIXL_SUCCESS) {
-        const uint64_t start = th.prof ? nowNs() : 0;
-        status = applyAtomic(th, d.msg.remote_addr, d.msg.value);
-        if (th.prof) {
-            th.prof->add(nixlLibfabricProxyProfile::ATOMIC_APPLY, nowNs() - start);
-        }
-        if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "EFA proxy: atomicAdd to " << std::hex << d.msg.remote_addr << std::dec
-                       << " failed with status " << status
-                       << "; reporting it to the sender, later ones on its ring fail too";
-            ring.error.store(status, std::memory_order_relaxed);
-        }
-    }
-    ++th.events;
-    // The ring's next atomicAdd may be another thread's: publish the add first.
-    ring.applied.store(d.msg.seq + 1, std::memory_order_release);
-    sendAck(th, PendingAck{d.reply, d.msg.token, status});
-    return true;
-}
-
-void
-nixlLibfabricProxy::drainDeferred(Thread &th) {
-    // Which adds have all their puts in, then one flush for all of them: only puts
-    // whose CQ entries were counted before the flush are made visible by it.
-    bool flush = false;
-    const Deferred *first = nullptr;
-    for (Deferred &d : th.deferred) {
-        if (!d.data_ready &&
-            d.ring->received[d.msg.seq % wire::kRingEpochs].load(std::memory_order_acquire) >=
-                d.msg.expected_puts) {
-            d.data_ready = true;
-        }
-        if (d.data_ready && !d.flushed) {
-            flush = true;
-            first = first ? first : &d;
-        }
-    }
-    if (flush) {
-        nixl_status_t status = NIXL_SUCCESS;
-        if (rx_flush_) {
-            status = flushRdmaWrites(th, first->msg.remote_addr);
-        }
-        for (Deferred &d : th.deferred) {
-            if (d.data_ready && !d.flushed) {
-                d.flushed = true;
-                if (status != NIXL_SUCCESS &&
-                    d.ring->error.load(std::memory_order_relaxed) == NIXL_SUCCESS) {
-                    d.ring->error.store(status, std::memory_order_relaxed);
-                }
-            }
-        }
-    }
-
-    // Arrival order is not ring order (no message ordering on EFA RDM), so retry
-    // all of them until none moves.
-    const uint64_t now = nowNs();
-    bool progressed = true;
-    while (progressed && !th.deferred.empty()) {
-        progressed = false;
-        for (size_t i = 0; i < th.deferred.size();) {
-            Deferred &d = th.deferred[i];
-            bool done = tryApplyDeferred(th, d);
-            if (!done && now - d.arrived >= kAckTimeoutNs) {
-                // The sender has given up on it too.
-                NIXL_ERROR << "EFA proxy: receiver-ordered atomicAdd to " << std::hex
-                           << d.msg.remote_addr << std::dec << " still waited for its ring after "
-                           << kAckTimeoutNs / 1000000000 << " s (received "
-                           << d.ring->received[d.msg.seq % wire::kRingEpochs].load() << " of "
-                           << d.msg.expected_puts << " puts, applied " << d.ring->applied.load()
-                           << " of " << d.msg.seq << " atomicAdds); dropping it";
-                sendAck(th, PendingAck{d.reply, d.msg.token, NIXL_ERR_REMOTE_DISCONNECT});
-                done = true;
-            }
-            if (done) {
-                th.deferred[i] = th.deferred.back();
-                th.deferred.pop_back();
-                progressed = true;
-            } else {
-                ++i;
-            }
-        }
-    }
-}
-
-fi_addr_t
-nixlLibfabricProxy::dataAddr(Thread &th,
-                             PeerAddrs &pa,
-                             const nixlLibfabricConnection &conn,
-                             size_t rail,
-                             size_t remote_thread,
-                             size_t remote_rail) {
-    const auto &names = conn.remote_proxy_data_ep_names_;
-    const size_t remote_rails = names[0].size();
-    static const std::array<char, LF_EP_NAME_MAX_LEN> kNoName{};
-    if (remote_thread >= names.size() || remote_rail >= remote_rails ||
-        names[remote_thread][remote_rail] == kNoName) {
-        NIXL_ERROR << "EFA proxy: " << conn.remoteAgent_ << " accepts no remote CQ data on rail "
-                   << remote_rail << " (thread " << remote_thread
-                   << "); receiver ordering needs buffers on the target GPU's rails";
-        return FI_ADDR_UNSPEC;
-    }
-    if (pa.data_ep.empty()) {
-        pa.data_ep.resize(rails_);
-    }
-    std::vector<fi_addr_t> &slots = pa.data_ep[rail];
-    if (slots.empty()) {
-        slots.assign(names.size() * remote_rails, FI_ADDR_UNSPEC);
-    }
-    fi_addr_t &addr = slots[remote_thread * remote_rails + remote_rail];
-    if (addr == FI_ADDR_UNSPEC &&
-        fi_av_insert(
-            th.rails[rail].av, names[remote_thread][remote_rail].data(), 1, &addr, 0, nullptr) !=
-            1) {
-        addr = FI_ADDR_UNSPEC;
-        NIXL_ERROR << "EFA proxy: fi_av_insert failed for " << conn.remoteAgent_ << " proxy thread "
-                   << remote_thread << " data EP on rail " << remote_rail;
-    }
-    return addr;
-}
-
-size_t
-nixlLibfabricProxy::rxThread(const nixlLibfabricConnection &conn,
-                             uint32_t key,
-                             size_t remote_rail) {
-    const size_t threads = conn.remote_proxy_data_ep_names_.size();
-    if (!conn.remote_proxy_rx_by_rail_) {
-        return wire::ringThread(key, static_cast<uint32_t>(threads));
-    }
-    const auto &rails = conn.remote_proxy_data_rails_;
-    const auto it = std::find(rails.begin(), rails.end(), remote_rail);
-    // A rail it does not accept on: dataAddr() reports it.
-    return it == rails.end() ? 0 : static_cast<size_t>(it - rails.begin()) % threads;
-}
-
-void
-nixlLibfabricProxy::reportRx() const {
-    for (const auto &th : thread_state_) {
-        if (th->busy_ns == 0) {
-            continue;
-        }
-        const double window = double(th->busy_last - th->busy_first);
-        std::ostringstream out;
-        out << std::fixed << std::setprecision(1) << "EFA proxy cpu: thread " << th->id
-            << ": events=" << th->events << " busy_ms=" << th->busy_ns / 1e6
-            << " window_ms=" << window / 1e6
-            << " busy_pct=" << (window > 0 ? 100.0 * th->busy_ns / window : 0.0);
-        NIXL_INFO << out.str();
-    }
-    if (!imm_puts_) {
-        return;
-    }
-    for (const auto &th : thread_state_) {
-        const auto &st = th->rx_stats;
-        if (st.entries == 0 && st.deferred == 0) {
-            continue;
-        }
-        const double window_ns = st.last > st.first ? double(st.last - st.first) : 0.0;
-        const double entries = st.entries != 0 ? double(st.entries) : 1.0;
-        std::ostringstream out;
-        out << std::fixed << std::setprecision(1) << "EFA proxy rx: thread " << th->id
-            << ": entries=" << st.entries << " reads=" << st.reads << " sweeps=" << st.sweeps
-            << " window_ms=" << window_ns / 1e6
-            << " sweep_ns_per_entry=" << double(st.sweep_ns) / entries
-            << " read_ns_per_entry=" << double(st.read_ns) / entries
-            << " decode_ns_per_entry=" << double(st.decode_ns) / entries
-            << " entries_per_read=" << double(st.entries) / std::max<uint64_t>(st.reads, 1)
-            << " busy_pct=" << (window_ns > 0 ? 100.0 * double(st.sweep_ns) / window_ns : 0.0)
-            << " entries_per_s=" << (window_ns > 0 ? double(st.entries) * 1e9 / window_ns : 0.0)
-            << " consumed_rx=" << st.consumed_rx << " deferred_atomics=" << st.deferred;
-        NIXL_INFO << out.str();
-    }
-}
 
 /* ---------------------------------------------------------------------------
  * Peer addresses
@@ -2622,6 +2546,16 @@ nixlLibfabricProxy::peerAddrs(Thread &th, const std::shared_ptr<nixlLibfabricCon
     pa.rail_ep.assign(rails_,
                       std::vector<fi_addr_t>(conn->remote_rail_ep_names_.size(), FI_ADDR_UNSPEC));
     pa.home.assign(conn->remote_proxy_ep_names_.size(), FI_ADDR_UNSPEC);
+    const auto &data_rails = conn->remote_proxy_data_rails_;
+    pa.data_ep.assign(rails_, std::vector<fi_addr_t>(data_rails.size(), FI_ADDR_UNSPEC));
+    uint32_t max_rail = 0;
+    for (uint32_t r : data_rails) {
+        max_rail = std::max(max_rail, r);
+    }
+    pa.data_index.assign(data_rails.empty() ? 0 : max_rail + 1, -1);
+    for (size_t i = 0; i < data_rails.size(); ++i) {
+        pa.data_index[data_rails[i]] = static_cast<int>(i);
+    }
     return &th.peers.emplace(conn.get(), std::move(pa)).first->second;
 }
 
@@ -2650,14 +2584,35 @@ fi_addr_t
 nixlLibfabricProxy::homeAddr(Thread &th,
                              PeerAddrs &pa,
                              const nixlLibfabricConnection &conn,
-                             size_t owner) {
-    fi_addr_t &addr = pa.home[owner];
+                             size_t thread) {
+    fi_addr_t &addr = pa.home[thread];
     if (addr == FI_ADDR_UNSPEC &&
-        fi_av_insert(th.ctl_av, conn.remote_proxy_ep_names_[owner].data(), 1, &addr, 0, nullptr) !=
+        fi_av_insert(th.ctl_av, conn.remote_proxy_ep_names_[thread].data(), 1, &addr, 0, nullptr) !=
             1) {
         addr = FI_ADDR_UNSPEC;
         NIXL_ERROR << "EFA proxy: fi_av_insert failed for " << conn.remoteAgent_ << " proxy thread "
-                   << owner;
+                   << thread;
+    }
+    return addr;
+}
+
+fi_addr_t
+nixlLibfabricProxy::dataAddr(Thread &th,
+                             PeerAddrs &pa,
+                             const nixlLibfabricConnection &conn,
+                             size_t rail,
+                             size_t data_index) {
+    fi_addr_t &addr = pa.data_ep[rail][data_index];
+    if (addr == FI_ADDR_UNSPEC &&
+        fi_av_insert(th.rails[rail].av,
+                     conn.remote_proxy_data_ep_names_[data_index].data(),
+                     1,
+                     &addr,
+                     0,
+                     nullptr) != 1) {
+        addr = FI_ADDR_UNSPEC;
+        NIXL_ERROR << "EFA proxy: fi_av_insert failed for " << conn.remoteAgent_
+                   << " data EP on its rail " << conn.remote_proxy_data_rails_[data_index];
     }
     return addr;
 }
@@ -2701,58 +2656,45 @@ nixlLibfabricProxy::dropPeer(Thread &th, PeerAddrs &pa) {
 
 std::string
 nixlLibfabricProxy::serializeConnInfo() const {
-    nixlLibfabricProxyConnInfo::ProxyEps eps;
-    eps.home.reserve(thread_state_.size());
-    if (imm_puts_) {
-        // Only the rails whose data CQs are polled accept puts with remote CQ data
-        // (and the handshake carrying this has a size limit).
-        eps.data_rails = rx_rails_;
-        eps.rx_by_rail = rx_by_rail_;
-    }
+    ci::ProxyEps eps;
     for (const auto &th : thread_state_) {
         eps.home.push_back(th->home_name);
-        if (imm_puts_) {
-            eps.data.emplace_back();
-            for (uint32_t r : rx_rails_) {
-                eps.data.back().push_back(th->rails[r].name);
-            }
-        }
+    }
+    // Each receive rail with the data EP of the thread that polls it.
+    for (size_t i = 0; i < rx_rails_.size() && !thread_state_.empty(); ++i) {
+        const uint32_t owner = wire::railThread(static_cast<uint32_t>(i), threads_);
+        eps.data_rails.push_back(rx_rails_[i]);
+        eps.data.push_back(thread_state_[owner]->rails[rx_rails_[i]].name);
     }
     eps.incarnation = incarnation_;
-    return nixlLibfabricProxyConnInfo::serialize(eps);
+    return ci::serialize(eps);
 }
 
 std::string
 nixlLibfabricProxy::joinConnInfo(const std::string &engine_part, const std::string &proxy_part) {
-    return nixlLibfabricProxyConnInfo::join(engine_part, proxy_part);
+    return ci::join(engine_part, proxy_part);
 }
 
 void
 nixlLibfabricProxy::splitConnInfo(const std::string &in,
                                   std::string &engine_part,
                                   std::string &proxy_part) {
-    nixlLibfabricProxyConnInfo::split(in, engine_part, proxy_part);
+    ci::split(in, engine_part, proxy_part);
 }
 
 nixl_status_t
 nixlLibfabricProxy::parseConnInfo(const std::string &blob, nixlLibfabricConnection &conn) {
-    nixlLibfabricProxyConnInfo::ProxyEps eps;
-    const nixl_status_t status = nixlLibfabricProxyConnInfo::parse(blob, eps);
-    conn.remote_proxy_ep_names_ = std::move(eps.home);
+    ci::ProxyEps eps;
+    const nixl_status_t status = ci::parse(blob, eps);
+    conn.remote_proxy_ep_names_.clear();
     conn.remote_proxy_data_ep_names_.clear();
-    conn.remote_proxy_data_rails_ = eps.data_rails;
-    conn.remote_proxy_rx_by_rail_ = eps.rx_by_rail;
-    if (!eps.data.empty()) {
-        // Dense [thread][rail]; rails that accept no remote CQ data stay all-zero.
-        const uint32_t rails = *std::max_element(eps.data_rails.begin(), eps.data_rails.end()) + 1;
-        conn.remote_proxy_data_ep_names_.assign(
-            eps.data.size(), std::vector<std::array<char, LF_EP_NAME_MAX_LEN>>(rails));
-        for (size_t t = 0; t < eps.data.size(); ++t) {
-            for (size_t i = 0; i < eps.data_rails.size(); ++i) {
-                conn.remote_proxy_data_ep_names_[t][eps.data_rails[i]] = eps.data[t][i];
-            }
-        }
+    for (const std::string &name : eps.home) {
+        conn.remote_proxy_ep_names_.push_back(ci::paddedName(name));
     }
+    for (const std::string &name : eps.data) {
+        conn.remote_proxy_data_ep_names_.push_back(ci::paddedName(name));
+    }
+    conn.remote_proxy_data_rails_ = eps.data_rails;
     conn.remote_proxy_incarnation_ = eps.incarnation;
     return status;
 }

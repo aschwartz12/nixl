@@ -114,11 +114,7 @@ twoCounterReceiverKernel(unsigned long long *a,
     out[1] = bv;
 }
 
-/**
- * Parameter: the backend, optionally with a receiver-side ordering variant:
- * LIBFABRIC_receiver (efa_proxy_ordering=receiver), LIBFABRIC_rxrail (the same,
- * with each put counted by the target thread of its rail).
- */
+/** Parameter: the backend (LIBFABRIC: the EFA proxy, which orders at the target). */
 class ProxyOrderingTest : public testing::TestWithParam<std::string> {
 protected:
     static constexpr size_t kSender = 0;
@@ -127,12 +123,13 @@ protected:
 
     std::string
     backend() const {
-        return GetParam().substr(0, GetParam().find('_'));
+        return GetParam();
     }
 
+    /** The EFA proxy orders put -> atomicAdd at the target. */
     bool
     receiverOrdering() const {
-        return GetParam() == "LIBFABRIC_receiver" || GetParam() == "LIBFABRIC_rxrail";
+        return backend() == "LIBFABRIC";
     }
 
     nixl_b_params_t
@@ -141,13 +138,7 @@ protected:
                                   {"proxy_channel_count", std::to_string(kChannels)},
                                   {"proxy_thread_count", std::to_string(kProxyThreads)},
                                   {"proxy_max_peers", "2"}};
-        if (receiverOrdering()) {
-            params.emplace("efa_proxy_ordering", "receiver");
-        }
-        if (GetParam() == "LIBFABRIC_rxrail") {
-            params.emplace("efa_proxy_rx_thread", "rail");
-        }
-        // Experiments: extra receiver-ordering parameters, "key=value,...".
+        // Experiments: extra EFA proxy parameters, "key=value,...".
         const char *extra = std::getenv("NIXL_GTEST_EFA_PROXY_RX_PARAMS");
         if (receiverOrdering() && extra != nullptr) {
             std::stringstream items(extra);
@@ -687,6 +678,56 @@ TEST_P(ProxyAtomicTest, DeregisterDuringAtomics) {
     releaseViews(b);
 }
 
+/**
+ * A peer's handshake that arrives while this agent is loading the peer's metadata
+ * must not be lost (it would make the first connection to the peer time out).
+ * NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS widens the window in the engine.
+ */
+class ProxyConnectionTest : public ProxyOrderingTest {
+protected:
+    void
+    SetUp() override {
+#ifdef NDEBUG
+        GTEST_SKIP() << "the handshake delay hook is compiled out of NDEBUG builds";
+#endif
+        if (!hasCudaGpu()) {
+            GTEST_SKIP() << "No CUDA-capable GPU is available";
+        }
+        ASSERT_EQ(cudaSetDevice(kDevId), cudaSuccess);
+        ASSERT_EQ(setenv("NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS", "500", 1), 0);
+        createAgents();
+    }
+
+    void
+    TearDown() override {
+        ProxyOrderingTest::TearDown();
+        unsetenv("NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS");
+    }
+};
+
+TEST_P(ProxyConnectionTest, HandshakeDuringMetadataLoad) {
+    if (IsSkipped()) {
+        return;
+    }
+    nixl_blob_t md0, md1;
+    ASSERT_EQ(agents_[kSender]->getLocalMD(md0), NIXL_SUCCESS);
+    ASSERT_EQ(agents_[kReceiver]->getLocalMD(md1), NIXL_SUCCESS);
+    std::string remote;
+    // The receiver connects first: its handshake (with its connection info) reaches
+    // the sender, whose engine stalls in handleHandshake() before buffering it...
+    ASSERT_EQ(agents_[kReceiver]->loadRemoteMD(md0, remote), NIXL_SUCCESS);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // ...while the sender creates the connection to the receiver.
+    ASSERT_EQ(agents_[kSender]->loadRemoteMD(md1, remote), NIXL_SUCCESS);
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(agents_[kSender]->makeConnection(name(kReceiver)), NIXL_SUCCESS);
+    EXPECT_EQ(agents_[kReceiver]->makeConnection(name(kSender)), NIXL_SUCCESS);
+    const double s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    Logger() << "HandshakeDuringMetadataLoad: connections established in " << s << " s";
+    EXPECT_LT(s, 10.0);
+}
+
 namespace {
     std::string
     testName(const testing::TestParamInfo<std::string> &info) {
@@ -694,19 +735,15 @@ namespace {
     }
 } // namespace
 
-INSTANTIATE_TEST_SUITE_P(libfabricProxy,
-                         ProxyOrderingTest,
-                         testing::Values("LIBFABRIC", "LIBFABRIC_receiver", "LIBFABRIC_rxrail"),
-                         testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyOrderingTest, testing::Values("LIBFABRIC"), testName);
+
+INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyFaultTest, testing::Values("LIBFABRIC"), testName);
 
 INSTANTIATE_TEST_SUITE_P(libfabricProxy,
-                         ProxyFaultTest,
-                         testing::Values("LIBFABRIC", "LIBFABRIC_receiver", "LIBFABRIC_rxrail"),
+                         ProxyConnectionTest,
+                         testing::Values("LIBFABRIC"),
                          testName);
 
-INSTANTIATE_TEST_SUITE_P(libfabricProxy,
-                         ProxyAtomicTest,
-                         testing::Values("LIBFABRIC", "LIBFABRIC_receiver", "LIBFABRIC_rxrail"),
-                         testName);
+INSTANTIATE_TEST_SUITE_P(libfabricProxy, ProxyAtomicTest, testing::Values("LIBFABRIC"), testName);
 
 } // namespace gtest::nixl::gpu::proxy_ordering

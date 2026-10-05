@@ -14,9 +14,9 @@
 # limitations under the License.
 
 # EFA device proxy logic that needs no fabric: the connection-info trailer and
-# the per-ring fence (header-only in the plugin).
+# the wire format (header-only in the plugin).
 libfabric_unit_test_dep = declare_dependency(
-    sources: ['proxy_conninfo.cpp', 'proxy_fence.cpp'],
+    sources: ['proxy_conninfo.cpp'],
     include_directories: [
         nixl_inc_dirs,
         utils_inc_dirs,

@@ -19,12 +19,31 @@
 #include "serdes/serdes.h"
 #include "common/nixl_log.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <thread>
 
 /****************************************
  * Peer-id handshake protocol
  *****************************************/
+
+namespace {
+// Tests only (ignored in NDEBUG builds): NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS stalls
+// handleHandshake() for an unknown peer between its lookup and buffering, where a
+// concurrent createAgentConnection() can interleave.
+void
+testHandshakeDelay() {
+#ifndef NDEBUG
+    const char *env = std::getenv("NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS");
+    if (env != nullptr && *env != '\0') {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(env)));
+    }
+#endif
+}
+} // namespace
 
 // Wire format for a handshake message body (serialized via nixlSerDes):
 //   "idx"      : uint16 = assigned_idx (the index we have for this peer)
@@ -150,25 +169,27 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
                << "' assigned_idx=" << assigned_idx
                << " piggybacked_conn_info_len=" << piggybacked_conn_info.size();
 
-    // Process the decoded handshake.
+    // Process the decoded handshake. Look the peer up and, if it is unknown, buffer
+    // the handshake under the lock createAgentConnection() holds while it drains the
+    // buffer: with separate critical sections, a connection created in between would
+    // never see this handshake, and the first connection to the peer would time out.
     std::shared_ptr<nixlLibfabricConnection> conn;
     {
         std::lock_guard<std::mutex> lock(connection_state_mutex_);
         auto it = connections_.find(peer_agent_name);
         if (it != connections_.end() && it->second) {
             conn = it->second;
-        }
-    }
-
-    if (!conn) {
-        {
+        } else {
+            testHandshakeDelay();
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
             pending_inbound_handshakes_[peer_agent_name] = assigned_idx;
             NIXL_DEBUG << "Buffered handshake from not-yet-known peer '" << peer_agent_name
                        << "' (assigned_idx=" << assigned_idx
                        << "); will apply on createAgentConnection";
         }
+    }
 
+    if (!conn) {
         if (piggybacked_conn_info.empty()) {
             // Code should not reach here. When piggybacked_conn_info is empty, the handshake
             // source should have received a handshake message from this side, which means

@@ -45,38 +45,36 @@ class nixlLibfabricEngine;
 struct nixlLibfabricConnection;
 
 /**
- * EFA implementation of the device proxy's backend operations.
+ * EFA implementation of the device proxy's backend operations, ordering put ->
+ * atomicAdd at the target (libfabric_proxy_wire.h; design and flow in
+ * EFA_PROXY_RECEIVER_ORDERING.md).
  *
  * The engine owns one instance when the device_proxy backend param is set and
- * hands its callbacks to nixlProxyRuntime. Resources follow the design:
+ * hands its callbacks to nixlProxyRuntime. Per proxy thread t:
  *
- *  - Proxy thread t owns an EP, CQ and AV on every local rail, created in the
- *    engine's per-rail fi_domain, so memory registrations and keys are reused,
- *    plus a control EP on its home rail for atomicAdd records and acks.
- *  - A put is one fi_writemsg per fragment with FI_DELIVERY_COMPLETE (striped
- *    across rails at or above the engine's striping threshold), completed
- *    through CQ entries whose op_context identifies the exact request.
- *  - An atomicAdd is held in its ring's fence until every earlier put and the
- *    previous atomicAdd on that ring (channel, peer) have completed, then sent
- *    (libfabric_proxy_wire.h) to the counter's owner thread at the target. The
- *    owner applies it through GDRCopy (VRAM), CUDA copies on its own
- *    non-blocking stream (VRAM without GDRCopy) or a CPU atomic (DRAM), and acks
- *    with the result: an atomicAdd completes once applied, and a failure at the
- *    target reaches the sender's GPU.
- *  - efa_proxy_ordering=receiver (opt-in prototype) orders at the target
- *    instead: every put fragment carries its ring's key as remote CQ data and goes
- *    to one data EP of the target per ring, whose thread counts it; an atomicAdd
- *    is sent at once with its ring's put count and sequence number, and its owner
- *    applies it once the ring's received puts and applied atomicAdds reach them.
+ *  - a data EP (with its own CQ and AV) on every rail, in the engine's per-rail
+ *    fi_domain (so registrations and keys are shared). Puts leave from them; on
+ *    the receive rails (next to the GPU) t polls the data CQ of the rails it owns
+ *    (wire::railThread()) and counts the puts that land there;
+ *  - a control EP on its home rail for atomicAdd records, acks and ring aborts.
+ *
+ * Sender side, per ring (channel, peer): every put fragment is an RDMA write with
+ * FI_DELIVERY_COMPLETE and remote CQ data (ring key, epoch) to the data EP of the
+ * target thread that receives on the destination rail; an atomicAdd is sent at
+ * once to its counter's owner thread and completes on that thread's ack, i.e. once
+ * applied. A ring waits for the engine handshake with its target (the ring key
+ * holds the sender's index at the target) before its first operation leaves.
+ *
+ * Target side: the owner applies an atomicAdd (GDRCopy, CUDA copy or CPU atomic)
+ * once its ring's epoch slot counted its puts and the ring's previous atomicAdd was
+ * applied, then acks with the result.
  *
  * Threading: ProxyWorker owns channel c on thread c % effectiveThreadCount() and
- * calls submit/check_completion/progress/quiesce for a ring only from that
- * thread (checked), visiting ring (t, 0) on every pass; that call polls the
- * thread's CQs (every pass while it has work, every efa_proxy_idle_poll_us when
- * idle). Every CQ therefore has exactly one polling thread. The data path
- * takes no lock except, while applying an add to VRAM, its own thread's
- * (uncontended) registration lock and a brief lookup in the shared GDRCopy page
- * map.
+ * calls submit/check_completion/progress/quiesce for a ring only from that thread
+ * (checked), visiting ring (t, 0) on every pass; that call polls the thread's CQs
+ * (every pass while it has work, every efa_proxy_idle_poll_us when idle). Every CQ
+ * has one polling thread. Receive-side ring state is shared between the thread
+ * counting a ring's puts and the owners of its counters through atomics.
  */
 class nixlLibfabricProxy {
 public:
@@ -117,19 +115,20 @@ public:
 private:
     struct OpCtx;
     struct Request;
-    struct RingFence;
+    struct Ring;
+    struct TxRing;
+    struct RxRing;
+    struct RxOwned;
+    struct Parked;
     struct RecvBuf;
-    struct AckBuf;
+    struct CtlBuf;
+    struct PendingCtl;
     struct PendingPost;
-    struct PendingAck;
     struct PeerAddrs;
     struct RailRes;
     struct Thread;
     struct CounterMap;
     struct Inject;
-    struct TxRing;
-    struct RxRing;
-    struct Deferred;
 
     // nixlProxyBackendOps callbacks.
     nixl_status_t
@@ -151,16 +150,46 @@ private:
     void
     checkOwner(Thread &th);
 
-    // Data path helpers; all run on the owning proxy thread.
+    // Sender side; all on the owning proxy thread.
+    /** Post @p sub for @p req on @p ring, or set @p parked if it must wait for a handshake. */
     nixl_status_t
-    submitPut(Thread &th, const nixlBackendProxySubmission &sub, Request *req);
+    submitOp(Thread &th,
+             Ring &ring,
+             const nixlBackendProxySubmission &sub,
+             Request *req,
+             bool &parked);
+    /** @p tx: the ring's counts towards the target, nullptr if it published no proxy. */
     nixl_status_t
-    submitAtomic(Thread &th, const nixlBackendProxySubmission &sub, Request *req);
+    submitPut(Thread &th,
+              Ring &ring,
+              const nixlBackendProxySubmission &sub,
+              Request *req,
+              TxRing *tx);
+    nixl_status_t
+    submitAtomic(Thread &th,
+                 Ring &ring,
+                 const nixlBackendProxySubmission &sub,
+                 Request *req,
+                 TxRing *tx);
+    /**
+     * The sender-side counts of @p ring towards @p conn's agent, once the engine
+     * handshake with it gave the sender's index there (part of the ring key):
+     * nullptr until then, or (with @p status set) if they cannot be had.
+     */
+    TxRing *
+    txRing(Thread &th,
+           Ring &ring,
+           const std::shared_ptr<nixlLibfabricConnection> &conn,
+           nixl_status_t &status);
+    /** Post the requests parked behind a pending handshake whose rings are ready. */
+    void
+    replayParked(Thread &th, uint64_t now_ns);
     /** Index into a buffer's rails for an unstriped put. */
     size_t
-    unstripedRail(const Thread &th, RingFence &fence, size_t nrails) const;
+    unstripedRail(const Thread &th, Ring &ring, size_t nrails) const;
+    /** Fail @p req's ring's later atomicAdds, at the sender and (abort) at the target. */
     void
-    releaseFence(Thread &th, RingFence &fence);
+    failRing(Thread &th, Request *req, nixl_status_t status);
     void
     sendAtomic(Thread &th, Request *req);
     ssize_t
@@ -188,77 +217,61 @@ private:
     void
     expireAcks(Thread &th, uint64_t now_ns);
 
-    // Proxy-to-proxy messages on the home endpoints.
+    // Control messages on the control EPs.
     void
     handleRecv(Thread &th, RecvBuf *buf, size_t len);
     void
     handleAtomic(Thread &th, const nixlLibfabricProxyWire::atomicAddMsg &msg);
-    /** Apply a received atomicAdd now and ack it with the result. */
-    void
-    applyAndAck(Thread &th, const nixlLibfabricProxyWire::atomicAddMsg &msg, fi_addr_t reply);
     void
     handleAck(Thread &th, const nixlLibfabricProxyWire::atomicAckMsg &ack);
+    void
+    handleAbort(Thread &th, const nixlLibfabricProxyWire::ringAbortMsg &abort);
     fi_addr_t
     replyAddr(Thread &th, const nixlLibfabricProxyWire::atomicAddMsg &msg);
+    /** Queue a control message (ack or abort) in order; posted as buffers allow. */
     void
-    sendAck(Thread &th, const PendingAck &ack);
-    /** False when the ack has to wait (no buffer, or -FI_EAGAIN). */
+    sendCtl(Thread &th, const PendingCtl &ctl);
+    /** False when the message has to wait (no buffer, or -FI_EAGAIN). */
     bool
-    postAck(Thread &th, const PendingAck &ack);
+    postCtl(Thread &th, const PendingCtl &ctl);
     nixl_status_t
     applyAtomic(Thread &th, uint64_t addr, uint64_t value);
-    /** Make completed RDMA writes to the GPU of @p addr visible to it (receiver ordering). */
+    /** Make completed RDMA writes to the GPU of @p addr visible to it (efa_proxy_rx_flush). */
     nixl_status_t
     flushRdmaWrites(Thread &th, uint64_t addr);
-
-    // Receiver-side ordering (and the test-only immediate-data puts).
-    /** The sender-side counts of a ring (channel, peer) to @p conn; re-keyed after a failure. */
-    TxRing *
-    txRing(Thread &th,
-           RingFence &fence,
-           const std::shared_ptr<nixlLibfabricConnection> &conn,
-           uint32_t ring);
-    /** Fail the atomicAdds after a failed operation of @p req's ring, as the fence does. */
-    void
-    failRing(Thread &th, Request *req, nixl_status_t status);
-    /** A put fragment with remote CQ data @p imm arrived: count it for its ring and epoch. */
-    void
-    handleImm(Thread &th, uint32_t imm);
-    RxRing *
-    rxRing(Thread &th, uint32_t ring_key);
-    /** Apply the deferred atomicAdds whose rings caught up; expire overdue ones. */
-    void
-    drainDeferred(Thread &th);
-    /** Apply @p d (its puts arrived and were flushed) if it is its ring's next one. */
-    bool
-    tryApplyDeferred(Thread &th, Deferred &d);
-    fi_addr_t
-    dataAddr(Thread &th,
-             PeerAddrs &pa,
-             const nixlLibfabricConnection &conn,
-             size_t rail,
-             size_t remote_thread,
-             size_t remote_rail);
-    /** The target thread that counts a put of ring @p key landing on @p remote_rail. */
-    static size_t
-    rxThread(const nixlLibfabricConnection &conn, uint32_t key, size_t remote_rail);
-    void
-    reportRx() const;
 #ifdef HAVE_CUDA
     nixl_status_t
     addWithCuda(Thread &th, int device_id, uint64_t addr, uint64_t value);
 #endif
 
+    // Receive side.
+    /** A put fragment with remote CQ data @p imm arrived: count it for its ring and epoch. */
+    void
+    handleImm(Thread &th, uint32_t imm);
+    RxRing *
+    rxRing(Thread &th, uint32_t ring_key);
+    /** Apply this thread's waiting atomicAdds whose rings caught up; expire overdue ones. */
+    void
+    drainDeferred(Thread &th);
+
     PeerAddrs *
     peerAddrs(Thread &th, const std::shared_ptr<nixlLibfabricConnection> &conn);
+    fi_addr_t
+    homeAddr(Thread &th, PeerAddrs &pa, const nixlLibfabricConnection &conn, size_t thread);
+    /** An engine EP of a peer without a (compatible) proxy, in @p rail's AV. */
     fi_addr_t
     railAddr(Thread &th,
              PeerAddrs &pa,
              const nixlLibfabricConnection &conn,
              size_t rail,
              size_t remote_ep);
+    /** The target's receiving data EP on its data rail number @p data_index, in @p rail's AV. */
     fi_addr_t
-    homeAddr(Thread &th, PeerAddrs &pa, const nixlLibfabricConnection &conn, size_t owner);
+    dataAddr(Thread &th,
+             PeerAddrs &pa,
+             const nixlLibfabricConnection &conn,
+             size_t rail,
+             size_t data_index);
     void
     dropPeer(Thread &th, PeerAddrs &pa);
     Request *
@@ -269,6 +282,8 @@ private:
     postRecv(Thread &th, RecvBuf *buf);
     void
     releaseThread(Thread &th);
+    void
+    report() const;
 
     nixlLibfabricEngine &engine_;
     nixlProxyConfig config_{};
@@ -276,32 +291,16 @@ private:
     size_t rails_ = 0;
     bool rail_per_thread_ = true; // efa_proxy_rail_policy: "thread" (default) or "ring"
     uint64_t idle_poll_ns_ = 0; // efa_proxy_idle_poll_us (0: poll on every pass)
-    bool profile_ = false; // NIXL_EFA_PROXY_PROFILE: per-stage timers, logged at shutdown
-    bool rx_trace_ = false; // NIXL_EFA_PROXY_RXTRACE: log early receiver-ordering events
-    // efa_proxy_ordering: put -> atomicAdd order kept by the sender's fence (default)
-    // or by the target (receiver).
-    bool receiver_order_ = false;
-    // Test-only (ignored in NDEBUG builds): sender ordering with puts carrying
-    // remote CQ data to the target's proxy data EPs (efa_proxy_test_put_imm), and
-    // atomicAdds sent without waiting for anything (efa_proxy_test_fence_off: no
-    // ordering at all).
-    bool test_put_imm_ = false;
-    bool test_fence_off_ = false;
-    size_t test_data_rx_post_ = 0; // efa_proxy_test_data_rx_post: receives per data EP
-    // efa_proxy_rx_flush (receiver ordering, default on): flush GPUDirect RDMA writes
-    // to the counter's GPU before applying adds whose puts arrived. A put's CQ entry
-    // only says the NIC wrote it: without the flush the GPU was seen to read a put
-    // still in flight after its counter moved (the counter write takes another path).
-    bool rx_flush_ = true;
-    size_t data_rx_size_ = 0; // efa_proxy_data_rx_size: data EP receive queue size
-    // Puts carry remote CQ data to proxy data EPs; this proxy also accepts them.
-    bool imm_puts_ = false;
-    // efa_proxy_rx_thread: the thread that counts a put with remote CQ data is the
-    // ring's (ring, default) or the one polling the destination rail (rail).
-    bool rx_by_rail_ = false;
-    uint64_t incarnation_ = 0; // published; peers restart their ring counts with it
-    std::vector<uint32_t> rx_rails_; // data CQs every thread polls when imm_puts_
+    bool profile_ = false; // NIXL_EFA_PROXY_PROFILE: per-stage timers, reported at shutdown
     std::unique_ptr<Inject> inject_; // NIXL_EFA_PROXY_INJECT: tests only, off under NDEBUG
+    // efa_proxy_rx_flush: flush GPUDirect RDMA writes to the counter's GPU before
+    // applying adds. Default as NCCL (ncclTopoNeedFlush()): only before Hopper, or
+    // on aarch64 hosts (C2C platforms, where the counter write and the NIC's data
+    // reach the GPU on different paths).
+    bool rx_flush_ = false;
+    int rx_flush_param_ = -1; // efa_proxy_rx_flush as given: -1 unset, 0 or 1
+    uint64_t incarnation_ = 0; // published; peers restart their ring counts with it
+    std::vector<uint32_t> rx_rails_; // rails that receive puts (next to the GPU), in order
     std::vector<std::unique_ptr<Thread>> thread_state_;
 
     // Target-side registrations by base address; duplicates and overlaps allowed.
@@ -329,10 +328,16 @@ private:
     std::multimap<uintptr_t, Region> regions_;
     std::unique_ptr<CounterMap> counters_;
 
-    // Target-side ring state, shared by the thread that counts a ring's puts and
-    // the owners of its counters; never freed while the proxy lives.
+    // Receive-side ring state by key, shared by the thread counting a ring's puts
+    // and the owners of its counters; created on first use, kept until shutdown
+    // (keys are never reused: a failed ring comes back under a new key).
     std::mutex rx_rings_mutex_;
     std::unordered_map<uint32_t, std::unique_ptr<RxRing>> rx_rings_;
+
+    // Sender side: the next ring id per target (name, incarnation), shared by the
+    // threads; ids are never reused for a target incarnation.
+    std::mutex ring_ids_mutex_;
+    std::map<std::pair<std::string, uint64_t>, uint32_t> next_ring_id_;
 };
 
 #endif // HAVE_NIXL_DEVICE_API
