@@ -583,6 +583,12 @@ public:
         return domain;
     }
 
+    /** Fabric of this rail (the proxy opens private domains in it). */
+    struct fid_fabric *
+    getFabric() const {
+        return fabric;
+    }
+
     /** Apply this rail's endpoint options (shm policy, EFA RNR retry) to another EP. */
     nixl_status_t
     configureProxyEndpoint(struct fid_ep *ep) const;

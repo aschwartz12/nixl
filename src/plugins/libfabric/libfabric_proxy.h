@@ -282,6 +282,18 @@ private:
     postRecv(Thread &th, RecvBuf *buf);
     void
     releaseThread(Thread &th);
+
+    /** The resources a thread sends puts on for @p rail (private or shared domain). */
+    RailRes &
+    sendRes(Thread &th, size_t rail) const;
+
+    /** Open thread @p th's private send domain, CQ, AV and EP on @p rail. */
+    int
+    openTxRail(Thread &th, size_t rail);
+
+    /** Descriptor of the local buffer at @p addr for a put on @p rail; nullptr on error. */
+    void *
+    txDesc(Thread &th, size_t rail, uint64_t addr, void *shared_desc);
     void
     report() const;
 
@@ -290,6 +302,9 @@ private:
     uint32_t threads_ = 0;
     size_t rails_ = 0;
     bool rail_per_thread_ = true; // efa_proxy_rail_policy: "thread" (default) or "ring"
+    // efa_proxy_tx_domain=private: each thread sends from its own domain per GPU rail
+    // (no domain lock shared with other threads); source buffers are registered there.
+    bool tx_private_ = false;
     uint64_t idle_poll_ns_ = 0; // efa_proxy_idle_poll_us (0: poll on every pass)
     bool profile_ = false; // NIXL_EFA_PROXY_PROFILE: per-stage timers, reported at shutdown
     std::unique_ptr<Inject> inject_; // NIXL_EFA_PROXY_INJECT: tests only, off under NDEBUG

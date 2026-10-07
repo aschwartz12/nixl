@@ -335,6 +335,12 @@ struct nixlLibfabricProxy::Thread {
     // Held while this thread applies an add; registration changes take all of them.
     std::mutex regions_lock;
     std::vector<RailRes> rails;
+    // efa_proxy_tx_domain=private: per rail, a send EP in a domain of its own (domain
+    // unset elsewhere), the rails it wrote on, and its registrations of source
+    // buffers there, by (rail, region start).
+    std::vector<RailRes> tx;
+    std::vector<uint32_t> tx_poll_rails;
+    std::map<std::pair<uint32_t, uintptr_t>, struct fid_mr *> tx_mrs;
     // Data CQs this thread polls: the receive rails it owns, plus every rail it has
     // written on (its write completions). The rail domains are FI_THREAD_SAFE, so
     // skipping other CQs also avoids taking their domain locks.
@@ -696,6 +702,14 @@ nixlLibfabricProxy::nixlLibfabricProxy(nixlLibfabricEngine &engine) : engine_(en
                       << "'; using 'thread'";
         }
     }
+    if (auto it = params.find("efa_proxy_tx_domain"); it != params.end()) {
+        if (it->second == "private") {
+            tx_private_ = true;
+        } else if (it->second != "shared") {
+            NIXL_WARN << "EFA proxy: unknown efa_proxy_tx_domain '" << it->second
+                      << "'; using 'shared'";
+        }
+    }
     if (auto it = params.find("efa_proxy_rx_flush"); it != params.end()) {
         if (it->second == "1" || it->second == "0") {
             rx_flush_param_ = it->second == "1" ? 1 : 0;
@@ -790,6 +804,7 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
         }
         th->home = static_cast<uint32_t>(home_rails[t % home_rails.size()]);
         th->rails.resize(rails_);
+        th->tx.resize(rails_);
         th->retry.resize(rails_ + 1);
         th->polled.assign(rails_, false);
 
@@ -847,6 +862,17 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
                            << ": " << fi_strerror(-ret);
                 releaseThread(*th);
                 return NIXL_ERR_BACKEND;
+            }
+        }
+
+        if (tx_private_) {
+            for (const uint32_t r : rx_rails_) {
+                if (const int ret = openTxRail(*th, r)) {
+                    NIXL_ERROR << "EFA proxy: private send domain failed for thread " << t
+                               << " rail " << r << ": " << fi_strerror(-ret);
+                    releaseThread(*th);
+                    return NIXL_ERR_BACKEND;
+                }
             }
         }
 
@@ -1018,6 +1044,24 @@ nixlLibfabricProxy::releaseThread(Thread &th) {
     };
     close(th.ctl_ep ? &th.ctl_ep->fid : nullptr);
     th.ctl_ep = nullptr;
+    for (auto &rr : th.tx) {
+        close(rr.ep ? &rr.ep->fid : nullptr);
+        rr.ep = nullptr;
+    }
+    for (auto &[key, mr] : th.tx_mrs) {
+        close(&mr->fid);
+    }
+    th.tx_mrs.clear();
+    for (auto &rr : th.tx) {
+        close(rr.cq ? &rr.cq->fid : nullptr);
+        close(rr.av ? &rr.av->fid : nullptr);
+        close(rr.domain ? &rr.domain->fid : nullptr);
+        if (rr.info) {
+            fi_freeinfo(rr.info);
+        }
+        rr = RailRes{};
+    }
+    th.tx_poll_rails.clear();
     for (auto &rr : th.rails) {
         close(rr.ep ? &rr.ep->fid : nullptr);
         rr.ep = nullptr;
@@ -1490,7 +1534,10 @@ nixlLibfabricProxy::submitPut(Thread &th,
         pp.fctx = &req->frag[i];
         pp.local = reinterpret_cast<void *>(sub.local.desc.addr + off);
         pp.len = len;
-        pp.desc = fi_mr_desc(local->rail_mr_list_[rail]);
+        pp.desc = txDesc(th, rail, sub.local.desc.addr, fi_mr_desc(local->rail_mr_list_[rail]));
+        if (pp.desc == nullptr) {
+            return NIXL_ERR_BACKEND;
+        }
         if (tx != nullptr) {
             // To the data EP receiving on the destination rail; a buffer rail the
             // target does not receive on (e.g. host memory on other rails) is
@@ -1708,7 +1755,7 @@ nixlLibfabricProxy::tryPost(Thread &th, const PendingPost &pp) {
         msg.rma_iov_count = 1;
         msg.context = &pp.fctx->op.ctx;
         msg.data = pp.imm;
-        return fi_writemsg(th.rails[pp.rail].ep, &msg, flags);
+        return fi_writemsg(sendRes(th, pp.rail).ep, &msg, flags);
     }
     // An atomicAdd record, on the control EP: the owner's ack, not the send
     // completion, finishes it.
@@ -1730,7 +1777,7 @@ nixlLibfabricProxy::postTimed(Thread &th, const PendingPost &pp) {
     const ssize_t rc = tryPost(th, pp);
     const uint64_t end = nixlLibfabricProxyProfile::now();
     th.prof->add(nixlLibfabricProxyProfile::POST_CALL, end - start);
-    RailRes &rr = th.rails[pp.rail];
+    RailRes &rr = sendRes(th, pp.rail);
     if (end - start > kSlowCallNs) {
         NIXL_INFO << "EFA proxy profile: slow "
                   << (pp.kind == PendingPost::Kind::WRITE ? "write" : "send") << " post: thread "
@@ -1748,9 +1795,16 @@ nixlLibfabricProxy::postTimed(Thread &th, const PendingPost &pp) {
 
 void
 nixlLibfabricProxy::post(Thread &th, PendingPost &&pp) {
-    if (pp.kind == PendingPost::Kind::WRITE && !th.polled[pp.rail]) {
-        th.polled[pp.rail] = true;
-        th.poll_rails.push_back(pp.rail);
+    if (pp.kind == PendingPost::Kind::WRITE) {
+        if (th.tx[pp.rail].ep != nullptr) {
+            if (std::find(th.tx_poll_rails.begin(), th.tx_poll_rails.end(), pp.rail) ==
+                th.tx_poll_rails.end()) {
+                th.tx_poll_rails.push_back(pp.rail); // its write completions arrive there
+            }
+        } else if (!th.polled[pp.rail]) {
+            th.polled[pp.rail] = true;
+            th.poll_rails.push_back(pp.rail);
+        }
     }
     std::deque<PendingPost> &queue =
         th.retry[pp.kind == PendingPost::Kind::SEND ? th.retry.size() - 1 : pp.rail];
@@ -1876,6 +1930,10 @@ nixlLibfabricProxy::pollCqs(Thread &th) {
     for (size_t i = 0; i < th.poll_rails.size(); ++i) {
         const uint32_t r = th.poll_rails[i];
         pollCq(th, th.rails[r].cq, r, th.rails[r].cq_reads);
+    }
+    for (size_t i = 0; i < th.tx_poll_rails.size(); ++i) {
+        const uint32_t r = th.tx_poll_rails[i];
+        pollCq(th, th.tx[r].cq, r, th.tx[r].cq_reads);
     }
     pollCq(th, th.ctl_cq, static_cast<uint32_t>(rails_), th.ctl_cq_reads);
     th.rx_active = th.sweep_imm != 0;
@@ -2593,12 +2651,120 @@ nixlLibfabricProxy::onDeregister(uintptr_t addr, size_t len) {
         victim = first;
         len = std::max(len, first->second.len);
     }
+    const uintptr_t start = victim->first;
     regions_.erase(victim);
+    for (auto &th : thread_state_) { // their owners hold no region lock: none is in use
+        for (auto it = th->tx_mrs.begin(); it != th->tx_mrs.end();) {
+            if (it->first.second == start) {
+                fi_close(&it->second->fid);
+                it = th->tx_mrs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     // Keep the counter pages another registration still covers.
     counters_->dropRange(
         addr, len, [this](uintptr_t page, size_t size) { return regionOverlaps(page, size); });
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Private send domains (efa_proxy_tx_domain=private)
+ * ------------------------------------------------------------------------- */
+
+nixlLibfabricProxy::RailRes &
+nixlLibfabricProxy::sendRes(Thread &th, size_t rail) const {
+    return th.tx[rail].ep != nullptr ? th.tx[rail] : th.rails[rail];
+}
+
+int
+nixlLibfabricProxy::openTxRail(Thread &th, size_t r) {
+    RailRes &rr = th.tx[r];
+    const nixlLibfabricRail &rail = engine_.rail_manager_.getRail(r);
+    rr.info = fi_dupinfo(rail.getRailInfo());
+    if (!rr.info) {
+        return -FI_ENOMEM;
+    }
+    rr.info->tx_attr->size = std::min(rr.info->tx_attr->size, kTxSize);
+    rr.info->rx_attr->size = std::min(rr.info->rx_attr->size, kDataRxSize);
+    rr.virt_addr = (rr.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0;
+    int ret = fi_domain(rail.getFabric(), rr.info, &rr.domain, nullptr);
+    struct fi_cq_attr cq_attr = {};
+    cq_attr.format = FI_CQ_FORMAT_DATA;
+    cq_attr.wait_obj = FI_WAIT_NONE;
+    cq_attr.size = kCqSize;
+    struct fi_av_attr av_attr = {};
+    if (!ret) {
+        ret = fi_cq_open(rr.domain, &cq_attr, &rr.cq, nullptr);
+    }
+    if (!ret) {
+        ret = fi_av_open(rr.domain, &av_attr, &rr.av, nullptr);
+    }
+    if (!ret) {
+        ret = fi_endpoint(rr.domain, rr.info, &rr.ep, nullptr);
+    }
+    if (!ret) {
+        ret = fi_ep_bind(rr.ep, &rr.cq->fid, FI_TRANSMIT | FI_RECV);
+    }
+    if (!ret) {
+        ret = fi_ep_bind(rr.ep, &rr.av->fid, 0);
+    }
+    if (!ret && rail.configureProxyEndpoint(rr.ep) != NIXL_SUCCESS) {
+        ret = -FI_EINVAL;
+    }
+    if (!ret) {
+        ret = fi_enable(rr.ep);
+    }
+    if (ret && rr.ep) {
+        fi_close(&rr.ep->fid);
+        rr.ep = nullptr; // sendRes() falls back to the shared domain
+    }
+    return ret;
+}
+
+void *
+nixlLibfabricProxy::txDesc(Thread &th, size_t rail, uint64_t addr, void *shared_desc) {
+    RailRes &rr = th.tx[rail];
+    if (rr.ep == nullptr) {
+        return shared_desc;
+    }
+    std::lock_guard<std::mutex> lock(th.regions_lock);
+    // The registration holding addr (the put's start; NIXL registered the whole put).
+    auto it = regions_.upper_bound(addr);
+    while (it != regions_.begin()) {
+        --it;
+        if (addr < it->first + it->second.len) {
+            break;
+        }
+    }
+    if (regions_.empty() || addr < it->first || addr >= it->first + it->second.len) {
+        NIXL_ERROR << "EFA proxy: no registration holds the put source " << std::hex << addr;
+        return nullptr;
+    }
+    const auto key = std::make_pair(static_cast<uint32_t>(rail), it->first);
+    auto found = th.tx_mrs.find(key);
+    if (found == th.tx_mrs.end()) {
+        struct iovec iov = {reinterpret_cast<void *>(it->first), it->second.len};
+        struct fi_mr_attr attr = {};
+        attr.mr_iov = &iov;
+        attr.iov_count = 1;
+        attr.access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+        attr.iface = it->second.is_vram ? FI_HMEM_CUDA : FI_HMEM_SYSTEM;
+        if (it->second.is_vram) {
+            attr.device.cuda = it->second.device_id;
+        }
+        struct fid_mr *mr = nullptr;
+        const int ret = fi_mr_regattr(rr.domain, &attr, 0, &mr);
+        if (ret) {
+            NIXL_ERROR << "EFA proxy: registration in thread " << th.id << "'s domain on rail "
+                       << rail << " failed: " << fi_strerror(-ret);
+            return nullptr;
+        }
+        found = th.tx_mrs.emplace(key, mr).first;
+    }
+    return fi_mr_desc(found->second);
+}
 
 /* ---------------------------------------------------------------------------
  * Peer addresses
@@ -2648,7 +2814,7 @@ nixlLibfabricProxy::railAddr(Thread &th,
                              size_t remote_ep) {
     fi_addr_t &addr = pa.rail_ep[rail][remote_ep];
     if (addr == FI_ADDR_UNSPEC &&
-        fi_av_insert(th.rails[rail].av,
+        fi_av_insert(sendRes(th, rail).av,
                      conn.remote_rail_ep_names_[remote_ep].data(),
                      1,
                      &addr,
@@ -2685,7 +2851,7 @@ nixlLibfabricProxy::dataAddr(Thread &th,
                              size_t data_index) {
     fi_addr_t &addr = pa.data_ep[rail][data_index];
     if (addr == FI_ADDR_UNSPEC &&
-        fi_av_insert(th.rails[rail].av,
+        fi_av_insert(sendRes(th, rail).av,
                      conn.remote_proxy_data_ep_names_[data_index].data(),
                      1,
                      &addr,
@@ -2721,14 +2887,14 @@ nixlLibfabricProxy::dropPeer(Thread &th, PeerAddrs &pa) {
     for (size_t r = 0; r < pa.rail_ep.size(); ++r) {
         for (fi_addr_t &addr : pa.rail_ep[r]) {
             if (addr != FI_ADDR_UNSPEC && !shared(r, addr)) {
-                fi_av_remove(th.rails[r].av, &addr, 1, 0);
+                fi_av_remove(sendRes(th, r).av, &addr, 1, 0);
             }
         }
     }
     for (size_t r = 0; r < pa.data_ep.size(); ++r) {
         for (fi_addr_t &addr : pa.data_ep[r]) {
             if (addr != FI_ADDR_UNSPEC && !shared(r, addr)) {
-                fi_av_remove(th.rails[r].av, &addr, 1, 0);
+                fi_av_remove(sendRes(th, r).av, &addr, 1, 0);
             }
         }
     }
