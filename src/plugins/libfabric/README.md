@@ -133,10 +133,12 @@ wire encoding and thread/endpoint mapping are described in
   threshold) with `FI_DELIVERY_COMPLETE` and 32 bits of remote CQ data (ring key and
   epoch) to the data EP of the target thread that receives on the destination rail. It
   completes once placed at the target.
-- **atomicAdd():** sent at once to the counter's owner thread at the target, which
-  applies it (GDRCopy, CUDA copies without GDRCopy, or a CPU atomic for host memory)
-  only after the target counted every earlier put of the ring and applied the ring's
-  previous atomicAdd, then acks; the atomicAdd completes on the ack. Ordering is per
+- **atomicAdd():** sent at once to the ring's owner thread at the target, which
+  applies the ring's adds in order (GDRCopy, CUDA copies without GDRCopy, or a CPU
+  atomic for host memory; a VRAM counter's update holds a lock stripe, since rings on
+  other threads may add to it too), each only after the target counted every earlier
+  put of the ring, then acks; the atomicAdd completes on the ack. VRAM registrations
+  are mapped through GDRCopy when registered, so a first add to a counter is not slow. Ordering is per
   ring and target. The add is a read-modify-write: the GPU must not write a counter
   while remote adds to it can arrive; counters must be 8-byte aligned and registered.
 - **Failures:** a failed put or atomicAdd fails the later atomicAdds of its ring (at
@@ -145,14 +147,15 @@ wire encoding and thread/endpoint mapping are described in
   nothing for 10 s. Known gap: a command the runtime cannot resolve (for example a
   stale memory view) never reaches the backend, so it does not fail later atomicAdds
   on its ring.
-- **Connection info:** a proxy section (version 4: control EPs, receive rails and
+- **Connection info:** a proxy section (version 5: control EPs, receive rails and
   their data EPs, incarnation) is appended after the rail endpoints. Peers without it,
   or with another version, still get puts and host transfers, but no atomicAdd. A
   ring's first operation towards a peer waits for the engine handshake with it.
 - **Diagnostics:** `NIXL_EFA_PROXY_PROFILE=1` prints per-stage latency histograms, per
   thread busy time and the cost of receiving puts to stderr at shutdown.
   `NIXL_EFA_PROXY_INJECT` (tests only; ignored in `NDEBUG` builds) injects
-  back-pressure, failed posts or completions, or disables GDRCopy.
+  back-pressure, failed posts or completions, disables GDRCopy, or sends control
+  messages from the data EP instead of the control EP (`ctl_on_data=1`).
 
 ## API Reference
 

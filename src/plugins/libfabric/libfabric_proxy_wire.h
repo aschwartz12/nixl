@@ -28,11 +28,12 @@
  *    putImm(): its ring's key and its epoch, the index of the atomicAdd that will
  *    follow it on the ring (mod kEpochs). The target thread that polls the rail it
  *    lands on counts it per (ring, epoch slot).
- *  - An atomicAdd leaves at once as an atomicAddMsg to the counter's owner thread
- *    (counterOwner()), with its index on the ring (seq) and the fragment count its
- *    epoch slot reaches once its own puts are in (expected_puts). The owner applies
- *    it when that count is reached and the ring's previous atomicAdd was applied,
- *    then acks; the sender completes the atomicAdd on the ack.
+ *  - An atomicAdd leaves at once as an atomicAddMsg to its ring's owner thread at
+ *    the target (ringOwner()), with its index on the ring (seq) and the fragment
+ *    count its epoch slot reaches once its own puts are in (expected_puts). The
+ *    owner applies a ring's adds in seq order, each once that count is reached,
+ *    then acks to the sending thread (named by the ring key's sender index and the
+ *    record's sender_thread); the sender completes the atomicAdd on the ack.
  *  - A ring key names one sender ring at one target, deterministically:
  *    ringKey(the sender's index at the target, a ring id). The sender allocates
  *    ring ids per target, one per (runtime ring, target), and a fresh one when a
@@ -46,10 +47,7 @@
 namespace nixlLibfabricProxyWire {
 
 /** Bumped on any layout or protocol change; also published in the connection info. */
-inline constexpr uint16_t kVersion = 4;
-
-/** Room for a libfabric endpoint name (LF_EP_NAME_MAX_LEN, checked by the proxy). */
-inline constexpr uint32_t kMaxEpName = 56;
+inline constexpr uint16_t kVersion = 5;
 
 /** Epoch slots per ring: the put immediate's low bits. */
 inline constexpr uint32_t kEpochBits = 8;
@@ -66,17 +64,18 @@ struct msgHeader {
     uint32_t reserved;
 };
 
-/** Sender -> counter owner. */
+/** Sender -> the ring's owner thread at the target. */
 struct atomicAddMsg {
     msgHeader hdr;
     uint64_t remote_addr;
     uint64_t value;
     uint64_t token; // sender's request, echoed in the ack
     uint32_t ring; // ringKey() of the sender's ring
-    uint32_t reply_name_len;
+    // The sending proxy thread: the ack goes to its control EP, which the target
+    // knows from the sender's connection info (the ring key names the sender).
+    uint32_t sender_thread;
     uint64_t seq; // index of this add among the ring's atomicAdds
     uint64_t expected_puts; // count of slot seq % kEpochs once this add's puts are in
-    uint8_t reply_name[kMaxEpName]; // sender's control endpoint, where the ack goes
 };
 
 /** Counter owner -> sender, after the add was applied or failed. */
@@ -88,10 +87,10 @@ struct atomicAckMsg {
 };
 
 /**
- * Sender -> every proxy thread of the target: the ring failed at the sender, so its
+ * Sender -> the ring's owner thread: the ring failed at the sender, so its
  * atomicAdds from first_seq on will never be satisfiable (or are not wanted). The
- * owners drop them without applying (no ack: the sender already failed them) and
- * forget the ring once nothing of it waits.
+ * owner drops them without applying (no ack: the sender already failed them) and
+ * forgets the ring once nothing of it waits.
  */
 struct ringAbortMsg {
     msgHeader hdr;
@@ -113,6 +112,12 @@ ringKey(uint32_t sender_index, uint32_t ring_id) {
     return (sender_index & kMaxSenderIndex) << 16 | (ring_id & (kRingIds - 1));
 }
 
+/** The sender's index at the target, from a ring key. */
+constexpr uint32_t
+keySender(uint32_t ring_key) {
+    return ring_key >> 16;
+}
+
 constexpr uint32_t
 putImm(uint32_t ring_key, uint64_t epoch) {
     return ring_key << kEpochBits | static_cast<uint32_t>(epoch & (kEpochs - 1));
@@ -128,7 +133,7 @@ immSlot(uint32_t imm) {
     return imm & (kEpochs - 1);
 }
 
-/** Deterministic mixer: every sender must pick the same owner for a counter. */
+/** Deterministic mixer (the target's striped counter locks). */
 constexpr uint64_t
 mix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
@@ -137,10 +142,14 @@ mix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-/** Proxy thread of a target with @p threads proxy threads that applies adds to @p addr. */
+/**
+ * Proxy thread of a target with @p threads proxy threads that applies the adds of
+ * the ring @p ring_key, in order. A sender's ring ids are consecutive, so its rings
+ * go round-robin over the threads, starting at its index.
+ */
 constexpr uint32_t
-counterOwner(uint64_t addr, uint32_t threads) {
-    return static_cast<uint32_t>(mix64(addr >> 3) % threads);
+ringOwner(uint32_t ring_key, uint32_t threads) {
+    return (keySender(ring_key) + (ring_key & (kRingIds - 1))) % threads;
 }
 
 /**

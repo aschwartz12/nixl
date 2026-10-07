@@ -69,6 +69,32 @@ atomicLoopKernel(nixlMemViewH dst,
     *status_out = status;
 }
 
+/** One block per channel: `count` adds of 1 to one shared counter on its own ring. */
+__global__ void
+manyRingsAtomicKernel(nixlMemViewH dst,
+                      size_t counter_offset,
+                      unsigned count,
+                      unsigned long long timeout_ns,
+                      nixl_status_t *status_out) {
+    const unsigned channel = blockIdx.x;
+    nixlGpuXferStatusH last{};
+    nixl_status_t status = NIXL_SUCCESS;
+    for (unsigned i = 0; i < count && status == NIXL_SUCCESS; ++i) {
+        if (nixlAtomicAdd<nixl_gpu_level_t::THREAD>(
+                1, {dst, 0, counter_offset}, channel, 0, i + 1 == count ? &last : nullptr) !=
+            NIXL_IN_PROG) {
+            status = NIXL_ERR_BACKEND;
+        }
+    }
+    const unsigned long long deadline = globalTimeNs() + timeout_ns;
+    if (status == NIXL_SUCCESS) {
+        do {
+            status = nixlGpuGetXferStatus<nixl_gpu_level_t::THREAD>(last);
+        } while (status == NIXL_IN_PROG && globalTimeNs() < deadline);
+    }
+    status_out[channel] = status;
+}
+
 /** Rounds of add(A), add(B) on one ring: B must never run ahead of A. */
 __global__ void
 twoCounterSenderKernel(nixlMemViewH dst,
@@ -191,6 +217,51 @@ protected:
             ASSERT_EQ(agents_.back()->createBackend(backend(), backendParams(), handle),
                       NIXL_SUCCESS);
         }
+    }
+
+    /** Replace agent @p i by a new one under the same name (a restarted process). */
+    void
+    recreateAgent(size_t i) {
+        nixlAgentConfig cfg;
+        cfg.useProgThread = true;
+        cfg.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
+        cfg.pthrDelay = 1000;
+        agents_[i].reset();
+        agents_[i] = std::make_unique<nixlAgent>(name(i), cfg);
+        nixlBackendH *handle = nullptr;
+        ASSERT_EQ(agents_[i]->createBackend(backend(), backendParams(), handle), NIXL_SUCCESS);
+    }
+
+    /**
+     * Every channel (its own ring) adds 1 to the same counter @p count times. The
+     * target applies a ring's adds on the ring's owner thread, so here up to one
+     * thread per ring writes the counter: none of the adds may be lost.
+     */
+    void
+    runManyRingsOneCounter(unsigned count) {
+        const Layout layout{kChannels, 1};
+        Buffers b(layout);
+        setUpBuffers(layout, b);
+        if (HasFatalFailure()) {
+            return;
+        }
+        nixl_status_t *status = nullptr;
+        ASSERT_EQ(cudaMalloc(&status, kChannels * sizeof(*status)), cudaSuccess);
+        manyRingsAtomicKernel<<<kChannels, 1>>>(b.dst_mvh, 0, count, kTimeoutNs, status);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        std::vector<nixl_status_t> host(kChannels, NIXL_IN_PROG);
+        ASSERT_EQ(cudaMemcpy(host.data(), status, kChannels * sizeof(*status),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        uint64_t counter = 0;
+        ASSERT_EQ(cudaMemcpy(&counter, b.dst, sizeof(counter), cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        for (unsigned c = 0; c < kChannels; ++c) {
+            EXPECT_EQ(host[c], NIXL_SUCCESS) << "channel " << c;
+        }
+        EXPECT_EQ(counter, uint64_t(kChannels) * count) << "adds to one counter were lost";
+        cudaFree(status);
+        releaseViews(b);
     }
 
     static std::string
@@ -512,6 +583,14 @@ TEST_P(ProxyFaultTest, FailedCompletionStopsLaterSignals) {
 
 // Without GDRCopy the target adds through CUDA copies; they must not wait for a
 // kernel spinning on the legacy default stream (the counter's own receiver).
+TEST_P(ProxyFaultTest, ManyRingsAddToOneCounterWithoutGdrCopy) {
+    createAgentsInjecting("no_gdrcopy=1");
+    if (IsSkipped() || HasFatalFailure()) {
+        return;
+    }
+    runManyRingsOneCounter(500);
+}
+
 TEST_P(ProxyFaultTest, WithoutGdrCopyKeepsOrder) {
     createAgentsInjecting("no_gdrcopy=1");
     if (IsSkipped() || HasFatalFailure()) {
@@ -581,26 +660,17 @@ TEST_P(ProxyAtomicTest, AddToDeregisteredCounterFails) {
     releaseViews(b);
 }
 
-// Each add completes once applied, so add(A) of a round is visible before
-// add(B) even when A and B belong to different target threads.
-TEST_P(ProxyAtomicTest, CountersOfDifferentOwnersStayOrdered) {
+// The adds of a ring are applied in order, so add(A) of a round is visible before
+// add(B) on another counter.
+TEST_P(ProxyAtomicTest, AddsOfOneRingStayOrdered) {
     constexpr unsigned kRounds = 2000;
     Buffers b(kSmallLayout);
     setUpBuffers(kSmallLayout, b);
     if (HasFatalFailure()) {
         return;
     }
-    const auto dst = reinterpret_cast<uintptr_t>(static_cast<void *>(b.dst));
     const size_t offset_a = 0;
-    size_t offset_b = 0;
-    for (size_t off = kCounterStride; off < kDataOffset; off += kCounterStride) {
-        if (nixlLibfabricProxyWire::counterOwner(dst + off, kProxyThreads) !=
-            nixlLibfabricProxyWire::counterOwner(dst + offset_a, kProxyThreads)) {
-            offset_b = off;
-            break;
-        }
-    }
-    ASSERT_NE(offset_b, 0u) << "no counter with another owner thread";
+    const size_t offset_b = kCounterStride;
 
     nixl_status_t *status = nullptr;
     unsigned long long *out = nullptr;
@@ -639,6 +709,43 @@ TEST_P(ProxyAtomicTest, CountersOfDifferentOwnersStayOrdered) {
     cudaStreamDestroy(tx_stream);
     cudaFree(status);
     cudaFree(out);
+    releaseViews(b);
+}
+
+// Threads of different rings add to one counter (GDRCopy read-modify-writes).
+TEST_P(ProxyAtomicTest, ManyRingsAddToOneCounter) {
+    runManyRingsOneCounter(2000);
+}
+
+// A target that restarts under the same name gets fresh rings: the sender keys its
+// ring counts by the target's incarnation, so it does not continue the old
+// instance's seq numbers (which the new instance would wait for in vain).
+TEST_P(ProxyAtomicTest, TargetRestartStartsRingsOver) {
+    constexpr unsigned kCount = 100;
+    {
+        Buffers b(kSmallLayout);
+        setUpBuffers(kSmallLayout, b);
+        if (HasFatalFailure()) {
+            return;
+        }
+        EXPECT_EQ(runAtomics(b, 0, kCount), NIXL_SUCCESS);
+        EXPECT_EQ(readCounter(b, 0), kCount);
+        releaseViews(b);
+        deregisterBuffer(kSender, b.src);
+        deregisterBuffer(kReceiver, b.dst);
+    }
+    ASSERT_EQ(agents_[kSender]->invalidateRemoteMD(name(kReceiver)), NIXL_SUCCESS);
+    recreateAgent(kReceiver);
+    if (HasFatalFailure()) {
+        return;
+    }
+    Buffers b(kSmallLayout);
+    setUpBuffers(kSmallLayout, b);
+    if (HasFatalFailure()) {
+        return;
+    }
+    EXPECT_EQ(runAtomics(b, 0, kCount), NIXL_SUCCESS) << "the restarted target's ring stalled";
+    EXPECT_EQ(readCounter(b, 0), kCount);
     releaseViews(b);
 }
 

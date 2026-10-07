@@ -114,22 +114,12 @@ constexpr size_t kDataRxSize = 64;
 
 namespace wire = nixlLibfabricProxyWire;
 namespace ci = nixlLibfabricProxyConnInfo;
-static_assert(LF_EP_NAME_MAX_LEN <= wire::kMaxEpName, "endpoint names must fit in a message");
+static_assert(sizeof(wire::atomicAddMsg) == 56, "keep the atomicAdd record small");
 
 uint64_t
 nowNs() {
     return nixlLibfabricProxyProfile::now();
 }
-
-/** Transparent hash, so lookups by string_view allocate nothing. */
-struct NameHash {
-    using is_transparent = void;
-
-    size_t
-    operator()(std::string_view name) const noexcept {
-        return std::hash<std::string_view>{}(name);
-    }
-};
 
 } // namespace
 
@@ -355,6 +345,10 @@ struct nixlLibfabricProxy::Thread {
     struct fi_info *ctl_info = nullptr;
     uint64_t ctl_cq_reads = 0; // profiling only
     std::string home_name; // the control EP's name
+    // Where control messages leave from: the control EP (NIXL_EFA_PROXY_INJECT
+    // ctl_on_data=1: the data EP of the home rail, behind this thread's puts there).
+    struct fid_ep *ctl_send_ep = nullptr;
+    struct fid_av *ctl_send_av = nullptr;
 
     std::vector<Request> reqs;
     std::vector<Request *> free_reqs;
@@ -370,8 +364,9 @@ struct nixlLibfabricProxy::Thread {
     struct fid_mr *ctl_mr = nullptr;
     void *ctl_desc = nullptr;
     std::deque<PendingCtl> pending_ctls; // in order
-    // Senders' control endpoints, by name, in ctl_av (where acks go).
-    std::unordered_map<std::string, fi_addr_t, NameHash, std::equal_to<>> reply_addrs;
+    // Senders' control endpoints (where acks go), by sender index << 8 | thread.
+    // Indexes are never reused (a reconnected agent gets a new one).
+    std::unordered_map<uint32_t, fi_addr_t> reply_addrs;
     // atomicAdds whose ack is outstanding (entries go stale once acked; pruned on scans).
     std::vector<Request *> awaiting;
     uint32_t ack_scan = 0;
@@ -442,12 +437,27 @@ struct nixlLibfabricProxy::CounterMap {
         size_t off = 0;
     };
 
+    // Most BAR1 space premap() takes per process (an H100 has 128 GiB; smaller
+    // apertures stay available to other GDRCopy users). Beyond it: first-add mapping.
+    static constexpr size_t kPremapLimit = 4ull << 30;
+
+    /** A whole registration's pages, pinned and mapped at registration. */
+    struct Premapped {
+        uintptr_t start; // first and end GPU page inside the registration
+        uintptr_t end;
+        Mapping m;
+    };
+
     gdr_t gdr = nullptr;
     // GDRCopy's handle is not thread-safe: pin, map, info, unmap and unpin take
     // gdr_mutex (the copies through a mapping do not need it).
     std::mutex gdr_mutex;
-    std::mutex mutex; // pages and unmappable; never held across a GDRCopy call
-    std::unordered_map<uintptr_t, Mapping> pages;
+    // pages, premapped and unmappable; never held across a GDRCopy call
+    std::mutex mutex;
+    std::unordered_map<uintptr_t, Mapping> pages; // mapped on a first add
+    // By registration (start, length): mapped when the memory was registered.
+    std::map<std::pair<uintptr_t, size_t>, Premapped> premapped;
+    size_t premapped_bytes = 0; // under mutex
     std::unordered_set<uintptr_t> unmappable; // pages GDRCopy refused; logged once
 
     explicit CounterMap(bool use_gdrcopy) {
@@ -466,6 +476,11 @@ struct nixlLibfabricProxy::CounterMap {
             unmap(kv.second);
         }
         pages.clear();
+        for (auto &kv : premapped) {
+            gdr_unmap(gdr, kv.second.m.mh, kv.second.m.bar, kv.second.end - kv.second.start);
+            gdr_unpin_buffer(gdr, kv.second.m.mh);
+        }
+        premapped.clear();
         if (gdr) {
             gdr_close(gdr);
         }
@@ -476,6 +491,84 @@ struct nixlLibfabricProxy::CounterMap {
         return gdr != nullptr;
     }
 
+    /**
+     * Pin and map a VRAM registration's whole GPU pages at once (~1 ms for 256 MiB;
+     * BAR1 holds all of an H100's memory), so a first add to a counter there does not
+     * pin and map its page on the proxy thread. Best effort: on failure, its pages
+     * are mapped on their first add as before.
+     */
+    void
+    premap(uintptr_t base, size_t len) {
+        const uintptr_t start = (base + kPage - 1) & ~(kPage - 1);
+        const uintptr_t end = (base + len) & ~(kPage - 1);
+        if (end <= start) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (premapped_bytes + (end - start) > kPremapLimit) {
+                return; // mapped page by page on first add
+            }
+            premapped_bytes += end - start; // reserved; returned if mapping fails
+        }
+        const auto unreserve = [&] {
+            std::lock_guard<std::mutex> lock(mutex);
+            premapped_bytes -= end - start;
+        };
+        Premapped p{start, end, {}};
+        {
+            std::lock_guard<std::mutex> lock(gdr_mutex);
+            if (gdr_pin_buffer(gdr, start, end - start, 0, 0, &p.m.mh) != 0) {
+                NIXL_INFO << "EFA proxy: GDRCopy cannot pin " << ((end - start) >> 20)
+                          << " MiB at registration; counters there are mapped on first add";
+                unreserve();
+                return;
+            }
+            if (gdr_map(gdr, p.m.mh, &p.m.bar, end - start) != 0) {
+                gdr_unpin_buffer(gdr, p.m.mh);
+                NIXL_INFO << "EFA proxy: GDRCopy cannot map " << ((end - start) >> 20)
+                          << " MiB at registration; counters there are mapped on first add";
+                unreserve();
+                return;
+            }
+            gdr_info_t info{};
+            gdr_get_info(gdr, p.m.mh, &info);
+            p.m.off = static_cast<size_t>(info.va - start);
+        }
+        bool duplicate = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            duplicate = !premapped.emplace(std::make_pair(base, len), p).second;
+            if (duplicate) {
+                premapped_bytes -= end - start;
+            }
+        }
+        if (duplicate) { // registered twice: keep one mapping
+            std::lock_guard<std::mutex> lock(gdr_mutex);
+            gdr_unmap(gdr, p.m.mh, p.m.bar, end - start);
+            gdr_unpin_buffer(gdr, p.m.mh);
+        }
+    }
+
+    /** Undo premap() of the registration (base, len). */
+    void
+    unpremap(uintptr_t base, size_t len) {
+        Premapped p{};
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = premapped.find(std::make_pair(base, len));
+            if (it == premapped.end()) {
+                return;
+            }
+            p = it->second;
+            premapped.erase(it);
+            premapped_bytes -= p.end - p.start;
+        }
+        std::lock_guard<std::mutex> lock(gdr_mutex);
+        gdr_unmap(gdr, p.m.mh, p.m.bar, p.end - p.start);
+        gdr_unpin_buffer(gdr, p.m.mh);
+    }
+
     /** NIXL_ERR_NOT_SUPPORTED if GDRCopy cannot map the page (the caller falls back). */
     nixl_status_t
     add(uintptr_t addr, uint64_t value) {
@@ -484,7 +577,15 @@ struct nixlLibfabricProxy::CounterMap {
         bool found = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            auto it = pages.find(page);
+            for (const auto &[key, p] : premapped) { // a few registrations
+                if (page >= p.start && page < p.end) {
+                    m = p.m;
+                    m.off += page - p.start; // the page's place in the mapping
+                    found = true;
+                    break;
+                }
+            }
+            auto it = found ? pages.end() : pages.find(page);
             if (it != pages.end()) {
                 m = it->second;
                 found = true;
@@ -590,6 +691,12 @@ private:
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
+    void
+    premap(uintptr_t, size_t) {}
+
+    void
+    unpremap(uintptr_t, size_t) {}
+
     template<typename Keep>
     void
     dropRange(uintptr_t, size_t, Keep &&) {}
@@ -603,7 +710,10 @@ private:
  *                     libfabric (back-pressure and the retry queues);
  *  - post_error_at=N: the N-th put request fails to post;
  *  - cq_error_at=N:   the N-th put request completes with an error;
- *  - no_gdrcopy=1:    apply VRAM atomicAdds with CUDA copies instead of GDRCopy.
+ *  - no_gdrcopy=1:    apply VRAM atomicAdds with CUDA copies instead of GDRCopy;
+ *  - ctl_on_data=1:   send control messages (atomicAdd records, acks, aborts) from
+ *                     the data EP of the home rail, behind the thread's puts there,
+ *                     instead of from the control EP (measures what the latter buys).
  * Put requests are counted from 1 over all proxy threads of this backend.
  */
 struct nixlLibfabricProxy::Inject {
@@ -611,6 +721,7 @@ struct nixlLibfabricProxy::Inject {
     uint64_t post_error_at = 0;
     uint64_t cq_error_at = 0;
     bool no_gdrcopy = false;
+    bool ctl_on_data = false;
     std::atomic<uint64_t> attempts{0};
     std::atomic<uint64_t> puts{0};
 
@@ -645,13 +756,16 @@ struct nixlLibfabricProxy::Inject {
                 inject->cq_error_at = value;
             } else if (key == "no_gdrcopy") {
                 inject->no_gdrcopy = value != 0;
+            } else if (key == "ctl_on_data") {
+                inject->ctl_on_data = value != 0;
             } else {
                 NIXL_WARN << "EFA proxy: unknown NIXL_EFA_PROXY_INJECT item '" << item << "'";
             }
         }
         NIXL_WARN << "EFA proxy: fault injection enabled: eagain_every=" << inject->eagain_every
                   << " post_error_at=" << inject->post_error_at
-                  << " cq_error_at=" << inject->cq_error_at << " no_gdrcopy=" << inject->no_gdrcopy;
+                  << " cq_error_at=" << inject->cq_error_at << " no_gdrcopy=" << inject->no_gdrcopy
+                  << " ctl_on_data=" << inject->ctl_on_data;
         return inject;
 #endif
     }
@@ -895,6 +1009,16 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
                            << fi_strerror(-ret);
                 releaseThread(*th);
                 return NIXL_ERR_BACKEND;
+            }
+            th->ctl_send_ep = th->ctl_ep;
+            th->ctl_send_av = th->ctl_av;
+            if (inject_ && inject_->ctl_on_data) {
+                th->ctl_send_ep = home.ep;
+                th->ctl_send_av = home.av;
+                if (!th->polled[th->home]) { // their send completions arrive there
+                    th->polled[th->home] = true;
+                    th->poll_rails.push_back(th->home);
+                }
             }
         }
 
@@ -1566,9 +1690,9 @@ nixlLibfabricProxy::submitAtomic(Thread &th,
         return NIXL_SUCCESS;
     }
 
-    // All senders must agree on one owner thread per counter at the target.
-    const uint32_t owner = wire::counterOwner(
-        sub.remote.desc.addr, static_cast<uint32_t>(conn.remote_proxy_ep_names_.size()));
+    // The ring's owner at the target applies all its adds, in order.
+    const uint32_t owner =
+        wire::ringOwner(tx->key, static_cast<uint32_t>(conn.remote_proxy_ep_names_.size()));
     req->dest = homeAddr(th, *peer, conn, owner);
     if (req->dest == FI_ADDR_UNSPEC) {
         return NIXL_ERR_BACKEND;
@@ -1581,8 +1705,7 @@ nixlLibfabricProxy::submitAtomic(Thread &th,
     req->msg.ring = tx->key;
     req->msg.seq = tx->atomics++;
     req->msg.expected_puts = tx->slot_puts[req->msg.seq % wire::kEpochs];
-    req->msg.reply_name_len = static_cast<uint32_t>(th.home_name.size());
-    std::memcpy(req->msg.reply_name, th.home_name.data(), th.home_name.size());
+    req->msg.sender_thread = th.id;
     NIXL_DEBUG << "EFA proxy: atomicAdd " << sub.value << " to " << std::hex << sub.remote.desc.addr
                << " ring " << tx->key << std::dec << " seq " << req->msg.seq << " expecting "
                << req->msg.expected_puts << " -> " << conn.remoteAgent_ << " thread " << owner;
@@ -1642,21 +1765,20 @@ nixlLibfabricProxy::failRing(Thread &th, Request *req, nixl_status_t status) {
             completeFragment(th, other, status);
         }
     }
-    // Tell the target's threads to drop them too (if any was sent).
+    // Tell the ring's owner at the target to drop them too (if any was sent).
     if (first >= tx->atomics) {
         return;
     }
     auto conn = tx->conn.lock();
-    if (!conn) {
+    if (!conn || conn->remote_proxy_ep_names_.empty()) {
         return;
     }
     PeerAddrs *peer = peerAddrs(th, conn);
-    for (size_t t = 0; peer != nullptr && t < conn->remote_proxy_ep_names_.size(); ++t) {
-        const fi_addr_t dest = homeAddr(th, *peer, *conn, t);
-        if (dest != FI_ADDR_UNSPEC) {
-            sendCtl(th,
-                    PendingCtl{dest, wire::msgType::RING_ABORT, 0, NIXL_SUCCESS, tx->key, first});
-        }
+    const uint32_t owner =
+        wire::ringOwner(tx->key, static_cast<uint32_t>(conn->remote_proxy_ep_names_.size()));
+    const fi_addr_t dest = peer != nullptr ? homeAddr(th, *peer, *conn, owner) : FI_ADDR_UNSPEC;
+    if (dest != FI_ADDR_UNSPEC) {
+        sendCtl(th, PendingCtl{dest, wire::msgType::RING_ABORT, 0, NIXL_SUCCESS, tx->key, first});
     }
 }
 
@@ -1718,7 +1840,7 @@ nixlLibfabricProxy::tryPost(Thread &th, const PendingPost &pp) {
     msg.iov_count = 1;
     msg.addr = pp.dest;
     msg.context = &pp.fctx->op.ctx;
-    return fi_sendmsg(th.ctl_ep, &msg, FI_COMPLETION);
+    return fi_sendmsg(th.ctl_send_ep, &msg, FI_COMPLETION);
 }
 
 ssize_t
@@ -2208,21 +2330,43 @@ nixlLibfabricProxy::handleAbort(Thread &th, const wire::ringAbortMsg &abort) {
 
 fi_addr_t
 nixlLibfabricProxy::replyAddr(Thread &th, const wire::atomicAddMsg &msg) {
-    if (msg.reply_name_len == 0 || msg.reply_name_len > wire::kMaxEpName) {
-        NIXL_ERROR << "EFA proxy: atomicAdd without a valid reply address";
+    const uint32_t index = wire::keySender(msg.ring);
+    if (msg.sender_thread > 0xff) {
+        NIXL_ERROR << "EFA proxy: atomicAdd from sender thread " << msg.sender_thread;
         return FI_ADDR_UNSPEC;
     }
-    const std::string_view name(reinterpret_cast<const char *>(msg.reply_name), msg.reply_name_len);
-    if (auto it = th.reply_addrs.find(name); it != th.reply_addrs.end()) {
+    const uint32_t route = index << 8 | msg.sender_thread;
+    if (auto it = th.reply_addrs.find(route); it != th.reply_addrs.end()) {
         return it->second;
     }
-    const ci::EpName padded = ci::paddedName(std::string(name));
-    fi_addr_t addr = FI_ADDR_UNSPEC;
-    if (fi_av_insert(th.ctl_av, padded.data(), 1, &addr, 0, nullptr) != 1) {
-        NIXL_ERROR << "EFA proxy: fi_av_insert failed for an atomicAdd sender";
+    // The sender's control EP from its connection info. The sender learned its index
+    // here from our handshake, which we send only once we have its connection info.
+    ci::EpName name{};
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(engine_.connection_state_mutex_);
+        if (index < engine_.agent_names_.size()) {
+            auto it = engine_.connections_.find(engine_.agent_names_[index]);
+            // A name connected again has a new index: never ack the old one's adds there.
+            if (it != engine_.connections_.end() && it->second &&
+                it->second->agent_index_ == index &&
+                msg.sender_thread < it->second->remote_proxy_ep_names_.size()) {
+                name = it->second->remote_proxy_ep_names_[msg.sender_thread];
+                found = true;
+            }
+        }
+    }
+    if (!found) {
+        NIXL_ERROR << "EFA proxy: atomicAdd from unknown sender " << index << " thread "
+                   << msg.sender_thread << "; the sender fails it when its ack times out";
         return FI_ADDR_UNSPEC;
     }
-    th.reply_addrs.emplace(std::string(name), addr);
+    fi_addr_t addr = FI_ADDR_UNSPEC;
+    if (fi_av_insert(th.ctl_send_av, name.data(), 1, &addr, 0, nullptr) != 1) {
+        NIXL_ERROR << "EFA proxy: fi_av_insert failed for atomicAdd sender " << index;
+        return FI_ADDR_UNSPEC;
+    }
+    th.reply_addrs.emplace(route, addr);
     return addr;
 }
 
@@ -2261,7 +2405,7 @@ nixlLibfabricProxy::postCtl(Thread &th, const PendingCtl &ctl) {
     msg.iov_count = 1;
     msg.addr = ctl.dest;
     msg.context = &buf->op.ctx;
-    const ssize_t rc = fi_sendmsg(th.ctl_ep, &msg, FI_COMPLETION);
+    const ssize_t rc = fi_sendmsg(th.ctl_send_ep, &msg, FI_COMPLETION);
     if (rc == -FI_EAGAIN) {
         return false;
     }
@@ -2311,12 +2455,11 @@ nixlLibfabricProxy::handleImm(Thread &th, uint32_t imm) {
 void
 nixlLibfabricProxy::drainDeferred(Thread &th) {
     using Adds = std::map<uint64_t, RxOwned::Add>;
-    // Rounds: for every ring, take the run of consecutive atomicAdds this thread
-    // owns from the ring's next one (seq == applied) whose epoch slots counted their
-    // puts; flush once for all of them where needed (a flush covers only the puts
-    // counted before it); apply them in ring order. An add of the ring owned by
-    // another thread ends the run; once that thread applied it, a later round (or
-    // pass) continues.
+    // Rounds: for every ring this thread owns, take the run of consecutive
+    // atomicAdds from the ring's next one (seq == applied) whose epoch slots counted
+    // their puts; flush once for all of them where needed (a flush covers only the
+    // puts counted before it); apply them in ring order. (Every add of a ring comes
+    // to its owner, ringOwner(); a gap in the run is an add still on its way.)
     std::vector<std::pair<RxOwned *, Adds::iterator>> ready;
     const uint64_t deadline = nowNs() + kDrainBudgetNs;
     bool over_budget = false;
@@ -2496,13 +2639,15 @@ nixlLibfabricProxy::applyAtomic(Thread &th, uint64_t addr, uint64_t value) {
     NIXL_DEBUG << "EFA proxy: applying atomicAdd " << value << " at " << std::hex << addr
                << std::dec << (region->is_vram ? " (VRAM)" : " (DRAM)");
     if (!region->is_vram) {
-        // Every add to this counter arrives on this thread: a plain RMW is safe
-        // against other proxy threads; the atomic also covers concurrent CPU users.
+        // Atomic: other proxy threads (other rings) and CPU users may add too.
         __atomic_fetch_add(reinterpret_cast<uint64_t *>(addr), value, __ATOMIC_SEQ_CST);
         return NIXL_SUCCESS;
     }
     // A read-modify-write through the BAR or a copy, not an atomic: the GPU must
-    // not write the counter while remote adds to it can arrive.
+    // not write the counter while remote adds to it can arrive. Rings pick the
+    // owner thread, so several threads may add to one counter: hold its stripe.
+    std::lock_guard<std::mutex> counter_lock(
+        counter_locks_[wire::mix64(addr >> 3) % counter_locks_.size()]);
     if (counters_->usable()) {
         const nixl_status_t status = counters_->add(addr, value);
         if (status != NIXL_ERR_NOT_SUPPORTED) {
@@ -2573,6 +2718,9 @@ nixlLibfabricProxy::onRegister(uintptr_t addr, size_t len, bool is_vram, int dev
         std::find(vram_devices_.begin(), vram_devices_.end(), device_id) == vram_devices_.end()) {
         vram_devices_.push_back(device_id);
     }
+    if (is_vram && counters_->usable()) {
+        counters_->premap(addr, len); // any word of it may be a counter
+    }
 }
 
 void
@@ -2593,7 +2741,9 @@ nixlLibfabricProxy::onDeregister(uintptr_t addr, size_t len) {
         victim = first;
         len = std::max(len, first->second.len);
     }
+    const size_t victim_len = victim->second.len;
     regions_.erase(victim);
+    counters_->unpremap(addr, victim_len);
     // Keep the counter pages another registration still covers.
     counters_->dropRange(
         addr, len, [this](uintptr_t page, size_t size) { return regionOverlaps(page, size); });
@@ -2668,8 +2818,8 @@ nixlLibfabricProxy::homeAddr(Thread &th,
                              size_t thread) {
     fi_addr_t &addr = pa.home[thread];
     if (addr == FI_ADDR_UNSPEC &&
-        fi_av_insert(th.ctl_av, conn.remote_proxy_ep_names_[thread].data(), 1, &addr, 0, nullptr) !=
-            1) {
+        fi_av_insert(
+            th.ctl_send_av, conn.remote_proxy_ep_names_[thread].data(), 1, &addr, 0, nullptr) != 1) {
         addr = FI_ADDR_UNSPEC;
         NIXL_ERROR << "EFA proxy: fi_av_insert failed for " << conn.remoteAgent_ << " proxy thread "
                    << thread;
@@ -2756,7 +2906,7 @@ nixlLibfabricProxy::dropPeer(Thread &th, PeerAddrs &pa) {
             }
         }
         if (!used) {
-            fi_av_remove(th.ctl_av, &addr, 1, 0);
+            fi_av_remove(th.ctl_send_av, &addr, 1, 0);
         }
     }
 }

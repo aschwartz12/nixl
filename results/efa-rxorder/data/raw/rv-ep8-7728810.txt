@@ -1,0 +1,5 @@
+job=7728810 nodes=pool0-[0308,0964] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_8.json
+# base = before (0c253377), new = after, newctl = after with NIXL_EFA_PROXY_INJECT=ctl_on_data=1
+rv-ep8-7728810.log === mode=base params=: per-run means ['13.68', '13.74', '13.72'] median 13.72 GB/s; runs without a result: 0
+rv-ep8-7728810.log === mode=new params=: per-run means ['13.33', '13.85', '13.68'] median 13.68 GB/s; runs without a result: 0
+rv-ep8-7728810.log === mode=newctl params=: per-run means ['13.77', '13.70', '13.67'] median 13.70 GB/s; runs without a result: 0

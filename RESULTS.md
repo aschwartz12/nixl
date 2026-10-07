@@ -414,3 +414,22 @@ above):
 - Hang diagnosis: build with `scripts/hsdiag.patch` (agent-tagged handshake logs and a
   stack dump on signal 44), run `EP_MODES=new` at 16 ranks, and
   `scripts/hang-dump-watch.sh <job id>` alongside.
+
+## Review points 2-8 (protocol version 5)
+
+A colleague's review of the receiver-only proxy, checked point by point against the
+code and with tests (job ids in `results/efa-rxorder/data/raw/rv-*`, `gdrbench.txt`).
+"Before" is 0c253377, "after" this commit.
+
+| # | Point | Checked how | Result | Change |
+|---|---|---|---|---|
+| 2 | The control EP is unnecessary; control messages waiting behind puts is no problem | Test-only `NIXL_EFA_PROXY_INJECT=ctl_on_data=1` sends records, acks and aborts from the data EP of the home rail, behind the thread's puts there; nixl_ep, same allocation | 8 ranks: 13.68 (control EP) vs 13.70 GB/s (data EP); 16 ranks: 6.24 vs 6.25 (noisy allocation). No measurable cost | None. Kept: data EPs post no receive buffers (writes are unsolicited), and with more threads than receive rails some threads have no data EP to publish |
+| 3 | Let the ring pick the thread that applies its adds, with striped counter locks | New `ManyRingsAddToOneCounter` (4 rings, 4 owner threads, one counter; GDRCopy and CUDA-copy paths); negative control without the locks | Passes; without the locks 3,134 and 3,623 of 8,000 adds (GDRCopy) and 671 and 699 of 2,000 (CUDA) survive. Micro unchanged (55.9k vs 54.4k signals/s); nixl_ep 8 ranks 13.68 vs 13.72 GB/s, 16 ranks 11.21 vs 11.27 GB/s (5 runs each, ranges overlap; job 7729119) | Owner = `(sender index + ring id) % threads`; a VRAM counter's update holds one of 64 lock stripes; a ring abort goes to the owner only |
+| 4 | Map counters with GDRCopy in advance | `gdrbench.cu` on a p5 node; profiled ordering check | Per-page pin+map 62 us (first 424 us); whole 238 MiB buffer 844 us; BAR1 128 GiB. Worst atomic apply 344-432 us before, 12-16 us after (mean 3.25 us both) | Each VRAM registration is pinned and mapped at registration (up to 4 GiB of BAR1 per process; beyond that, or on failure: per page on first add) |
+| 5 | Is the wire version needed? | Layouts v4 vs v5 | Yes: a v4 peer's record would be misread (its `reply_name_len` read as `sender_thread`, no ack possible) and it would pick another owner thread; the connection-info check makes them refuse atomics cleanly. The per-message check is redundant once that passed, and costs one compare | None (version 4 -> 5 for this change) |
+| 6 | Drop `reply_name`: the target knows the sender's control EPs | All atomic tests (every add is acked) and the restart test | Works: the ring key holds the sender's index, the record its thread; agent indexes are never reused, so an index whose connection was replaced gets no ack | atomicAddMsg 112 -> 56 B (`sender_thread` replaces the 56-byte name) |
+| 7 | Drop `token`: ring + seq identify the add | Layouts | Possible: the ack stays 24 B ({ring, status, seq}), the record saves 8 B; but the sender would need a ring-key lookup and a 256-entry request table per ring instead of the token's direct index + generation check | None |
+| 8 | The target incarnation in the sender's ring key is unnecessary | New `TargetRestartStartsRingsOver` (target destroyed and re-created under its name); negative control with the incarnation ignored | Passes; with the incarnation ignored the sender continues the old instance's seq numbers, the new target waits for seq 0, the add fails after 10 s without progress and the counter stays 0 of 100. Keying by connection pointer instead would break when a new connection reuses the address | None |
+
+Tests on this commit: unit 162/162, device gtests 22/22 (3 new), atomic and fault
+gtests 3 x 10 (job 7729117).

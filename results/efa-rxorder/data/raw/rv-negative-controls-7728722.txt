@@ -1,0 +1,48 @@
+# negative controls (not committed): the review build minus the counter lock / with the target incarnation ignored, job 7728722
+== no counter lock
+../src-negctl-lock/test/gtest/device_api/proxy_ordering_test.cu:262: Failure
+Expected equality of these values:
+    Which is: 671
+    Which is: 2000
+adds to one counter were lost
+[  FAILED  ] libfabricProxy/ProxyFaultTest.ManyRingsAddToOneCounterWithoutGdrCopy/LIBFABRIC, where GetParam() = "LIBFABRIC" (5849 ms)
+../src-negctl-lock/test/gtest/device_api/proxy_ordering_test.cu:262: Failure
+Expected equality of these values:
+    Which is: 3623
+    Which is: 8000
+adds to one counter were lost
+[  FAILED  ] libfabricProxy/ProxyAtomicTest.ManyRingsAddToOneCounter/LIBFABRIC, where GetParam() = "LIBFABRIC" (4841 ms)
+[  FAILED  ] 2 tests, listed below:
+[  FAILED  ] libfabricProxy/ProxyFaultTest.ManyRingsAddToOneCounterWithoutGdrCopy/LIBFABRIC, where GetParam() = "LIBFABRIC"
+[  FAILED  ] libfabricProxy/ProxyAtomicTest.ManyRingsAddToOneCounter/LIBFABRIC, where GetParam() = "LIBFABRIC"
+ 2 FAILED TESTS
+../src-negctl-lock/test/gtest/device_api/proxy_ordering_test.cu:262: Failure
+Expected equality of these values:
+    Which is: 699
+    Which is: 2000
+adds to one counter were lost
+[  FAILED  ] libfabricProxy/ProxyFaultTest.ManyRingsAddToOneCounterWithoutGdrCopy/LIBFABRIC, where GetParam() = "LIBFABRIC" (4477 ms)
+../src-negctl-lock/test/gtest/device_api/proxy_ordering_test.cu:262: Failure
+Expected equality of these values:
+    Which is: 3134
+    Which is: 8000
+adds to one counter were lost
+[  FAILED  ] libfabricProxy/ProxyAtomicTest.ManyRingsAddToOneCounter/LIBFABRIC, where GetParam() = "LIBFABRIC" (4282 ms)
+[  FAILED  ] 2 tests, listed below:
+[  FAILED  ] libfabricProxy/ProxyFaultTest.ManyRingsAddToOneCounterWithoutGdrCopy/LIBFABRIC, where GetParam() = "LIBFABRIC"
+== incarnation ignored
+E1007 07:26:00.993967 3042137 libfabric_proxy.cpp:1956] EFA proxy: no ack for an atomicAdd to 0x155335e98a00 and no progress on its ring for 10 s; failing it
+ATTENTION: Message is 'EFA proxy: no ack for an atomicAdd to 0x155335e98a00 and no progress on its ring for 10 s; failing it'
+../src-negctl-inc/test/gtest/device_api/proxy_ordering_test.cu:747: Failure
+Expected equality of these values:
+    Which is: -10
+    Which is: 0
+the restarted target's ring stalled
+../src-negctl-inc/test/gtest/device_api/proxy_ordering_test.cu:748: Failure
+Expected equality of these values:
+    Which is: 0
+    Which is: 100
+[  FAILED  ] libfabricProxy/ProxyAtomicTest.TargetRestartStartsRingsOver/LIBFABRIC, where GetParam() = "LIBFABRIC" (17897 ms)
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] libfabricProxy/ProxyAtomicTest.TargetRestartStartsRingsOver/LIBFABRIC, where GetParam() = "LIBFABRIC"
+ 1 FAILED TEST

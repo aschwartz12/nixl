@@ -1,0 +1,8 @@
+per-page pin+map: first 423.9 us, mean 61.6 us, max 423.9 us (256 pages)
+8-byte RMW through the BAR: 2.82 us
+whole-buffer pin+map of 16 MiB: ok 148.7 us
+whole-buffer pin+map of 238 MiB: ok 843.7 us
+    BAR1 Memory Usage
+        Total                             : 131072 MiB
+        Used                              : 1 MiB
+        Free                              : 131071 MiB

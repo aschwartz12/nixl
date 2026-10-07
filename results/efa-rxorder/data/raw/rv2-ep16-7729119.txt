@@ -1,0 +1,4 @@
+job=7729119 nodes=pool0-[0017,0035,0665,0834] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_16.json
+# base = before (0c253377), new = after (this commit)
+rv2-ep16-7729119.log === mode=base params=: per-run means ['11.27', '11.21', '11.21', '11.42', '11.30'] median 11.27 GB/s; runs without a result: 0
+rv2-ep16-7729119.log === mode=new params=: per-run means ['11.27', '11.21', '10.99', '11.27', '11.18'] median 11.21 GB/s; runs without a result: 0

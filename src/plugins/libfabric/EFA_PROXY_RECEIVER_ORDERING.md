@@ -45,9 +45,12 @@ proxy thread t (t = 0..T-1)
   `railThread(i, T) = i % T`: only that thread polls its data CQ there, and the
   connection info publishes that thread's data EP for the rail.
 - **Home rail** of thread t: `rx_rails[t % R]`; its control EP lives there.
-- **Counter owner:** the target thread that applies adds to a counter address is
-  `counterOwner(addr, T) = mix64(addr >> 3) % T`. Every sender picks the same one,
-  so the GDRCopy read-modify-write of a counter has one writer.
+- **Ring owner:** the target thread that applies a ring's adds, in order, is
+  `ringOwner(key, T) = (sender index + ring id) % T` (a sender's ring ids are
+  consecutive, so its rings go round-robin over the threads). Rings of different
+  senders or channels may add to the same counter from different threads: a VRAM
+  counter's read-modify-write holds one of 64 lock stripes (by counter address);
+  host-memory counters use a CPU atomic.
 - **Channel owner:** channel `c` runs on thread `c % T` (the runtime's striping,
   checked: a thread state used by a second worker is fatal).
 - **Receive CQs:** the data CQs of receive rails hold 32768 entries, the device
@@ -99,15 +102,16 @@ remote key   = the remote buffer's key on the remote rail
    put, >= 128 KiB (fragment f = 0..n-1, n <= 4)
      from: s's data EP on lrails[f] ──fi_writemsg + imm──> reps[f] = rx_rails'[i_f]
                                                            -> thread i_f % T' (one per fragment)
-   atomicAdd(counter A)
-     from: s's control EP (home rail) ──fi_sendmsg──────> control EP of thread o = counterOwner(A, T')
+   atomicAdd(counter A) on ring key K
+     from: s's control EP (home rail) ──fi_sendmsg──────> control EP of thread o = ringOwner(K, T')
                                                            o waits, applies, then acks:
-     s's control CQ <──────────────── atomicAckMsg ────── from o's control EP
+     s's control CQ <──────────────── atomicAckMsg ────── from o's control EP (s's EP: from
+                                                           the sender's connection info)
 ```
 
 With equal thread counts and the GPU's buffers on the GPU's rails (the usual case),
 a small put of channel `c` is sent by thread `c % T` on rail index `c % T` and counted
-by target thread `c % T`; its signal goes to whichever thread owns the counter.
+by target thread `c % T`; its signal goes to the thread that owns the ring.
 
 ### Receiver side: which thread does what
 
@@ -115,8 +119,8 @@ by target thread `c % T`; its signal goes to whichever thread owns the counter.
 |---|---|
 | poll the data CQ of receive rail `i`, count put immediates | `railThread(i, T) = i % T` |
 | receive atomicAdd records, ring aborts and acks | each thread, on its own control EP |
-| wait for a ring's slot count, flush, apply the add to counter `A`, ack | `counterOwner(A, T)` |
-| drop a ring's waiting adds on a ring abort | every thread (each drops its own) |
+| wait for a ring's slot count, flush, apply its adds in order, ack | `ringOwner(key, T)` |
+| drop a ring's waiting adds on a ring abort | the ring's owner |
 | progress the engine's rails when the engine has no progress thread | thread 0 |
 
 ## 3. Encoding
@@ -144,18 +148,22 @@ by target thread `c % T`; its signal goes to whichever thread owns the counter.
 
 | Message | Direction | Fields |
 |---|---|---|
-| `atomicAddMsg` (112 B) | sender -> counter owner | header, remote_addr, value, token, ring key, reply_name_len, **seq**, **expected_puts**, reply_name (sender's control EP) |
+| `atomicAddMsg` (56 B) | sender -> ring owner | header, remote_addr, value, token, ring key, sender_thread, **seq**, **expected_puts** |
 | `atomicAckMsg` (24 B) | owner -> sender | header, token, status |
-| `ringAbortMsg` (24 B) | sender -> every target thread | header, ring key, first_seq |
+| `ringAbortMsg` (24 B) | sender -> ring owner | header, ring key, first_seq |
 
-`header = {version = 4, type, reserved}`. `seq` is the add's index on its ring;
+`header = {version = 5, type, reserved}`. `seq` is the add's index on its ring;
 `expected_puts` is the total count of slot `seq % 256` once this add's puts are in
-(the slot's counts accumulate over its uses `seq - 256, seq - 512, ...`).
+(the slot's counts accumulate over its uses `seq - 256, seq - 512, ...`). The ack goes
+to the control EP of `sender_thread` in the sender's connection info, found by the
+sender's index in the ring key (indexes are never reused: a reconnected agent gets a
+new one, and acks to an index whose connection was replaced are dropped). `token` is
+the sender's request (slot index and generation), so an ack finds it directly.
 
 ### 3.3 Connection info (proxy section, appended to the engine's)
 
 ```
-efa_proxy_version      = 4
+efa_proxy_version      = 5
 efa_proxy_threads      = T
 efa_proxy_ep_<t>       = control EP name of thread t           (t < T)
 efa_proxy_data_rails   = R
@@ -201,7 +209,7 @@ sequenceDiagram
     participant S as Sender proxy thread (owns the channel)
     participant N as EFA
     participant R as Target thread (owns the receive rail)
-    participant O as Target thread (owns the counter)
+    participant O as Target thread (owns the ring)
     participant TG as Target GPU
 
     G->>S: put(dst, n bytes) on ring (c, p)
@@ -214,7 +222,7 @@ sequenceDiagram
     R->>R: received[key][e % 256] += 1 (release)
     N-->>O: atomicAddMsg
     O->>O: wait: applied[key] == seq and received[key][seq % 256] >= expected (acquire)
-    O->>TG: GDRCopy read-modify-write of the counter (after a flush where needed)
+    O->>TG: GDRCopy read-modify-write of the counter under its lock stripe (after a flush where needed)
     O->>O: applied[key] = seq + 1 (release)
     O->>N: atomicAckMsg(token, status)
     N-->>S: write completion (put done) and ack (atomicAdd done)
@@ -237,8 +245,8 @@ different rails and be counted by different target threads.
    and a ring holds at most `proxy_ring_depth` (<= 256, checked at init) requests, so
    the puts of epoch `s + 256` cannot be issued before add `s` completed, i.e. was
    applied: they never mix with epoch `s`'s count.
-3. Adds of a ring are applied in `seq` order (`applied` counter, release/acquire),
-   even when their counters belong to different owner threads.
+3. Adds of a ring are applied in `seq` order by the ring's owner thread (`applied`
+   counter, release/acquire towards the counting threads).
 4. A fragment is counted only after its remote-CQ-data completion, which EFA
    generates after the write is placed. Making those writes visible to the GPU before
    a later CPU write of the counter: on Hopper and later GPUs on x86, as NCCL relies
@@ -286,7 +294,7 @@ sequenceDiagram
     S->>S: a put of epoch e fails (post or completion error)
     S->>S: ring.error, tx.error = status (sticky); later atomicAdds complete with it
     S->>S: atomicAdds already sent with seq >= e complete with the error now
-    S->>T: ringAbortMsg(key, first_seq = e) to every target thread (once per ring and seq)
+    S->>T: ringAbortMsg(key, first_seq = e) to the ring's owner (once per ring and seq)
     T->>T: aborted_from = min(aborted_from, e); drop waiting adds with seq >= e (no ack)
     T->>T: later records of the ring with seq >= aborted_from are dropped on arrival
     Note over S: next use of the ring after its views are released: new ring id
@@ -306,11 +314,16 @@ that long to land.
   slot), `applied`, `error`, `aborted_from`.
 - Each thread caches key -> RxRing (one-entry cache plus a map), so counting a put
   costs one atomic increment.
-- `owned`: per thread, its waiting adds grouped by ring, ordered by `seq`. A drain
+- `owned`: per thread, the waiting adds of the rings it owns, ordered by `seq`. A drain
   round takes, per ring, the run of consecutive adds from the ring's next one
   (`seq == applied`) whose slots are complete, flushes once for the whole batch (if
-  needed) and applies it in order; an add owned by another thread ends a run, and the
-  next round (or pass) picks up what the batch unblocked. A drain stops after 1 ms of
+  needed) and applies it in order; the next round (or pass) picks up what the batch
+  unblocked.
+- Counter mappings: a VRAM registration is pinned and mapped through GDRCopy when it
+  is registered, all at once (~1 ms for 256 MiB; BAR1 holds all of an H100's memory),
+  so the first add to a counter does not pin and map its page on the proxy thread
+  (~60-420 us each). This takes BAR1 space equal to the registered VRAM, up to 4 GiB
+  per process; beyond that, or if it fails, pages are mapped on their first add. A drain stops after 1 ms of
   applies (the rest wait, in order, for the next pass), so the thread polls its receive
   CQs at least that often. A record for a seq that was already applied or is already
   waiting (only a broken sender sends one) is failed with an error ack.

@@ -245,20 +245,21 @@ TEST(LibfabricProxyWireTest, RailsMapToThreads) {
     }
 }
 
-TEST(LibfabricProxyWireTest, EveryCounterHasOneOwner) {
-    // Deterministic, in range, and spread over the threads.
-    std::vector<size_t> hits(4, 0);
-    for (uint64_t addr = 0x7f0000000000ull; addr < 0x7f0000000000ull + 4096 * 8; addr += 8) {
-        const uint32_t owner = wire::counterOwner(addr, 4);
-        ASSERT_LT(owner, 4u);
-        EXPECT_EQ(owner, wire::counterOwner(addr, 4));
-        ++hits[owner];
+TEST(LibfabricProxyWireTest, RingsGoRoundRobinOverOwners) {
+    // A sender's consecutive ring ids take the target's threads in turn, starting at
+    // its index; different senders start at different threads.
+    for (uint32_t sender = 0; sender < 8; ++sender) {
+        for (uint32_t id = 0; id < 16; ++id) {
+            const uint32_t owner = wire::ringOwner(wire::ringKey(sender, id), 4);
+            EXPECT_EQ(owner, (sender + id) % 4) << "sender " << sender << " ring " << id;
+        }
     }
-    for (size_t t = 0; t < hits.size(); ++t) {
-        EXPECT_GT(hits[t], 512u) << "thread " << t;
-    }
+    EXPECT_EQ(wire::ringOwner(wire::ringKey(wire::kMaxSenderIndex, wire::kRingIds - 1), 3),
+              (wire::kMaxSenderIndex + wire::kRingIds - 1) % 3);
+    EXPECT_EQ(wire::keySender(wire::ringKey(17, 5)), 17u);
     static_assert(sizeof(wire::anyMsg) == sizeof(wire::atomicAddMsg));
-    static_assert(sizeof(wire::atomicAddMsg) <= 128, "keep atomicAdd records small");
+    static_assert(sizeof(wire::atomicAddMsg) == 56, "the record carries no endpoint name");
+    static_assert(sizeof(wire::atomicAckMsg) == 24);
 }
 
 } // namespace

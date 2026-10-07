@@ -3,7 +3,7 @@
 # Source on a pool0 compute node (GDRCopy headers/libs exist only there).
 
 workspace=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa
-source_dir=${workspace}/nixl-efa-cpu-proxy
+source_dir=${SOURCE_DIR:-${workspace}/nixl-efa-cpu-proxy}
 build_dir=${BUILD_DIR:-${workspace}/build/nixl-efa-cpu-proxy}
 cuda_dir=/cm/shared/apps/cuda12.4/toolkit/12.4.1
 efa_dir=/opt/amazon/efa

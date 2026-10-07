@@ -328,6 +328,9 @@ private:
     std::multimap<uintptr_t, Region> regions_;
     std::vector<int> vram_devices_; // GPUs with registered memory; under the region locks
     std::unique_ptr<CounterMap> counters_;
+    // Serialize read-modify-writes of a VRAM counter: rings pick the owner thread,
+    // so threads of different rings may add to the same counter.
+    std::array<std::mutex, 64> counter_locks_;
 
     // Receive-side ring state by key, shared by the thread counting a ring's puts
     // and the owners of its counters; created on first use, kept until shutdown
