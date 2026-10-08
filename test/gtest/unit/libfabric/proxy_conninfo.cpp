@@ -131,7 +131,6 @@ TEST(LibfabricProxyConnInfoTest, MalformedProxySectionsAreRejected) {
     const std::string good = ci::serialize(eps);
     const auto base = [](const std::string &threads) {
         nixlSerDes sd;
-        sd.addStr(ci::kVersionTag, std::to_string(wire::kVersion));
         sd.addStr(ci::kThreadsTag, threads);
         return sd;
     };
@@ -202,19 +201,6 @@ TEST(LibfabricProxyConnInfoTest, NamesArePaddedForTheAv) {
     }
 }
 
-// A peer speaking another proxy protocol gets no device operations (parse fails,
-// so the backend treats it as having no proxy).
-TEST(LibfabricProxyConnInfoTest, OtherProtocolVersionIsRejected) {
-    for (const uint16_t version : {uint16_t(wire::kVersion - 1), uint16_t(wire::kVersion + 1)}) {
-        nixlSerDes sd;
-        sd.addStr(ci::kVersionTag, std::to_string(version));
-        sd.addStr(ci::kThreadsTag, "1");
-        ci::ProxyEps parsed = proxyEps();
-        EXPECT_EQ(ci::parse(sd.exportStr(), parsed), NIXL_ERR_MISMATCH) << "version " << version;
-        EXPECT_TRUE(parsed.home.empty());
-    }
-}
-
 TEST(LibfabricProxyWireTest, PutImmediateCarriesRingAndEpoch) {
     const uint32_t key = wire::ringKey(wire::kMaxSenderIndex, wire::kRingIds - 1);
     EXPECT_EQ(key, 0xffffffu);
@@ -245,17 +231,7 @@ TEST(LibfabricProxyWireTest, RailsMapToThreads) {
     }
 }
 
-TEST(LibfabricProxyWireTest, RingsGoRoundRobinOverOwners) {
-    // A sender's consecutive ring ids take the target's threads in turn, starting at
-    // its index; different senders start at different threads.
-    for (uint32_t sender = 0; sender < 8; ++sender) {
-        for (uint32_t id = 0; id < 16; ++id) {
-            const uint32_t owner = wire::ringOwner(wire::ringKey(sender, id), 4);
-            EXPECT_EQ(owner, (sender + id) % 4) << "sender " << sender << " ring " << id;
-        }
-    }
-    EXPECT_EQ(wire::ringOwner(wire::ringKey(wire::kMaxSenderIndex, wire::kRingIds - 1), 3),
-              (wire::kMaxSenderIndex + wire::kRingIds - 1) % 3);
+TEST(LibfabricProxyWireTest, MessagesStaySmall) {
     EXPECT_EQ(wire::keySender(wire::ringKey(17, 5)), 17u);
     static_assert(sizeof(wire::anyMsg) == sizeof(wire::atomicAddMsg));
     static_assert(sizeof(wire::atomicAddMsg) == 56, "the record carries no endpoint name");

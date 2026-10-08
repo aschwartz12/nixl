@@ -118,26 +118,28 @@ wire encoding and thread/endpoint mapping are described in
 
 - **Parameters** (shared with the UCX proxy): `device_proxy`, `proxy_channel_count`,
   `proxy_thread_count`, `proxy_max_peers`, `proxy_ring_depth` (at most 256 here),
-  `proxy_pthr_delay_us`. EFA-specific: `efa_proxy_rail_policy` = `thread` (default:
-  a buffer's rails are split among the proxy threads for unstriped puts) or `ring`;
-  `efa_proxy_idle_poll_us` (default 2: how often a proxy thread with nothing to do
+  `proxy_pthr_delay_us`. EFA-specific: `efa_proxy_idle_poll_us` (default 2: how often a proxy thread with nothing to do
   polls its CQs; `0` polls on every pass); `efa_proxy_rx_flush` = `1`/`0` forces the
   GPUDirect RDMA flush before target-side adds on/off (default as NCCL: only before
-  Hopper and on aarch64 hosts). Use one proxy thread per EFA device of the GPU.
+  Hopper and on aarch64 hosts). Use one proxy thread per EFA device of the GPU; a
+  buffer's rails are split among the proxy threads for unstriped puts.
 - **Endpoints:** each proxy thread has a data EP (own CQ and AV) on every rail, in the
-  rail's domain (registrations and keys are shared with the host path), and a control
-  EP on one of the GPU's EFA devices. The rail domains are `FI_THREAD_SAFE` while the
-  proxy is on. Each of the GPU's EFA devices is polled for incoming puts by exactly one
-  proxy thread (rail `i` of the GPU by thread `i % threads`).
+  rail's domain (registrations and keys are shared with the host path); there is no
+  separate control EP. The rail domains are `FI_THREAD_SAFE` while the proxy is on.
+  Each of the GPU's EFA devices is polled for incoming puts and atomicAdd records by
+  exactly one proxy thread (rail `i` of the GPU by thread `i % threads`); a thread's
+  control messages leave from its EP on its home rail (one of the GPU's), where its
+  acks arrive.
 - **put():** one RDMA write per fragment (striped across rails at or above the striping
   threshold) with `FI_DELIVERY_COMPLETE` and 32 bits of remote CQ data (ring key and
   epoch) to the data EP of the target thread that receives on the destination rail. It
   completes once placed at the target.
-- **atomicAdd():** sent at once to the ring's owner thread at the target, which
-  applies the ring's adds in order (GDRCopy, CUDA copies without GDRCopy, or a CPU
-  atomic for host memory; a VRAM counter's update holds a lock stripe, since rings on
-  other threads may add to it too), each only after the target counted every earlier
-  put of the ring, then acks; the atomicAdd completes on the ack. VRAM registrations
+- **atomicAdd():** sent at once to the target's data EP on the rail where the sending
+  thread's small puts land, so the target thread that counts those puts applies the
+  ring's adds, in order (GDRCopy, CUDA copies without GDRCopy, or a CPU atomic for host
+  memory; a VRAM counter's update holds a lock stripe, since adds from other senders
+  may arrive on other threads), each only after the target counted every earlier put
+  of the ring, then acks; the atomicAdd completes on the ack. VRAM registrations
   are mapped through GDRCopy when registered, so a first add to a counter is not slow. Ordering is per
   ring and target. The add is a read-modify-write: the GPU must not write a counter
   while remote adds to it can arrive; counters must be 8-byte aligned and registered.
@@ -147,15 +149,15 @@ wire encoding and thread/endpoint mapping are described in
   nothing for 10 s. Known gap: a command the runtime cannot resolve (for example a
   stale memory view) never reaches the backend, so it does not fail later atomicAdds
   on its ring.
-- **Connection info:** a proxy section (version 5: control EPs, receive rails and
-  their data EPs, incarnation) is appended after the rail endpoints. Peers without it,
-  or with another version, still get puts and host transfers, but no atomicAdd. A
+- **Connection info:** a proxy section (each thread's home data EP, receive rails and
+  their data EPs, incarnation; no version, a job's nodes run the same build) is
+  appended after the rail endpoints. Peers without it still get puts and host
+  transfers, but no atomicAdd. A
   ring's first operation towards a peer waits for the engine handshake with it.
 - **Diagnostics:** `NIXL_EFA_PROXY_PROFILE=1` prints per-stage latency histograms, per
   thread busy time and the cost of receiving puts to stderr at shutdown.
   `NIXL_EFA_PROXY_INJECT` (tests only; ignored in `NDEBUG` builds) injects
-  back-pressure, failed posts or completions, disables GDRCopy, or sends control
-  messages from the data EP instead of the control EP (`ctl_on_data=1`).
+  back-pressure, failed posts or completions, or disables GDRCopy.
 
 ## API Reference
 

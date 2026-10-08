@@ -48,9 +48,10 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     // Remote engine rail EP names, kept so device-proxy threads can insert
     // them into their own AVs (puts target any EP in the remote rail's domain).
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> remote_rail_ep_names_;
-    // The peer's device proxy (empty if it published none): its threads' control
-    // EPs (atomicAdd records, ring aborts), the rails it receives puts on with the
-    // data EP receiving on each, and the incarnation they belong to.
+    // The peer's device proxy (empty if it published none): its threads' data EPs
+    // on their home rails (acks), the rails it receives puts, atomicAdd records and
+    // ring aborts on with the data EP receiving on each, and the incarnation they
+    // belong to.
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> remote_proxy_ep_names_;
     std::vector<uint32_t> remote_proxy_data_rails_;
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> remote_proxy_data_ep_names_;

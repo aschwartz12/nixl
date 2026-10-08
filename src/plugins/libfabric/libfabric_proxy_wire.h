@@ -28,12 +28,14 @@
  *    putImm(): its ring's key and its epoch, the index of the atomicAdd that will
  *    follow it on the ring (mod kEpochs). The target thread that polls the rail it
  *    lands on counts it per (ring, epoch slot).
- *  - An atomicAdd leaves at once as an atomicAddMsg to its ring's owner thread at
- *    the target (ringOwner()), with its index on the ring (seq) and the fragment
- *    count its epoch slot reaches once its own puts are in (expected_puts). The
- *    owner applies a ring's adds in seq order, each once that count is reached,
- *    then acks to the sending thread (named by the ring key's sender index and the
- *    record's sender_thread); the sender completes the atomicAdd on the ack.
+ *  - An atomicAdd leaves at once as an atomicAddMsg to the target's data EP on the
+ *    rail where the sending thread's small puts land, with its index on the ring
+ *    (seq) and the fragment count its epoch slot reaches once its own puts are in
+ *    (expected_puts). The thread polling that EP applies a ring's adds in seq order
+ *    (the ring's applied count is shared, so adds of one ring may arrive on several
+ *    threads), each once that count is reached, then acks to the sending thread's
+ *    home data EP (named by the ring key's sender index and the record's
+ *    sender_thread); the sender completes the atomicAdd on the ack.
  *  - A ring key names one sender ring at one target, deterministically:
  *    ringKey(the sender's index at the target, a ring id). The sender allocates
  *    ring ids per target, one per (runtime ring, target), and a fresh one when a
@@ -41,13 +43,11 @@
  *  - Slot s of a ring is reused kEpochs atomicAdds later; a ring with at most
  *    kEpochs requests in flight cannot get there before atomicAdd s was applied.
  *
- * Control messages (atomicAdd, ack, ring abort) go between the threads' control
- * EPs; puts go to the data EP of the thread that receives on the destination rail.
+ * Everything travels on the data EPs: puts and control messages (atomicAdd, ring
+ * abort) to the EP of the thread that receives on the destination rail, acks to the
+ * sending thread's EP on its home rail.
  */
 namespace nixlLibfabricProxyWire {
-
-/** Bumped on any layout or protocol change; also published in the connection info. */
-inline constexpr uint16_t kVersion = 5;
 
 /** Epoch slots per ring: the put immediate's low bits. */
 inline constexpr uint32_t kEpochBits = 8;
@@ -58,27 +58,28 @@ inline constexpr uint32_t kRingIds = 0x10000;
 
 enum class msgType : uint16_t { ATOMIC_ADD = 1, ATOMIC_ACK = 2, RING_ABORT = 3 };
 
+// No version: every node of a job runs the same build.
 struct msgHeader {
-    uint16_t version;
     msgType type;
+    uint16_t reserved16;
     uint32_t reserved;
 };
 
-/** Sender -> the ring's owner thread at the target. */
+/** Sender -> the thread receiving on the rail of the sender's small puts at the target. */
 struct atomicAddMsg {
     msgHeader hdr;
     uint64_t remote_addr;
     uint64_t value;
     uint64_t token; // sender's request, echoed in the ack
     uint32_t ring; // ringKey() of the sender's ring
-    // The sending proxy thread: the ack goes to its control EP, which the target
+    // The sending proxy thread: the ack goes to its home data EP, which the target
     // knows from the sender's connection info (the ring key names the sender).
     uint32_t sender_thread;
     uint64_t seq; // index of this add among the ring's atomicAdds
     uint64_t expected_puts; // count of slot seq % kEpochs once this add's puts are in
 };
 
-/** Counter owner -> sender, after the add was applied or failed. */
+/** Applying thread -> sender, after the add was applied or failed. */
 struct atomicAckMsg {
     msgHeader hdr;
     uint64_t token;
@@ -87,9 +88,9 @@ struct atomicAckMsg {
 };
 
 /**
- * Sender -> the ring's owner thread: the ring failed at the sender, so its
+ * Sender -> where its atomicAdds went: the ring failed at the sender, so its
  * atomicAdds from first_seq on will never be satisfiable (or are not wanted). The
- * owner drops them without applying (no ack: the sender already failed them) and
+ * target drops them without applying (no ack: the sender already failed them) and
  * forgets the ring once nothing of it waits.
  */
 struct ringAbortMsg {
@@ -143,18 +144,9 @@ mix64(uint64_t x) {
 }
 
 /**
- * Proxy thread of a target with @p threads proxy threads that applies the adds of
- * the ring @p ring_key, in order. A sender's ring ids are consecutive, so its rings
- * go round-robin over the threads, starting at its index.
- */
-constexpr uint32_t
-ringOwner(uint32_t ring_key, uint32_t threads) {
-    return (keySender(ring_key) + (ring_key & (kRingIds - 1))) % threads;
-}
-
-/**
  * Proxy thread of a target with @p threads proxy threads that receives (polls and
- * counts) the puts landing on its receive rail number @p rail_index.
+ * counts) the puts, and applies the atomicAdds, landing on its receive rail number
+ * @p rail_index.
  */
 constexpr uint32_t
 railThread(uint32_t rail_index, uint32_t threads) {

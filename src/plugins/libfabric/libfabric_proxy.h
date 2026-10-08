@@ -55,19 +55,22 @@ struct nixlLibfabricConnection;
  *  - a data EP (with its own CQ and AV) on every rail, in the engine's per-rail
  *    fi_domain (so registrations and keys are shared). Puts leave from them; on
  *    the receive rails (next to the GPU) t polls the data CQ of the rails it owns
- *    (wire::railThread()) and counts the puts that land there;
- *  - a control EP on its home rail for atomicAdd records, acks and ring aborts.
+ *    (wire::railThread()), counts the puts that land there and receives the
+ *    atomicAdd records and ring aborts sent there. Its data EP on its home rail
+ *    sends its atomicAdd records, acks and ring aborts and receives its acks.
+ *    There is no separate control EP.
  *
  * Sender side, per ring (channel, peer): every put fragment is an RDMA write with
  * FI_DELIVERY_COMPLETE and remote CQ data (ring key, epoch) to the data EP of the
  * target thread that receives on the destination rail; an atomicAdd is sent at
- * once to its counter's owner thread and completes on that thread's ack, i.e. once
- * applied. A ring waits for the engine handshake with its target (the ring key
- * holds the sender's index at the target) before its first operation leaves.
+ * once to the target's data EP on the rail where this thread's small puts land,
+ * and completes on the ack of the thread polling it, i.e. once applied. A ring
+ * waits for the engine handshake with its target (the ring key holds the sender's
+ * index at the target) before its first operation leaves.
  *
- * Target side: the owner applies an atomicAdd (GDRCopy, CUDA copy or CPU atomic)
- * once its ring's epoch slot counted its puts and the ring's previous atomicAdd was
- * applied, then acks with the result.
+ * Target side: the receiving thread applies an atomicAdd (GDRCopy, CUDA copy or
+ * CPU atomic) once its ring's epoch slot counted its puts and the ring's previous
+ * atomicAdd was applied, then acks with the result.
  *
  * Threading: ProxyWorker owns channel c on thread c % effectiveThreadCount() and
  * calls submit/check_completion/progress/quiesce for a ring only from that thread
@@ -121,6 +124,7 @@ private:
     struct RxOwned;
     struct Parked;
     struct RecvBuf;
+    struct RecvPool;
     struct CtlBuf;
     struct PendingCtl;
     struct PendingPost;
@@ -187,6 +191,12 @@ private:
     /** Index into a buffer's rails for an unstriped put. */
     size_t
     unstripedRail(const Thread &th, Ring &ring, size_t nrails) const;
+    /**
+     * Position among @p conn's receive rails of the remote buffer rail @p reps[sel]
+     * (or of the next of @p reps the target receives on), -1 if none.
+     */
+    static int
+    receiveIndex(const PeerAddrs &pa, const std::vector<size_t> &reps, size_t sel, size_t &rep);
     /** Fail @p req's ring's later atomicAdds, at the sender and (abort) at the target. */
     void
     failRing(Thread &th, Request *req, nixl_status_t status);
@@ -203,7 +213,7 @@ private:
     drainRetries(Thread &th);
     void
     pollCqs(Thread &th);
-    /** Drain one CQ; @p rail names it in logs (the rail count for the control CQ). */
+    /** Drain one CQ; @p rail names it in logs. */
     void
     pollCq(Thread &th, struct fid_cq *cq, uint32_t rail, uint64_t &reads);
     void
@@ -217,7 +227,7 @@ private:
     void
     expireAcks(Thread &th, uint64_t now_ns);
 
-    // Control messages on the control EPs.
+    // Control messages (atomicAdd records, acks, ring aborts) on the data EPs.
     void
     handleRecv(Thread &th, RecvBuf *buf, size_t len);
     void
@@ -256,8 +266,6 @@ private:
 
     PeerAddrs *
     peerAddrs(Thread &th, const std::shared_ptr<nixlLibfabricConnection> &conn);
-    fi_addr_t
-    homeAddr(Thread &th, PeerAddrs &pa, const nixlLibfabricConnection &conn, size_t thread);
     /** An engine EP of a peer without a (compatible) proxy, in @p rail's AV. */
     fi_addr_t
     railAddr(Thread &th,
@@ -265,7 +273,10 @@ private:
              const nixlLibfabricConnection &conn,
              size_t rail,
              size_t remote_ep);
-    /** The target's receiving data EP on its data rail number @p data_index, in @p rail's AV. */
+    /**
+     * The target's receiving data EP on its data rail number @p data_index (puts,
+     * atomicAdd records, ring aborts), in @p rail's AV.
+     */
     fi_addr_t
     dataAddr(Thread &th,
              PeerAddrs &pa,
@@ -289,7 +300,6 @@ private:
     nixlProxyConfig config_{};
     uint32_t threads_ = 0;
     size_t rails_ = 0;
-    bool rail_per_thread_ = true; // efa_proxy_rail_policy: "thread" (default) or "ring"
     uint64_t idle_poll_ns_ = 0; // efa_proxy_idle_poll_us (0: poll on every pass)
     bool profile_ = false; // NIXL_EFA_PROXY_PROFILE: per-stage timers, reported at shutdown
     std::unique_ptr<Inject> inject_; // NIXL_EFA_PROXY_INJECT: tests only, off under NDEBUG
@@ -328,12 +338,12 @@ private:
     std::multimap<uintptr_t, Region> regions_;
     std::vector<int> vram_devices_; // GPUs with registered memory; under the region locks
     std::unique_ptr<CounterMap> counters_;
-    // Serialize read-modify-writes of a VRAM counter: rings pick the owner thread,
-    // so threads of different rings may add to the same counter.
+    // Serialize read-modify-writes of a VRAM counter: rings of different senders (or
+    // sending threads) arrive on different threads and may add to the same counter.
     std::array<std::mutex, 64> counter_locks_;
 
-    // Receive-side ring state by key, shared by the thread counting a ring's puts
-    // and the owners of its counters; created on first use, kept until shutdown
+    // Receive-side ring state by key, shared by the threads counting a ring's puts
+    // and applying its adds; created on first use, kept until shutdown
     // (keys are never reused: a failed ring comes back under a new key).
     std::mutex rx_rings_mutex_;
     std::unordered_map<uint32_t, std::unique_ptr<RxRing>> rx_rings_;

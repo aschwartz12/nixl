@@ -1,0 +1,4 @@
+# no control EP: base = before (c9568c5d), new = after (this commit), 8 ranks, second allocation
+job=7749972 nodes=pool0-[0972,0979] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_8.json
+noctl2-ep8-7749972.log === mode=base params=: per-run means ['13.84', '13.81', '13.84', '13.74', '13.84'] median 13.84 GB/s; runs without a result: 0
+noctl2-ep8-7749972.log === mode=new params=: per-run means ['13.64', '13.61', '13.00', '13.76', '13.61'] median 13.61 GB/s; runs without a result: 0

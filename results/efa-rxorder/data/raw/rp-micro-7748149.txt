@@ -1,0 +1,15 @@
+# rail policy: thread/shared ('new') vs ring + private send domains ('newprivring'), fcfc47e0, job 7748149
+| Metric | new | newprivring |
+|---|---|---|
+| ping-pong 8 B (us) | 55.8 (54.5-56.6, n=3) | 55.7 (55.6-55.8, n=3) |
+| put 8 B (us) | 34.9 (34.0-35.1, n=3) | 34.7 (34.6-35.0, n=3) |
+| put+signal 8 B at sender (us) | 45.9 (44.0-46.1, n=3) | 45.7 (45.4-45.8, n=3) |
+| put+signal 64 KiB at sender (us) | 55.9 (55.4-56.3, n=3) | 56.4 (55.8-56.7, n=3) |
+| pipelined 1 MiB, 1 ch (Gbit/s) | 358.5 (356.7-358.9, n=3) | 358.9 (358.2-358.9, n=3) |
+| pipelined 64 KiB, 1 ch (Gbit/s) | 117.7 (116.7-118.8, n=3) | 118.2 (117.4-118.2, n=3) |
+| pipelined 8 KiB, 1 ch (Gbit/s) | 15.9 (15.9-16.1, n=3) | 16.0 (15.8-16.0, n=3) |
+| batch-signal 64 KiB, 1 ch (Gbit/s) | 113.2 (111.2-114.0, n=3) | 112.6 (112.6-113.0, n=3) |
+| pipelined 1 MiB, 4 ch (Gbit/s) | 389.9 (389.8-389.9, n=3) | 389.4 (387.9-389.5, n=3) |
+| pipelined 64 KiB, 4 ch (Gbit/s) | 293.7 (290.8-293.7, n=3) | 290.0 (283.5-290.4, n=3) |
+| pipelined 8 KiB, 4 ch (Gbit/s) | 58.7 (57.3-59.0, n=3) | 59.4 (59.3-59.4, n=3) |
+| ordering check, 4 ch (signals/s) | 57672 (57193-57953, n=3) | 43270 (43193-43638, n=3) |

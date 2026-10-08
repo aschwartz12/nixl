@@ -13,7 +13,6 @@
  *   NIXL_EFA_PROXY_CHANNELS/WORKERS   proxy channels / threads (default 1 / 1)
  *   NIXL_EFA_PROXY_PIPELINE_WINDOW    outstanding puts in the pipelined tests
  *   NIXL_EFA_PROXY_RING_DEPTH         proxy_ring_depth (power of two, default 256)
- *   NIXL_EFA_PROXY_RAIL_POLICY        efa_proxy_rail_policy: thread (default) or ring
  *   NIXL_EFA_PROXY_IDLE_POLL_US       efa_proxy_idle_poll_us (idle CQ polling period)
  *   NIXL_PROXY_BENCH_HOST_ROUNDS      rounds per host-transfer trial (default 200)
  *   NIXL_PROXY_BENCH_PTHR_DELAY_US    engine progress thread delay (default 1000)
@@ -660,9 +659,6 @@ main(int argc, char **argv) {
                 {"proxy_thread_count", std::to_string(proxy_workers)},
                 {"proxy_max_peers", "1"},
             };
-            if (const char *policy = std::getenv("NIXL_EFA_PROXY_RAIL_POLICY")) {
-                backend_params.emplace("efa_proxy_rail_policy", policy);
-            }
             if (const char *depth = std::getenv("NIXL_EFA_PROXY_RING_DEPTH")) {
                 backend_params.emplace("proxy_ring_depth", depth);
             }

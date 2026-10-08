@@ -415,7 +415,7 @@ above):
   stack dump on signal 44), run `EP_MODES=new` at 16 ranks, and
   `scripts/hang-dump-watch.sh <job id>` alongside.
 
-## Review points 2-8 (protocol version 5)
+## Review points 2-8 (protocol version 5; see the decisions below)
 
 A colleague's review of the receiver-only proxy, checked point by point against the
 code and with tests (job ids in `results/efa-rxorder/data/raw/rv-*`, `gdrbench.txt`).
@@ -433,3 +433,58 @@ code and with tests (job ids in `results/efa-rxorder/data/raw/rv-*`, `gdrbench.t
 
 Tests on this commit: unit 162/162, device gtests 22/22 (3 new), atomic and fault
 gtests 3 x 10 (job 7729117).
+
+## Decisions after the review: thread rail policy only, no control EP, no version
+
+The review's follow-up decisions, checked and applied in this commit. "Before" is
+c9568c5d, "after" this commit; raw summaries in `results/efa-rxorder/data/raw/rp-*`
+and `noctl*`.
+
+**Rail policy.** A prototype gave each thread a private send domain per rail
+(`efa_proxy_tx_domain=private`, not merged) so that `ring` (a ring's small puts
+rotate over all rails) no longer serializes on the shared domain lock. On one
+allocation, modes interleaved, 5 runs each (fcfc47e0 = c9568c5d + prototype):
+
+| | thread, shared domains | ring, private domains |
+|---|---|---|
+| nixl_ep 16 ranks (GB/s), job 7748148 | 11.27 (11.07-11.33) | 11.34 (11.31-11.40), +0.6% |
+| nixl_ep 8 ranks (GB/s), job 7748147 (slow allocation) | 9.13 (8.82-9.33) | 9.29 (7.30-9.39) |
+| ordering check, 4 ch (signals/s), job 7748149, n=3 | 57672 (57193-57953) | 43270 (43193-43638), -25% |
+| latency, pipelined bandwidth | unchanged | unchanged |
+
+`ring` spreads a ring's puts over four target threads, so each add waits for counts
+from all of them; its 1% bandwidth gain does not pay for that, nor for a domain, EP,
+AV and registrations per thread and rail. On shared domains `ring` costs 22% (job
+7687420). Kept: `thread` only; `efa_proxy_rail_policy` is ignored with a warning.
+
+**No control EP.** A thread's atomicAdd records, acks and ring aborts now use its data
+EP on its home rail. Records and aborts go to the target's data EP on the rail where
+the sending thread's small puts land, so the thread that counts those puts applies
+the adds (no owner formula); acks go to the sending thread's home data EP (published
+in the connection info instead of a control EP). The EPs that receive messages (a
+thread's home and receive rails) post 1024 receive buffers each. The ring's `applied`
+count and abort mark are shared, so adds of one ring may still arrive on several
+threads (a ring moving between rails) and stay ordered; the VRAM counter lock stripes
+stay (other senders' adds arrive on other threads).
+
+**No version.** The per-message version and the connection-info version are removed:
+a job's nodes run the same build.
+
+| Before (c9568c5d) vs after | before | after |
+|---|---|---|
+| nixl_ep 16 ranks (GB/s), job 7749764 | 11.10 (10.86-11.39) | 11.04 (10.58-11.22), within noise |
+| nixl_ep 8 ranks (GB/s), job 7749972 | 13.84 (13.74-13.84) | 13.61 (13.00-13.76), -1.7% |
+| nixl_ep 8 ranks (GB/s), job 7749763 (slow allocation) | 8.62 (8.17-9.22) | 8.26 (7.79-8.75) |
+| ordering check, 4 ch (signals/s), job 7749765, n=3 | 61797 (58386-61901) | 64693 (62895-65042), +4.7% |
+| ping-pong / put+signal 8 B (us) | 59.2 / 49.2 | 58.5 / 49.4 |
+| pipelined 64 KiB / 1 MiB, 4 ch (Gbit/s) | 287.0 / 389.7 | 287.3 / 389.7 |
+
+Signals are 4.7% faster (an add is applied by the thread that already counted its
+puts). nixl_ep at 8 ranks lost 1.7% on the good allocation (4 of 5 runs below every
+baseline run); at 16 ranks the difference is within noise. The earlier test that only
+*sent* control messages from the data EP (`ctl_on_data=1`) measured no cost, so the
+difference, if real, comes from receiving them there (larger receive queues on the
+receive rails, or records and acks sharing the data CQs); not investigated further.
+
+Tests on this commit: unit 161/161 (the version-mismatch test is gone), device gtests
+22/22, atomic and fault gtests 3 x 10 (job 7749762).

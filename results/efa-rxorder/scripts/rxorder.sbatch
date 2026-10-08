@@ -20,6 +20,8 @@
 #             base      baseline build (BASE_BUILD, efa-cpu-proxy 5a762a8)
 #             new       study build, receiver-side ordering only (defaults)
 #             newflush  new, with the GPUDirect RDMA flush forced on
+#             newring / newpriv / newprivring  new with efa_proxy_rail_policy=ring,
+#                       efa_proxy_tx_domain=private, or both
 #             sender    study build, efa_proxy_ordering=sender (the default)
 #             imm       study build, sender ordering + test-only immediate-data puts
 #             imm4k     imm with 4096-entry data EP receive queues (efa_proxy_data_rx_size)
@@ -100,6 +102,9 @@ mode_params() {
     base) echo "" ;;
     new) echo "" ;;
     newflush) echo "efa_proxy_rx_flush=1" ;;
+    newring) echo "efa_proxy_rail_policy=ring" ;;
+    newpriv) echo "efa_proxy_tx_domain=private" ;;
+    newprivring) echo "efa_proxy_tx_domain=private,efa_proxy_rail_policy=ring" ;;
     sender) echo "efa_proxy_ordering=sender" ;;
     imm) echo "efa_proxy_ordering=sender,efa_proxy_test_put_imm=1" ;;
     imm4k) echo "efa_proxy_ordering=sender,efa_proxy_test_put_imm=1,efa_proxy_data_rx_size=4096" ;;

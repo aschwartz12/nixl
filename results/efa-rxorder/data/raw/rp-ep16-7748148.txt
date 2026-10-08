@@ -1,0 +1,4 @@
+# rail policy: thread/shared ('new') vs ring + private send domains ('newprivring'), fcfc47e0 (c9568c5d + prototype), 16 ranks
+job=7748148 nodes=pool0-[0061,0116,0316,0374] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_16.json
+tp2-ep16-7748148.log === mode=new params=: per-run means ['11.07', '11.33', '11.28', '11.17', '11.27'] median 11.27 GB/s; runs without a result: 0
+tp2-ep16-7748148.log === mode=newprivring params=efa_proxy_tx_domain=private,efa_proxy_rail_policy=ring: per-run means ['11.34', '11.40', '11.31', '11.40', '11.31'] median 11.34 GB/s; runs without a result: 0

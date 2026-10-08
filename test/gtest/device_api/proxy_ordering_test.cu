@@ -233,9 +233,10 @@ protected:
     }
 
     /**
-     * Every channel (its own ring) adds 1 to the same counter @p count times. The
-     * target applies a ring's adds on the ring's owner thread, so here up to one
-     * thread per ring writes the counter: none of the adds may be lost.
+     * Every channel (its own ring, on its own proxy thread) adds 1 to the same
+     * counter @p count times. Each sending thread's adds go to the target thread
+     * receiving on its rail, so here up to one target thread per ring writes the
+     * counter: none of the adds may be lost.
      */
     void
     runManyRingsOneCounter(unsigned count) {

@@ -34,17 +34,18 @@
  *
  *   "<engine blob><proxy blob><8-byte proxy blob length>EFAPRXY1"
  *
- * The proxy blob carries the proxy protocol version, every proxy thread's control
- * EP (atomicAdd records, acks and ring aborts go there), the rails that receive
- * puts (those next to the GPU) with the data EP of the thread receiving on each
- * (wire::railThread()), and a random incarnation that changes whenever the proxy is
- * re-created (senders restart their ring counts with it). Names are published at
- * their real length: the whole connection info travels in the engine's handshake,
- * which is limited to 8 KiB.
+ * The proxy blob carries every proxy thread's data EP on its home rail (acks go
+ * there), the rails that receive puts (those next to the GPU) with the data EP of
+ * the thread receiving on each (wire::railThread(); puts, atomicAdd records and
+ * ring aborts go there), and a random incarnation that changes whenever the proxy
+ * is re-created (senders restart their ring counts with it). Names are published
+ * at their real length: the whole connection info travels in the engine's
+ * handshake, which is limited to 8 KiB. There is no protocol version: every node of
+ * a job runs the same build.
  *
  * A peer without the proxy sends only the engine blob, which split() returns
- * unchanged; a peer with another protocol version is rejected by parse(), so no
- * device operation is sent to it.
+ * unchanged; parse() rejects a malformed blob, so no device operation is sent to
+ * that peer.
  */
 namespace nixlLibfabricProxyConnInfo {
 
@@ -52,7 +53,6 @@ using EpName = std::array<char, LF_EP_NAME_MAX_LEN>;
 
 inline constexpr char kMagic[] = "EFAPRXY1";
 inline constexpr size_t kMagicLen = sizeof(kMagic) - 1;
-inline constexpr char kVersionTag[] = "efa_proxy_version";
 inline constexpr char kThreadsTag[] = "efa_proxy_threads";
 inline constexpr char kEpTagPrefix[] = "efa_proxy_ep_";
 inline constexpr char kRailsTag[] = "efa_proxy_data_rails";
@@ -64,7 +64,7 @@ inline constexpr uint64_t kMaxRails = 1024;
 
 /** A proxy's endpoints, as published. */
 struct ProxyEps {
-    std::vector<std::string> home; // per proxy thread: its control EP name
+    std::vector<std::string> home; // per proxy thread: its data EP on its home rail
     std::vector<uint32_t> data_rails; // rails that receive puts, in order
     std::vector<std::string> data; // per data rail: the receiving thread's data EP
     uint64_t incarnation = 0;
@@ -74,7 +74,6 @@ struct ProxyEps {
 inline std::string
 serialize(const ProxyEps &eps) {
     nixlSerDes sd;
-    sd.addStr(kVersionTag, std::to_string(nixlLibfabricProxyWire::kVersion));
     sd.addStr(kThreadsTag, std::to_string(eps.home.size()));
     for (size_t t = 0; t < eps.home.size(); ++t) {
         sd.addBuf(kEpTagPrefix + std::to_string(t), eps.home[t].data(), eps.home[t].size());
@@ -115,7 +114,7 @@ namespace detail {
 
 /**
  * Parse a proxy blob; an empty blob means no proxy. On error @p eps is empty:
- * NIXL_ERR_MISMATCH for a malformed blob or another protocol version.
+ * NIXL_ERR_MISMATCH for a malformed blob.
  */
 inline nixl_status_t
 parse(const std::string &blob, ProxyEps &eps) {
@@ -125,9 +124,6 @@ parse(const std::string &blob, ProxyEps &eps) {
     }
     nixlSerDes sd;
     if (sd.importStr(blob) != NIXL_SUCCESS) {
-        return NIXL_ERR_MISMATCH;
-    }
-    if (sd.getStr(kVersionTag) != std::to_string(nixlLibfabricProxyWire::kVersion)) {
         return NIXL_ERR_MISMATCH;
     }
     uint64_t threads = 0;
