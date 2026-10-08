@@ -703,7 +703,9 @@ private:
  *                     libfabric (back-pressure and the retry queues);
  *  - post_error_at=N: the N-th put request fails to post;
  *  - cq_error_at=N:   the N-th put request completes with an error;
- *  - no_gdrcopy=1:    apply VRAM atomicAdds with CUDA copies instead of GDRCopy.
+ *  - no_gdrcopy=1:    apply VRAM atomicAdds with CUDA copies instead of GDRCopy;
+ *  - msg_rx=N:        receive queue size and posted buffers of the data EPs that
+ *                     receive control messages (default kMsgRxSize).
  * Put requests are counted from 1 over all proxy threads of this backend.
  */
 struct nixlLibfabricProxy::Inject {
@@ -711,6 +713,7 @@ struct nixlLibfabricProxy::Inject {
     uint64_t post_error_at = 0;
     uint64_t cq_error_at = 0;
     bool no_gdrcopy = false;
+    uint64_t msg_rx = 0;
     std::atomic<uint64_t> attempts{0};
     std::atomic<uint64_t> puts{0};
 
@@ -745,13 +748,16 @@ struct nixlLibfabricProxy::Inject {
                 inject->cq_error_at = value;
             } else if (key == "no_gdrcopy") {
                 inject->no_gdrcopy = value != 0;
+            } else if (key == "msg_rx") {
+                inject->msg_rx = value;
             } else {
                 NIXL_WARN << "EFA proxy: unknown NIXL_EFA_PROXY_INJECT item '" << item << "'";
             }
         }
         NIXL_WARN << "EFA proxy: fault injection enabled: eagain_every=" << inject->eagain_every
                   << " post_error_at=" << inject->post_error_at
-                  << " cq_error_at=" << inject->cq_error_at << " no_gdrcopy=" << inject->no_gdrcopy;
+                  << " cq_error_at=" << inject->cq_error_at << " no_gdrcopy=" << inject->no_gdrcopy
+                  << " msg_rx=" << inject->msg_rx;
         return inject;
 #endif
     }
@@ -909,8 +915,9 @@ nixlLibfabricProxy::init(const nixlProxyConfig &config) {
             const bool msgs =
                 std::find(msg_rails.begin(), msg_rails.end(), r) != msg_rails.end();
             rr.info->tx_attr->size = std::min(rr.info->tx_attr->size, kTxSize);
+            const size_t msg_rx = inject_ && inject_->msg_rx != 0 ? inject_->msg_rx : kMsgRxSize;
             rr.info->rx_attr->size =
-                std::min(rr.info->rx_attr->size, msgs ? kMsgRxSize : kDataRxSize);
+                std::min(rr.info->rx_attr->size, msgs ? msg_rx : kDataRxSize);
             rr.virt_addr = (rr.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0;
 
             const bool receives = std::find(rx_rails_.begin(), rx_rails_.end(), r) != rx_rails_.end();

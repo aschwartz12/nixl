@@ -1,0 +1,5 @@
+# no control EP, 8 ranks: base = c9568c5d, new = 1f3af509, newrx64 = new with NIXL_EFA_PROXY_INJECT=msg_rx=64 (64 instead of 1024 receive buffers per data EP)
+job=7750615 nodes=pool0-[0020,0763] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_8.json
+rx64-ep8-7750615.log === mode=base params=: per-run means ['13.74', '13.78', '13.80', '13.81', '13.68', '12.99', '13.81'] median 13.78 GB/s; runs without a result: 0
+rx64-ep8-7750615.log === mode=new params=: per-run means ['13.59', '13.60', '13.64', '13.64', '13.69', '13.46', '13.63'] median 13.63 GB/s; runs without a result: 0
+rx64-ep8-7750615.log === mode=newrx64 params=: per-run means ['13.53', '13.60', '13.56', '13.62', '13.65', '13.48', '13.61'] median 13.60 GB/s; runs without a result: 0

@@ -29,6 +29,7 @@ params_of() {
     base | new) echo "" ;;
     basering | newring) echo "efa_proxy_rail_policy=ring" ;;
     newctl) echo "" ;; # + NIXL_EFA_PROXY_INJECT=ctl_on_data=1 (below)
+    newrx64) echo "" ;; # + NIXL_EFA_PROXY_INJECT=msg_rx=64 (below)
     newpriv) echo "efa_proxy_tx_domain=private" ;;
     newprivring) echo "efa_proxy_tx_domain=private,efa_proxy_rail_policy=ring" ;;
     newflush) echo "efa_proxy_rx_flush=1" ;;
@@ -52,6 +53,8 @@ for rep in $(seq 1 "${REPS:-3}"); do
         export NIXL_EP_BACKEND_PARAMS=$(params_of "${mode}") EP_RUN_LABEL=${mode}-${rep}
         if [[ ${mode} == newctl ]]; then
             export NIXL_EFA_PROXY_INJECT=ctl_on_data=1 # control messages behind the puts
+        elif [[ ${mode} == newrx64 ]]; then
+            export NIXL_EFA_PROXY_INJECT=msg_rx=64 # small receive queues on the data EPs
         else
             unset NIXL_EFA_PROXY_INJECT
         fi

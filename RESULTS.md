@@ -480,11 +480,24 @@ a job's nodes run the same build.
 | pipelined 64 KiB / 1 MiB, 4 ch (Gbit/s) | 287.0 / 389.7 | 287.3 / 389.7 |
 
 Signals are 4.7% faster (an add is applied by the thread that already counted its
-puts). nixl_ep at 8 ranks lost 1.7% on the good allocation (4 of 5 runs below every
-baseline run); at 16 ranks the difference is within noise. The earlier test that only
-*sent* control messages from the data EP (`ctl_on_data=1`) measured no cost, so the
-difference, if real, comes from receiving them there (larger receive queues on the
-receive rails, or records and acks sharing the data CQs); not investigated further.
+puts). nixl_ep at 8 ranks loses 1-2%; at 16 ranks the difference is within noise.
+
+The 8-rank loss, checked on two more allocations (7 interleaved rounds each), with a
+third mode that shrinks the receive queues and posted buffers of the data EPs that
+receive control messages from 1024 to 64 (test-only `NIXL_EFA_PROXY_INJECT=msg_rx=64`):
+
+| nixl_ep 8 ranks (GB/s) | before | after | after, 64 receive buffers |
+|---|---|---|---|
+| job 7750615 | 13.78 (12.99-13.81) | 13.63 (13.46-13.69), -1.1% | 13.60 (13.48-13.65), -1.3% |
+| job 7750616 (slow allocation) | 8.65 (7.79-8.94) | 8.78 (8.43-9.19) | 8.27 (7.33-8.83) |
+
+So the loss is real (-1.7% and -1.1% on the two fast allocations; there 11 of 12
+"after" runs are below the median "before" run) and small, and the receive queue size
+is not its cause. The earlier test that only *sent* control messages from the data EP
+(`ctl_on_data=1`) measured no cost, so it comes from receiving them there: the records
+and acks share the data CQs, and the provider's receive path, with the put immediates
+(a receive needs a copy out of the provider's bounce buffer under the rail domain's
+lock, which the CQ reads of the counting threads also take). Not investigated further.
 
 Tests on this commit: unit 161/161 (the version-mismatch test is gone), device gtests
 22/22, atomic and fault gtests 3 x 10 (job 7749762).
