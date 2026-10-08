@@ -491,13 +491,12 @@ receive control messages from 1024 to 64 (test-only `NIXL_EFA_PROXY_INJECT=msg_r
 | job 7750615 | 13.78 (12.99-13.81) | 13.63 (13.46-13.69), -1.1% | 13.60 (13.48-13.65), -1.3% |
 | job 7750616 (slow allocation) | 8.65 (7.79-8.94) | 8.78 (8.43-9.19) | 8.27 (7.33-8.83) |
 
-So the loss is real (-1.7% and -1.1% on the two fast allocations; there 11 of 12
+So the loss is real (-1.7% and -1.1% on the two fast allocations; there all 12
 "after" runs are below the median "before" run) and small, and the receive queue size
 is not its cause. The earlier test that only *sent* control messages from the data EP
-(`ctl_on_data=1`) measured no cost, so it comes from receiving them there: the records
-and acks share the data CQs, and the provider's receive path, with the put immediates
-(a receive needs a copy out of the provider's bounce buffer under the rail domain's
-lock, which the CQ reads of the counting threads also take). Not investigated further.
+(`ctl_on_data=1`) measured no cost, so it comes from receiving them there. Likely (not
+verified): the records and acks now share the data CQs, and the provider's receive
+path, with the put immediates on the receive rails, under the same rail domain lock.
 
 Tests on this commit: unit 161/161 (the version-mismatch test is gone), device gtests
 22/22, atomic and fault gtests 3 x 10 (job 7749762).
