@@ -18,6 +18,10 @@ subdir('unit')
 
 subdir('gtest')
 
+if cuda_dep.found()
+    subdir('efa_proxy')
+endif
+
 # Standalone DOCA telemetry exporter test (self-contained; only built when the
 # DOCA telemetry headers are present). Kept out of the main gtest target so the
 # DOCA/CollectX gRPC stack is not linked into every test.
