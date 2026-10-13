@@ -1,0 +1,11 @@
+# rebase: tests of efa-cpu-proxy-v2 (host build), job 7868257
+[==========] 183 tests from 26 test suites ran. (631 ms total)
+[  PASSED  ] 180 tests.
+unit-exit=0
+[==========] 28 tests from 5 test suites ran. (118384 ms total)
+[  PASSED  ] 28 tests.
+gtest-exit=0
+[  PASSED  ] 10 tests.
+[  PASSED  ] 10 tests.
+[  PASSED  ] 10 tests.
+repeat-exit=0

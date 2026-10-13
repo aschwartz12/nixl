@@ -1,0 +1,5 @@
+# rebase: nixl_ep, base = efa-cpu-proxy-rxorder (1f3af509 code), new = efa-cpu-proxy-v2 (newnodmabuf: NIXL_LIBFABRIC_DMABUF_MAPPING=off)
+job=7868521 nodes=pool0-[0400,0417,0675,1085] gpus/node=4 plan=/lustre/fsw/portfolios/network/projects/network_research_advdev/users/aschwartz/efa/milestones/06-implement-optimize-nixl-efa/scripts/efa-cpu-proxy/ep-plans/static_16.json
+v2b-ep16-7868521.log === mode=base params=: per-run means ['11.16', '11.08', '11.18', '11.11', '11.17'] median 11.16 GB/s; runs without a result: 0
+v2b-ep16-7868521.log === mode=new params=: per-run means ['10.56', '10.66', '10.55', '10.44', '10.58'] median 10.56 GB/s; runs without a result: 0
+v2b-ep16-7868521.log === mode=newnodmabuf params=: per-run means ['10.71', '10.62', '10.79', '10.48', '10.58'] median 10.62 GB/s; runs without a result: 0

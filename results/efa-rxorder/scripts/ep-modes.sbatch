@@ -2,7 +2,9 @@
 # nixl_ep (static 8-rank plan) per ordering mode on the same two nodes, modes
 # interleaved within each repetition. Submit with --nodes=2 --gpus-per-node=4.
 # Env: REPS (default 3), EP_MODES (default: base sender receiver rxrail fenceoff),
-# BASE_INSTALL / STUDY_INSTALL, EP_PLAN, EP_STEP_MINUTES (per-run limit, default 5).
+# BASE_INSTALL / STUDY_INSTALL, BASE_SOURCE / STUDY_SOURCE (worktrees for the
+# Python package and elastic test; default nixl-efa-cpu-proxy), EP_PLAN,
+# EP_STEP_MINUTES (per-run limit, default 5).
 #SBATCH --account=network_research_advdev
 #SBATCH --partition=pool0
 #SBATCH --job-name=ep-modes
@@ -30,6 +32,7 @@ params_of() {
     basering | newring) echo "efa_proxy_rail_policy=ring" ;;
     newctl) echo "" ;; # + NIXL_EFA_PROXY_INJECT=ctl_on_data=1 (below)
     newrx64) echo "" ;; # + NIXL_EFA_PROXY_INJECT=msg_rx=64 (below)
+    newnodmabuf) echo "" ;; # + NIXL_LIBFABRIC_DMABUF_MAPPING=off (below)
     newpriv) echo "efa_proxy_tx_domain=private" ;;
     newprivring) echo "efa_proxy_tx_domain=private,efa_proxy_rail_policy=ring" ;;
     newflush) echo "efa_proxy_rx_flush=1" ;;
@@ -47,8 +50,10 @@ for rep in $(seq 1 "${REPS:-3}"); do
     for mode in ${EP_MODES:-base sender receiver rxrail fenceoff}; do
         if [[ ${mode} == base* ]]; then
             export INSTALL_DIR=${base_install}
+            [[ -n ${BASE_SOURCE:-} ]] && export SOURCE_DIR=${BASE_SOURCE}
         else
             export INSTALL_DIR=${study_install}
+            [[ -n ${STUDY_SOURCE:-} ]] && export SOURCE_DIR=${STUDY_SOURCE}
         fi
         export NIXL_EP_BACKEND_PARAMS=$(params_of "${mode}") EP_RUN_LABEL=${mode}-${rep}
         if [[ ${mode} == newctl ]]; then
@@ -57,6 +62,11 @@ for rep in $(seq 1 "${REPS:-3}"); do
             export NIXL_EFA_PROXY_INJECT=msg_rx=64 # small receive queues on the data EPs
         else
             unset NIXL_EFA_PROXY_INJECT
+        fi
+        if [[ ${mode} == newnodmabuf ]]; then
+            export NIXL_LIBFABRIC_DMABUF_MAPPING=off # VRAM registered without dmabuf
+        else
+            unset NIXL_LIBFABRIC_DMABUF_MAPPING
         fi
         echo "=== mode=${mode} rep=${rep} install=${INSTALL_DIR} params=${NIXL_EP_BACKEND_PARAMS}"
         # A hung run (e.g. a lost handshake) ends at the step limit, not the job's.

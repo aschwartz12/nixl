@@ -500,3 +500,86 @@ path, with the put immediates on the receive rails, under the same rail domain l
 
 Tests on this commit: unit 161/161 (the version-mismatch test is gone), device gtests
 22/22, atomic and fault gtests 3 x 10 (job 7749762).
+
+## Rebase onto the proxyTransport stack (branch efa-cpu-proxy-v2)
+
+The receiver-ordered proxy of this branch (control-EP-free, thread rail policy) was
+carried onto Tomer's `tdavidor/nixlbench-device-proxy` (d3cd8756: the proxy runtime
+behind `nixl::proxyTransport`, rebased on upstream main) as branch
+`efa-cpu-proxy-v2` (0d02ac9c proxy, 314c8a67 nixlbench). `RESULTS.md` and
+`results/` stay on this branch. Raw summaries: `results/efa-rxorder/data/raw/v2*`.
+
+**What the port needed.**
+
+- `nixlLibfabricProxy` implements `nixl::proxyTransport`; the runtime owns it.
+- Upstream identifies host-path senders by source address (#2294) and dropped the
+  agent index from the libfabric handshake. The proxy's 32-bit put immediate still
+  needs the sender's index at the target, so the handshake carries it as an optional
+  last field (`pidx`), sent by a peer that runs the proxy.
+- `parseProxyConfig()` again takes `allow_backend_progress_thread` (LIBFABRIC keeps
+  the engine progress thread); the plugin defines `NIXL_LIBFABRIC_DEVICE_PROXY`
+  (the base removed `HAVE_NIXL_DEVICE_API`, which compiled the proxy out silently).
+- The AV/CQ deadlock fix (0c253377) is upstream (#2308).
+- Tests: `common.h` treats `.cu` files as CUDA again (all device tests skipped as
+  "no GPU" otherwise); the ordering check launches a kernel with a device
+  `printf`/`assert` before its receiver spins. The new device API asserts, and a
+  process's first launch of such a kernel sets up the printf buffer, which waits for
+  every running kernel: the sender started only after the 60 s receiver timeout
+  (Nsight Systems: same context, separate streams, no host thread blocked).
+- nixl_ep: `get_from_pool()` for the container's pre-release PyTorch 2.10.
+
+Tests (job 7868257): unit 180/183 (3 upstream tracing tests skip), device gtests
+28/28, atomic and fault gtests 3 x 10.
+
+**nixlbench** gained `--backend=LIBFABRIC` in `--use_device_api=1
+--device_mode=proxy` (`--num_threads=N --device_channel_num=N`: N GPU groups on N
+proxy channels); the device API now needs only NIXL's device header, UCX's GPU
+device API only for UCX direct mode. Two nodes, one GPU each, VRAM -> VRAM WRITE,
+pairwise, median of 3 runs (jobs 7868259, 7868314):
+
+| Block | host, 1 thread | proxy, 1 channel | host, 4 threads | proxy, 4 channels |
+|---|---|---|---|---|
+| 4 KiB | 0.13 GB/s, 32.1 us | 0.10 GB/s, 39.6 us | 0.39 GB/s, 42.5 us | 0.37 GB/s, 44.2 us |
+| 64 KiB | 1.50 GB/s, 43.7 us | 1.27 GB/s, 51.6 us | 4.79 GB/s, 54.8 us | 4.60 GB/s, 56.9 us |
+| 1 MiB | 15.54 GB/s | 14.02 GB/s | 41.19 GB/s | 40.58 GB/s |
+| 8 MiB | 37.82 GB/s | 36.33 GB/s | 48.54 GB/s | 48.22 GB/s |
+| 64 MiB | 46.74 GB/s | 46.44 GB/s | 48.84 GB/s | 48.80 GB/s |
+
+- Line rate: a p5 GPU has 4 x 100 Gbit/s EFA rails (50 GB/s). The proxy reaches
+  48.8 GB/s (390 Gbit/s, 97-98%) from 8 MiB on 4 channels, as the host path does;
+  one channel reaches 46.4 GB/s at 64 MiB (puts >= 128 KiB are striped over the 4
+  rails).
+- Small blocks are latency-bound in nixlbench (one transfer in flight per thread or
+  group): the proxy adds ~8 us per transfer with one channel and ~2 us with four.
+- The first run's `dev4` (job 7868259) used one proxy channel for 4 groups
+  (nixlbench's default `--device_channel_num=1`); `nixlbench.sbatch` now passes N.
+
+**Micro-benchmark, this branch (1f3af509 code) vs efa-cpu-proxy-v2** (job 7868261,
+n=3): unchanged within noise. Ping-pong 59.5 vs 60.0 us, put+signal 8 B 50.4 vs
+50.1 us, pipelined 64 KiB x 4 channels 287.8 vs 287.4 Gbit/s, 1 MiB x 4 channels
+389.7 both, ordering check 59.7k vs 57.7k signals/s.
+
+**nixl_ep, this branch vs efa-cpu-proxy-v2** (5 runs each, modes interleaved;
+`newnodmabuf`: `NIXL_LIBFABRIC_DMABUF_MAPPING=off`):
+
+| nixl_ep (GB/s) | this branch | efa-cpu-proxy-v2 | v2, no dmabuf |
+|---|---|---|---|
+| 16 ranks, job 7868364 | 11.21 (10.99-11.32) | 10.68 (10.20-10.83), -4.7% | - |
+| 16 ranks, job 7868521 | 11.16 (11.08-11.18) | 10.56 (10.44-10.66), -5.4% | 10.62 (10.48-10.79) |
+| 8 ranks, job 7868363 | 8.30 (7.45-8.96) | 10.09 (9.48-10.25) | - |
+| 8 ranks, job 7868522 | 8.38 (8.29-8.59) | 10.16 (9.95-10.41) | 10.40 (10.02-10.56) |
+
+- 16 ranks: the rebased stack is ~5% slower on two allocations (every v2 run below
+  every run of this branch); dmabuf registration is not the cause.
+- 8 ranks: v2 is ~21% faster on two allocations, but this branch ran at ~8.3 GB/s
+  there against 13.8 GB/s on 2026-10-08 (jobs 7749972, 7750615), so these results
+  are not comparable; not explained yet.
+- The proxy code is unchanged apart from the interface port, so the difference lies
+  in the new stack (the runtime, nixl_ep on Tomer's branch, upstream libfabric
+  changes); not profiled yet (`NIXL_EFA_PROXY_PROFILE=1` at 16 ranks would show it).
+
+**Commands** (scripts in `results/efa-rxorder/scripts/`): nixlbench
+`nixlbench-build.sh` in the container after `ctr-build.sh`, then
+`INSTALL_DIR=<install> REPS=3 MODES="host1 host4 dev1 dev4" sbatch --nodes=2
+--gpus-per-node=1 nixlbench.sbatch` and `nixlbench_summarize.py <log>`; nixl_ep
+`BASE_SOURCE`/`STUDY_SOURCE` select each build's worktree in `ep-modes.sbatch`.
