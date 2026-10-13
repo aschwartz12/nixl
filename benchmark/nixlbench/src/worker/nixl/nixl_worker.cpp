@@ -159,6 +159,10 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
             backend_params["proxy_channel_count"] =
                 std::to_string(xferBenchConfig::device_channel_num);
             backend_params["proxy_max_peers"] = "1";
+            if (xferBenchConfig::device_proxy_threads > 0) {
+                backend_params["proxy_thread_count"] =
+                    std::to_string(xferBenchConfig::device_proxy_threads);
+            }
             // UCX host atomics need err-mode none.
             backend_params["ucx_error_handling_mode"] = "none";
             std::cout << "Device API mode: configuring " << xferBenchConfig::device_channel_num

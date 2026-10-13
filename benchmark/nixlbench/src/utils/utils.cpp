@@ -342,6 +342,10 @@ NB_ARG_STRING(device_mode,
               XFERBENCH_DEVICE_MODE_DIRECT,
               "Device API execution mode: direct (UCX GPU-initiated) or proxy (CPU proxy). "
               "Only used when --use_device_api is enabled.");
+NB_ARG_INT32(device_proxy_threads,
+             0,
+             "Number of CPU proxy threads draining the device channels, 0 for one per channel. "
+             "Only used with --device_mode=proxy.");
 
 #undef NB_ARG_INT32
 #undef NB_ARG_UINT32
@@ -428,6 +432,7 @@ bool xferBenchConfig::use_device_api = false;
 int xferBenchConfig::block_threads = 1;
 int xferBenchConfig::device_channel_num = 0;
 std::string xferBenchConfig::device_mode = XFERBENCH_DEVICE_MODE_DIRECT;
+int xferBenchConfig::device_proxy_threads = 0;
 
 static bool
 validateDeviceAPIConfig() {
@@ -454,6 +459,9 @@ validateDeviceAPIConfig() {
         return reject("device_mode must be direct or proxy");
     }
     if (proxy) {
+        if (xferBenchConfig::device_proxy_threads < 0) {
+            return reject("--device_proxy_threads must be >= 0");
+        }
         if (xferBenchConfig::progress_threads != 0) {
             return reject("--progress_threads is not supported with device_mode=proxy");
         }
@@ -787,6 +795,7 @@ xferBenchConfig::loadParams(void) {
     use_device_api = NB_ARG(use_device_api);
     device_channel_num = NB_ARG(device_channel_num);
     device_mode = NB_ARG(device_mode);
+    device_proxy_threads = NB_ARG(device_proxy_threads);
     if (use_device_api && (!validateDeviceAPIConfig() || !setupDeviceAPIConfig())) {
         return -1;
     }
@@ -1130,6 +1139,10 @@ xferBenchConfig::printConfig() {
         printOption("Device API channels (--device_channel_num=N)",
                     std::to_string(device_channel_num));
         printOption("Device API mode (--device_mode=[direct,proxy])", device_mode);
+        if (device_mode == XFERBENCH_DEVICE_MODE_PROXY) {
+            printOption("Device API proxy threads (--device_proxy_threads=N)",
+                        std::to_string(device_proxy_threads));
+        }
     }
     printSeparator('-');
     std::cout << std::endl;
