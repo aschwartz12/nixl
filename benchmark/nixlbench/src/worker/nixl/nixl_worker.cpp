@@ -206,6 +206,17 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
                   << rank << ", type " << name << ", hostname " << hostname << std::endl;
     } else if (0 == xferBenchConfig::backend.compare(XFERBENCH_BACKEND_LIBFABRIC)) {
         backend_params["num_threads"] = std::to_string(xferBenchConfig::progress_threads);
+        if (xferBenchConfig::use_device_api) {
+            // The device API over EFA runs only through the CPU proxy. Pairwise: each
+            // process talks to exactly one remote agent.
+            backend_params["device_proxy"] = "true";
+            backend_params["proxy_channel_count"] =
+                std::to_string(xferBenchConfig::device_channel_num);
+            backend_params["proxy_max_peers"] = "1";
+            std::cout << "Device API mode: configuring " << xferBenchConfig::device_channel_num
+                      << " CPU proxy channels for " << xferBenchConfig::deviceGroupNum()
+                      << " execution groups" << std::endl;
+        }
 
         if (gethostname(hostname, 256)) {
             std::cerr << "Failed to get hostname" << std::endl;
@@ -758,7 +769,7 @@ getVramDesc(int devid, size_t buffer_size, bool isInit) {
 /** Allocate @a nbytes of VRAM on @a devid with all bytes set to zero. */
 static std::optional<xferBenchIOV>
 allocVramValueZero(int devid, size_t nbytes) {
-#ifdef HAVE_UCX_GPU_DEVICE_API
+#ifdef NIXLBENCH_DEVICE_API
     if (neuronCoreCount() > 0) {
         return getVramDescNeuron(devid, nbytes, 0);
     }
@@ -1998,7 +2009,7 @@ execDeviceTransfer(nixlMemViewH local_mvh,
                    const bool collect_iteration_stats,
                    xferBenchStats &stats,
                    const std::atomic<int> *terminate_ptr = nullptr) {
-#ifdef HAVE_UCX_GPU_DEVICE_API
+#ifdef NIXLBENCH_DEVICE_API
     stats.clear();
     if (per_group_iter < 1) {
         std::cerr << "NIXL Device API requires at least one transfer iteration per group"
@@ -2117,7 +2128,7 @@ xferBenchNixlWorker::waitForDeviceCompletionCounter(const xferBenchIOV &counter_
                                                     uint64_t expected_value,
                                                     const char *phase,
                                                     const std::function<void()> &checkLiveness) {
-#ifdef HAVE_UCX_GPU_DEVICE_API
+#ifdef NIXLBENCH_DEVICE_API
     struct xferBenchDeviceCounters {
         uint64_t done;
         uint64_t error;
@@ -2164,7 +2175,7 @@ xferBenchNixlWorker::waitForDeviceCompletionCounter(const xferBenchIOV &counter_
 
 static void
 resetDeviceCounters(const xferBenchIOV &counter_iov) {
-#ifdef HAVE_UCX_GPU_DEVICE_API
+#ifdef NIXLBENCH_DEVICE_API
     CHECK_CUDA_ERROR(cudaSetDevice(counter_iov.devId), "Failed to set completion counter device");
     CHECK_CUDA_ERROR(cudaMemset(reinterpret_cast<void *>(counter_iov.addr), 0, kDeviceCounterBytes),
                      "Failed to reset completion counters in VRAM");
