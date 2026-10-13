@@ -65,6 +65,9 @@ constexpr const char *NIXL_HANDSHAKE_TAG_V1_IDX = "idx";
 constexpr const char *NIXL_HANDSHAKE_TAG_NAME = "name";
 constexpr const char *NIXL_HANDSHAKE_TAG_HAS_CONN = "has_conn";
 constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+// Last: the receiver's agent index at the sender (UINT32_MAX without the sender's device
+// proxy). The receiver's proxy puts it in the ring keys of its writes to the sender.
+constexpr const char *NIXL_HANDSHAKE_TAG_PROXY_IDX = "pidx";
 
 // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
 // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends

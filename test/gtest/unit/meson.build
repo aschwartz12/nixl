@@ -53,6 +53,11 @@ if is_variable('gds_backend_interface') or is_variable(
     unit_test_deps += [gds_unit_test_dep]
 endif
 
+if enabled_plugins.get('LIBFABRIC') and libfabric_dep.found()
+    subdir('libfabric')
+    unit_test_deps += [libfabric_unit_test_dep]
+endif
+
 cpp = meson.get_compiler('cpp')
 azure_storage_blobs = cpp.find_library('azure-storage-blobs', required: false)
 if enabled_plugins.get('AZURE_BLOB') and azure_storage_blobs.found()

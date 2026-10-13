@@ -54,6 +54,14 @@ typedef hipDevice_t CUdevice;
 // Forward declarations
 class nixlLibfabricEngine;
 class nixlLibfabricPostThreadPool;
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+class nixlLibfabricProxy;
+namespace nixl {
+class deviceOps;
+class proxyRuntime;
+struct proxyConfig;
+} // namespace nixl
+#endif
 
 #ifdef HAVE_CUDA
 /** CUDA context management for libfabric backend */
@@ -96,6 +104,7 @@ private:
 public:
     nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1) {}
     friend class nixlLibfabricEngine;
+    friend class nixlLibfabricProxy;
 };
 
 /** Public metadata for remote memory access */
@@ -115,6 +124,7 @@ public:
     derive_remote_selected_endpoints();
 
     friend class nixlLibfabricEngine;
+    friend class nixlLibfabricProxy;
 };
 
 /** Request handle for multi-rail transfer operations */
@@ -277,6 +287,8 @@ private:
     std::unordered_set<std::string> pending_inbound_handshakes_;
     // Same, for handshakes rejected for their protocol version: agent name -> peer's version.
     std::unordered_map<std::string, uint16_t> pending_rejected_handshakes_;
+    // Same, for the agent index a buffered handshake carried for the device proxy.
+    std::unordered_map<std::string, uint32_t> pending_proxy_indexes_;
     std::mutex pending_handshake_mutex_;
 
     // Connection management helpers
@@ -697,6 +709,40 @@ public:
      */
     void
     checkPendingNotifications();
+
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    /* Device API: GPU-initiated put/atomicAdd through the engine-owned CPU proxy. */
+    nixl_status_t
+    prepMemView(const nixl_remote_meta_dlist_t &dlist,
+                nixlMemViewH &mvh,
+                const nixl_opt_b_args_t *opt_args = nullptr) const override;
+
+    nixl_status_t
+    prepMemView(const nixl_meta_dlist_t &dlist,
+                nixlMemViewH &mvh,
+                const nixl_opt_b_args_t *opt_args = nullptr) const override;
+
+    void
+    releaseMemView(nixlMemViewH mem_view) const override;
+
+private:
+    friend class nixlLibfabricProxy;
+
+    /** Create and start the proxy runtime; called at the end of construction. */
+    nixl_status_t
+    setupProxyRuntime(const nixl::proxyConfig &config);
+
+    template<typename DlistT>
+    nixl_status_t
+    prepMemViewImpl(const DlistT &dlist, nixlMemViewH &mvh) const;
+
+    // Enabled with the device_proxy backend param. proxyRuntime_ owns the proxy;
+    // proxy_ points to it while the runtime runs (nullptr otherwise).
+    std::unique_ptr<nixl::proxyRuntime> proxyRuntime_;
+    nixlLibfabricProxy *proxy_ = nullptr;
+    // The device operations proxyRuntime_ was built on.
+    nixl::deviceOps *deviceOps_ = nullptr;
+#endif
 };
 
 #endif

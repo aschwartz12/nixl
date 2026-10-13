@@ -155,6 +155,60 @@ The following table summarizes briefly the plugin's runtime configuration:
 | split_batch_size | Minimum descriptor count before postXfer uses the posting thread pool | Backend init param | integer | 1024, 4096 | Default 1024; only applies when num_threads is greater than 0 |
 | dmabuf_mapping | Selects the CUDA dmabuf mapping type a VRAM_SEG registration exports for an EFA rail | Backend init param or `NIXL_LIBFABRIC_DMABUF_MAPPING` environment variable | auto, pcie, default, off | auto, off | Default auto takes a per-NIC verdict from the PCIe-path topology; pcie and default force the GPU's PCIe aperture (BAR1) or the platform default mapping on every device; off registers by virtual address. Only applies to CUDA device memory on an EFA provider whose fabric carries libfabric API 1.20 or newer |
 
+## Device API (GPU-initiated transfers through the CPU proxy)
+
+With the `device_proxy=true` backend parameter, the engine owns a device proxy
+runtime, so GPU kernels can call the NIXL device API (`put()`, `atomicAdd()`) on
+memory views prepared by this backend. Requires a CUDA-enabled build. The design,
+wire encoding and thread/endpoint mapping are described in
+[EFA_PROXY_RECEIVER_ORDERING.md](EFA_PROXY_RECEIVER_ORDERING.md).
+
+- **Parameters** (shared with the UCX proxy): `device_proxy`, `proxy_channel_count`,
+  `proxy_thread_count`, `proxy_max_peers`, `proxy_ring_depth` (at most 256 here),
+  `proxy_pthr_delay_us`. EFA-specific: `efa_proxy_idle_poll_us` (default 2: how often a proxy thread with nothing to do
+  polls its CQs; `0` polls on every pass); `efa_proxy_rx_flush` = `1`/`0` forces the
+  GPUDirect RDMA flush before target-side adds on/off (default as NCCL: only before
+  Hopper and on aarch64 hosts). Use one proxy thread per EFA device of the GPU; a
+  buffer's rails are split among the proxy threads for unstriped puts.
+- **Endpoints:** each proxy thread has a data EP (own CQ and AV) on every rail, in the
+  rail's domain (registrations and keys are shared with the host path); there is no
+  separate control EP. The rail domains are `FI_THREAD_SAFE` while the proxy is on.
+  Each of the GPU's EFA devices is polled for incoming puts and atomicAdd records by
+  exactly one proxy thread (rail `i` of the GPU by thread `i % threads`); a thread's
+  control messages leave from its EP on its home rail (one of the GPU's), where its
+  acks arrive.
+- **put():** one RDMA write per fragment (striped across rails at or above the striping
+  threshold) with `FI_DELIVERY_COMPLETE` and 32 bits of remote CQ data (ring key and
+  epoch) to the data EP of the target thread that receives on the destination rail. It
+  completes once placed at the target.
+- **atomicAdd():** sent at once to the target's data EP on the rail where the sending
+  thread's small puts land, so the target thread that counts those puts applies the
+  ring's adds, in order (GDRCopy, CUDA copies without GDRCopy, or a CPU atomic for host
+  memory; a VRAM counter's update holds a lock stripe, since adds from other senders
+  may arrive on other threads), each only after the target counted every earlier put
+  of the ring, then acks; the atomicAdd completes on the ack. VRAM registrations
+  are mapped through GDRCopy when registered, so a first add to a counter is not slow. Ordering is per
+  ring and target. The add is a read-modify-write: the GPU must not write a counter
+  while remote adds to it can arrive; counters must be 8-byte aligned and registered.
+- **Failures:** a failed put or atomicAdd fails the later atomicAdds of its ring (at
+  the sender, and the target drops them through a ring abort) until the ring's memory
+  views are released. An atomicAdd waiting for its ack fails once its ring completed
+  nothing for 10 s. Known gap: a command the runtime cannot resolve (for example a
+  stale memory view) never reaches the backend, so it does not fail later atomicAdds
+  on its ring.
+- **Connection info:** a proxy section (each thread's home data EP, receive rails and
+  their data EPs, incarnation; no version, a job's nodes run the same build) is
+  appended after the rail endpoints. Peers without it still get puts and host
+  transfers, but no atomicAdd. A
+  ring's first operation towards a peer waits for the engine handshake with it.
+- **nixlbench:** `--backend=LIBFABRIC --use_device_api=1 --device_mode=proxy` with
+  `--num_threads=N --device_channel_num=N` runs N GPU groups over N proxy channels
+  (VRAM to VRAM WRITE, pairwise).
+- **Diagnostics:** `NIXL_EFA_PROXY_PROFILE=1` prints per-stage latency histograms, per
+  thread busy time and the cost of receiving puts to stderr at shutdown.
+  `NIXL_EFA_PROXY_INJECT` (tests only; ignored in `NDEBUG` builds) injects
+  back-pressure, failed posts or completions, or disables GDRCopy.
+
 ## API Reference
 
 ### Core Classes
