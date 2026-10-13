@@ -190,7 +190,10 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
             exit(EXIT_FAILURE);
         }
 
-        if (!device_proxy) {
+        if (device_proxy) {
+            // The proxy derives its worker count from channels x peers.
+            backend_params.erase("num_workers");
+        } else {
             backend_params["num_workers"] = std::to_string(xferBenchConfig::num_threads + 1);
         }
 
