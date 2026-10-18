@@ -583,3 +583,50 @@ n=3): unchanged within noise. Ping-pong 59.5 vs 60.0 us, put+signal 8 B 50.4 vs
 `INSTALL_DIR=<install> REPS=3 MODES="host1 host4 dev1 dev4" sbatch --nodes=2
 --gpus-per-node=1 nixlbench.sbatch` and `nixlbench_summarize.py <log>`; nixl_ep
 `BASE_SOURCE`/`STUDY_SOURCE` select each build's worktree in `ep-modes.sbatch`.
+
+## nixlbench: LIBFABRIC proxy vs LIBFABRIC host vs UCX proxy and host over EFA
+
+Same two nodes, one GPU each, VRAM -> VRAM WRITE, pairwise, modes interleaved, median
+of 3 runs (job 7901422; build efa-cpu-proxy-v2 10e76f75 with the LIBFABRIC and UCX
+plugins; raw: `results/efa-rxorder/data/raw/v2u-nixlbench-7901422.txt`). UCX runs on
+EFA through its SRD transport (UCX 1.20, HPC-X in the NGC container).
+
+| 1 thread / 1 channel | LIBFABRIC host | LIBFABRIC proxy | UCX host | UCX proxy |
+|---|---|---|---|---|
+| 4 KiB latency | 32.9 us | 40.9 us | 32.1 us | 39.0 us |
+| 64 KiB | 1.47 GB/s | 1.24 GB/s | 1.67 GB/s | 1.42 GB/s |
+| 1 MiB | 15.3 GB/s | 13.8 GB/s | 16.0 GB/s | 14.5 GB/s |
+| 64 MiB | 46.7 GB/s | 46.5 GB/s | 46.8 GB/s | 46.6 GB/s |
+
+| 4 threads / 4 channels | LIBFABRIC host | LIBFABRIC proxy | UCX host | UCX proxy |
+|---|---|---|---|---|
+| 4 KiB latency | 42.3 us | 45.2 us | 34.6 us | 42.5 us |
+| 64 KiB | 4.80 GB/s | 4.53 GB/s | 6.20 GB/s | 5.15 GB/s |
+| 128 KiB | 8.50 GB/s | 7.86 GB/s | 11.35 GB/s | 9.60 GB/s |
+| 1 MiB | 41.7 GB/s | 39.8 GB/s | 46.4 GB/s | 44.5 GB/s |
+| 8-64 MiB | 48.6-48.8 GB/s | 48.2-48.8 GB/s | 48.6-48.9 GB/s | 47.8-48.8 GB/s |
+
+- All four reach line rate (48.8 GB/s, 97-98% of 400 Gbit/s) with 4 threads or
+  channels; with one, 46.5-46.8 GB/s at 64 MiB.
+- The CPU proxy costs ~7-8 us per transfer over its backend's host path, on both.
+- UCX is ahead at small and mid sizes: its proxy reaches 9.6 vs 7.9 GB/s at 128 KiB
+  and 42.5 vs 45.2 us at 4 KiB on 4 channels. The LIBFABRIC host path's latency
+  grows with threads (33 -> 42 us from 1 to 4), UCX's barely (32 -> 35 us): contention
+  in the LIBFABRIC host path, not investigated.
+
+What UCX needed on EFA:
+
+- `UCX_NET_DEVICES` = the 4 EFA devices on the GPU's PCIe switch (with all 32, UCX
+  picked distant devices: 8 GB/s) and `UCX_MAX_RMA_RAILS=4` (puts use 2 rails by
+  default: 24.4 GB/s); `nixlbench.sbatch` sets both.
+- SRD has no remote atomics: UCX applies `atomicAdd` on the target CPU
+  (`ucp_atomic_req_handler`), which faults on a VRAM counter. nixlbench's UCX proxy
+  modes keep the completion counter in host memory (`--device_counter_host=1`, one
+  add per group per phase), which needed the proxy memview manager to accept DRAM
+  remote views (56ab9d23). So the UCX proxy over EFA cannot signal a counter in GPU
+  memory (as nixl_ep does); the LIBFABRIC proxy applies such adds with GDRCopy.
+- nixlbench's proxy mode left the UCX plugin's default `num_workers=1`, which the UCX
+  proxy rejects (10e76f75).
+
+nixlbench measures puts plus one final signal per group; it does not exercise
+per-put signals that must follow their data, where the receiver ordering matters.
