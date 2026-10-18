@@ -125,7 +125,8 @@ nixl_status_t
 proxyMemViewManager::prepRemote(const nixl_remote_meta_dlist_t &dlist,
                                 const std::vector<void *> &direct_ptrs,
                                 proxy_view_handle_t &out) {
-    if (dlist.getType() != VRAM_SEG) {
+    // Host memory too: a counter in host memory takes atomics that the target CPU applies.
+    if (dlist.getType() != VRAM_SEG && dlist.getType() != DRAM_SEG) {
         NIXL_ERROR << "proxyMemViewManager::prepRemote: unsupported mem type " << dlist.getType();
         return NIXL_ERR_INVALID_PARAM;
     }
