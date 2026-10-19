@@ -55,6 +55,13 @@ namespace {
 
 /** Upper bound on rails a single put is striped over. */
 constexpr size_t kMaxStripes = 8;
+/**
+ * Puts below this size are striped only over the calling thread's share of the rails
+ * (the set unstripedRail() rotates over), so they take no other proxy thread's rail domain
+ * lock. From this size on, one rail's wire time outweighs that contention and puts are
+ * striped over all the buffer's rails. With one proxy thread the share is every rail.
+ */
+constexpr size_t kOwnRailStripeMax = 256 << 10;
 /** Posted receive buffers for control messages per data EP that receives them. */
 constexpr size_t kRecvPoolSize = 1024;
 /** Control send buffers (acks, ring aborts) per proxy thread; more wait in a queue. */
@@ -1521,17 +1528,29 @@ nixlLibfabricProxy::submitPut(Thread &th,
         return NIXL_SUCCESS;
     }
 
-    // Same rule as the host path: stripe at or above the threshold over >1 rail.
-    // Smaller puts go to one rail each (unstripedRail()).
-    const bool stripe = size >= engine_.striping_threshold_ && lrails.size() > 1;
-    const size_t nfrag = stripe ? std::min(lrails.size(), kMaxStripes) : 1;
+    // Stripe at or above the threshold over >1 rail, as the host path does, but below
+    // kOwnRailStripeMax only over this thread's rails. Smaller puts go to one rail each
+    // (unstripedRail()).
+    std::array<size_t, kMaxStripes> own{};
+    size_t nown = 0;
+    if (size < kOwnRailStripeMax && threads_ >= lrails.size()) {
+        own[nown++] = th.id % lrails.size();
+    } else {
+        const size_t step = size < kOwnRailStripeMax ? threads_ : 1;
+        for (size_t i = step == 1 ? 0 : th.id; i < lrails.size() && nown < kMaxStripes;
+             i += step) {
+            own[nown++] = i;
+        }
+    }
+    const bool stripe = size >= engine_.striping_threshold_ && nown > 1;
+    const size_t nfrag = stripe ? nown : 1;
     const size_t chunk = size / nfrag;
     const size_t first = stripe ? 0 : unstripedRail(th, ring, lrails.size());
 
     // Resolve every destination before anything is counted or posted.
     std::array<PendingPost, kMaxStripes> posts{};
     for (size_t i = 0; i < nfrag; ++i) {
-        const size_t sel = first + i;
+        const size_t sel = stripe ? own[i] : first;
         const size_t rail = lrails[sel];
         size_t rep = reps[sel % reps.size()];
         const size_t off = stripe ? i * chunk : 0;
