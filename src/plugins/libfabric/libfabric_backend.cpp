@@ -2426,12 +2426,36 @@ nixlLibfabricEngine::setupProxyRuntime(const nixl::proxyConfig &config) {
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
+    // Unless proxy_thread_count is set, run at most one proxy thread per EFA device next to
+    // the GPU: rail domains are FI_THREAD_SAFE, one lock each, and two threads posting on
+    // one rail contend for it (8 channels on 4 rails: 4 threads post 4-16 KiB puts 1.3-1.35x
+    // faster than 8). Channels share threads as channel % threads.
+    nixl::proxyConfig effective = config;
+    std::string explicit_threads;
+    if (getInitParam(std::string(nixl::kProxyThreadCountParam), explicit_threads) != NIXL_SUCCESS) {
+        size_t gpu_rails = 0;
+#ifdef HAVE_CUDA
+        int dev = 0;
+        char bus_id[32] = {};
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), dev) == cudaSuccess) {
+            gpu_rails = rail_manager_.railsForAccelerator(bus_id).size();
+        }
+#endif
+        if (gpu_rails > 0 && effective.thread_count > gpu_rails) {
+            NIXL_INFO << "Device proxy: " << gpu_rails << " thread(s) for "
+                      << effective.channel_count << " channel(s), one per EFA device of the GPU";
+            effective.thread_count = static_cast<uint32_t>(gpu_rails);
+        }
+    }
+
     // The runtime owns the transport; the engine keeps a pointer to it for
     // registrations and connection info until it shuts the runtime down.
     auto transport = std::make_unique<nixlLibfabricProxy>(*this);
     nixlLibfabricProxy *proxy = transport.get();
     std::unique_ptr<nixl::proxyRuntime> runtime;
-    nixl_status_t status = nixl::proxyRuntime::create(std::move(transport), config, runtime, *ops);
+    nixl_status_t status =
+        nixl::proxyRuntime::create(std::move(transport), effective, runtime, *ops);
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Device proxy runtime creation failed: " << status;
         return status;
@@ -2459,7 +2483,7 @@ nixlLibfabricEngine::setupProxyRuntime(const nixl::proxyConfig &config) {
     }
 
     NIXL_INFO << "Engine-owned device proxy enabled: " << config.channel_count << " channel(s), "
-              << config.effectiveThreadCount() << " thread(s), max_peers=" << config.max_peers
+              << effective.effectiveThreadCount() << " thread(s), max_peers=" << effective.max_peers
               << ", ring_depth=" << config.ring_depth;
     return NIXL_SUCCESS;
 }
