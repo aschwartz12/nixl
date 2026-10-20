@@ -346,6 +346,11 @@ NB_ARG_INT32(device_proxy_threads,
              0,
              "Number of CPU proxy threads draining the device channels, 0 for one per channel. "
              "Only used with --device_mode=proxy.");
+NB_ARG_BOOL(device_counter_host,
+            false,
+            "Keep the target's Device API completion counter in pinned host memory, for "
+            "transports that apply remote atomics on the target CPU (UCX over EFA SRD). "
+            "Only used when --use_device_api is enabled.");
 
 #undef NB_ARG_INT32
 #undef NB_ARG_UINT32
@@ -433,6 +438,7 @@ int xferBenchConfig::block_threads = 1;
 int xferBenchConfig::device_channel_num = 0;
 std::string xferBenchConfig::device_mode = XFERBENCH_DEVICE_MODE_DIRECT;
 int xferBenchConfig::device_proxy_threads = 0;
+bool xferBenchConfig::device_counter_host = false;
 
 static bool
 validateDeviceAPIConfig() {
@@ -805,6 +811,7 @@ xferBenchConfig::loadParams(void) {
         return -1;
     }
     use_device_api = NB_ARG(use_device_api);
+    device_counter_host = NB_ARG(device_counter_host);
     device_channel_num = NB_ARG(device_channel_num);
     device_mode = NB_ARG(device_mode);
     device_proxy_threads = NB_ARG(device_proxy_threads);
@@ -1155,6 +1162,8 @@ xferBenchConfig::printConfig() {
             printOption("Device API proxy threads (--device_proxy_threads=N)",
                         std::to_string(device_proxy_threads));
         }
+        printOption("Device API counter in host memory (--device_counter_host=[0,1])",
+                    std::to_string(device_counter_host));
     }
     printSeparator('-');
     std::cout << std::endl;

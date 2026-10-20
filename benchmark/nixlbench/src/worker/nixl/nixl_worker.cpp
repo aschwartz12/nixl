@@ -789,6 +789,17 @@ allocVramValueZero(int devid, size_t nbytes) {
 std::optional<xferBenchIOV>
 xferBenchNixlWorker::initCompletionCounterVram() {
     int counter_dev = rt->getRank() - xferBenchConfig::num_initiator_dev; // pairwise SG only
+#ifdef NIXLBENCH_DEVICE_API
+    if (xferBenchConfig::device_counter_host) {
+        // Pinned host memory, still described as VRAM (the memory view is VRAM): the
+        // backend detects the memory type when it registers it.
+        void *counter = nullptr;
+        CHECK_CUDA_ERROR(cudaHostAlloc(&counter, kDeviceCounterBytes, cudaHostAllocPortable),
+                         "Failed to allocate the completion counter in host memory");
+        std::memset(counter, 0, kDeviceCounterBytes);
+        return xferBenchIOV(reinterpret_cast<uintptr_t>(counter), kDeviceCounterBytes, counter_dev);
+    }
+#endif
     return allocVramValueZero(counter_dev, kDeviceCounterBytes);
 }
 
@@ -1305,7 +1316,8 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
             std::exit(EXIT_FAILURE);
         }
         std::vector<xferBenchIOV> cc_list{completion_counter_iov.value()};
-        nixl_reg_dlist_t cc_desc = iovListToNixlRegDlist(cc_list, VRAM_SEG);
+        nixl_reg_dlist_t cc_desc = iovListToNixlRegDlist(
+            cc_list, xferBenchConfig::device_counter_host ? DRAM_SEG : VRAM_SEG);
         CHECK_NIXL_ERROR(agent->registerMem(cc_desc, &opt_args),
                          "registerMem failed for completion counter");
     }
@@ -1325,12 +1337,20 @@ xferBenchNixlWorker::deallocateMemory(std::vector<std::vector<xferBenchIOV>> &io
     if (completion_counter_iov.has_value()) {
         if (isTarget()) {
             std::vector<xferBenchIOV> cc_list{completion_counter_iov.value()};
-            nixl_reg_dlist_t cc_desc = iovListToNixlRegDlist(cc_list, VRAM_SEG);
+            nixl_reg_dlist_t cc_desc = iovListToNixlRegDlist(
+            cc_list, xferBenchConfig::device_counter_host ? DRAM_SEG : VRAM_SEG);
             nixl_opt_args_t opt_args;
             opt_args.backends.push_back(backend_engine);
             CHECK_NIXL_ERROR(agent->deregisterMem(cc_desc, &opt_args),
                              "deregisterMem failed for completion counter");
-            cleanupBasicDescVram(completion_counter_iov.value());
+#ifdef NIXLBENCH_DEVICE_API
+            if (xferBenchConfig::device_counter_host) {
+                cudaFreeHost(reinterpret_cast<void *>(completion_counter_iov->addr));
+            } else
+#endif
+            {
+                cleanupBasicDescVram(completion_counter_iov.value());
+            }
         }
         completion_counter_iov.reset();
     }
@@ -2002,6 +2022,7 @@ execTransfer(nixlAgent *agent,
 static int
 execDeviceTransfer(nixlMemViewH local_mvh,
                    nixlMemViewH remote_mvh,
+                   nixlMemViewH device_counter_mvh,
                    const int per_group_iter,
                    const int block_threads,
                    size_t num_regions,
@@ -2056,8 +2077,10 @@ execDeviceTransfer(nixlMemViewH local_mvh,
     params.remoteMvh = remote_mvh;
     params.numRegions = num_regions;
     // prepareGPURemoteView() flattens num_groups lists of num_regions descriptors and appends the
-    // counter buffer, so the counter sits right after the last data descriptor.
-    params.counterIndex = num_regions * num_groups;
+    // counter buffer, so the counter sits right after the last data descriptor; a host-memory
+    // counter has its own view.
+    params.counterMvh = device_counter_mvh != nullptr ? device_counter_mvh : remote_mvh;
+    params.counterIndex = device_counter_mvh != nullptr ? 0 : num_regions * num_groups;
     params.regionSize = region_size;
     params.numIterations = static_cast<uint64_t>(per_group_iter);
     params.channelNum = static_cast<unsigned>(xferBenchConfig::device_channel_num);
@@ -2111,6 +2134,7 @@ execDeviceTransfer(nixlMemViewH local_mvh,
 #else
     (void)local_mvh;
     (void)remote_mvh;
+    (void)device_counter_mvh;
     (void)per_group_iter;
     (void)block_threads;
     (void)num_regions;
@@ -2140,11 +2164,17 @@ xferBenchNixlWorker::waitForDeviceCompletionCounter(const xferBenchIOV &counter_
     CHECK_CUDA_ERROR(cudaSetDevice(counter_iov.devId), "Failed to set completion counter device");
     while (!signaled()) {
         xferBenchDeviceCounters counters{};
-        CHECK_CUDA_ERROR(cudaMemcpy(&counters,
-                                    reinterpret_cast<const void *>(counter_iov.addr),
-                                    sizeof(counters),
-                                    cudaMemcpyDeviceToHost),
-                         "Failed to read completion counters from VRAM");
+        if (xferBenchConfig::device_counter_host) {
+            const auto *host = reinterpret_cast<const uint64_t *>(counter_iov.addr);
+            counters.done = __atomic_load_n(&host[0], __ATOMIC_ACQUIRE);
+            counters.error = __atomic_load_n(&host[1], __ATOMIC_ACQUIRE);
+        } else {
+            CHECK_CUDA_ERROR(cudaMemcpy(&counters,
+                                        reinterpret_cast<const void *>(counter_iov.addr),
+                                        sizeof(counters),
+                                        cudaMemcpyDeviceToHost),
+                             "Failed to read completion counters from VRAM");
+        }
         if (counters.error > 0) {
             std::cerr << "NIXL Device API: " << phase << " failed: remote error counter is "
                       << counters.error << std::endl;
@@ -2176,6 +2206,10 @@ xferBenchNixlWorker::waitForDeviceCompletionCounter(const xferBenchIOV &counter_
 static void
 resetDeviceCounters(const xferBenchIOV &counter_iov) {
 #ifdef NIXLBENCH_DEVICE_API
+    if (xferBenchConfig::device_counter_host) {
+        std::memset(reinterpret_cast<void *>(counter_iov.addr), 0, kDeviceCounterBytes);
+        return;
+    }
     CHECK_CUDA_ERROR(cudaSetDevice(counter_iov.devId), "Failed to set completion counter device");
     CHECK_CUDA_ERROR(cudaMemset(reinterpret_cast<void *>(counter_iov.addr), 0, kDeviceCounterBytes),
                      "Failed to reset completion counters in VRAM");
@@ -2211,6 +2245,7 @@ xferBenchNixlWorker::transfer(size_t block_size,
     nixlMemViewH local_mvh = nullptr;
     nixlMemViewH remote_mvh = nullptr;
     auto gpu_view_guard = make_scope_guard([this, &local_mvh, &remote_mvh] {
+        releaseMemView(device_counter_mvh);
         releaseMemView(remote_mvh);
         releaseMemView(local_mvh);
     });
@@ -2242,6 +2277,7 @@ xferBenchNixlWorker::transfer(size_t block_size,
         if (xferBenchConfig::use_device_api) {
             ret = execDeviceTransfer(local_mvh,
                                      remote_mvh,
+                                     device_counter_mvh,
                                      skip,
                                      xferBenchConfig::block_threads,
                                      num_regions,
@@ -2271,6 +2307,7 @@ xferBenchNixlWorker::transfer(size_t block_size,
     if (xferBenchConfig::use_device_api) {
         ret = execDeviceTransfer(local_mvh,
                                  remote_mvh,
+                                 device_counter_mvh,
                                  num_iter,
                                  xferBenchConfig::block_threads,
                                  num_regions,
@@ -2421,7 +2458,14 @@ xferBenchNixlWorker::prepareGPURemoteView(
                                     completion_counter_iov.value().len,
                                     static_cast<uint64_t>(completion_counter_iov.value().devId),
                                     remote_agent_name};
-    remote_list.addDesc(remoteDesc);
+    if (xferBenchConfig::device_counter_host) {
+        nixl_remote_dlist_t counter_list(DRAM_SEG);
+        counter_list.addDesc(remoteDesc);
+        CHECK_NIXL_ERROR(agent->prepMemView(counter_list, device_counter_mvh),
+                         "prepMemView on the remote counter view failed");
+    } else {
+        remote_list.addDesc(remoteDesc);
+    }
     nixlMemViewH remote_mvh = nullptr;
     CHECK_NIXL_ERROR(agent->prepMemView(remote_list, remote_mvh),
                      "prepMemView on remote view failed");

@@ -247,6 +247,7 @@ public:
     static int device_channel_num;
     static std::string device_mode;
     static int device_proxy_threads;
+    static bool device_counter_host;
 
     /* Number of independent groups Device API kernel runs with. */
     static int

@@ -26,15 +26,16 @@
  * Every group in the launched block transfers @a numIterations times.
  * The block as a whole performs @c numIterations * num_groups list transfers.
  *
- * Each group signals independently using @c nixlAtomicAdd on @c { remoteMvh, counterIndex, offset }
+ * Each group signals independently using @c nixlAtomicAdd on @c { counterMvh, counterIndex, offset }
  * over channel @c group_id%channelNum to add @a numIterations to the done counter.
  * Duration outputs contain @c numIterations * num_groups entries in iteration-major order.
  */
 struct nixlbenchDeviceXferParams {
     nixlMemViewH localMvh; ///< Local memory view from prepMemView
     nixlMemViewH remoteMvh; ///< Remote memory view from prepMemView
+    nixlMemViewH counterMvh; ///< View holding the counter: remoteMvh, or its own (host memory)
     size_t numRegions; ///< Data region count (puts)
-    size_t counterIndex; ///< Index of counter buffer (= numRegions * num_groups)
+    size_t counterIndex; ///< Counter's index in counterMvh (numRegions * num_groups, or 0)
     size_t regionSize; ///< Bytes per region for this transfer pattern
     uint64_t numIterations; ///< Per-group number of complete region-list transfers
     unsigned channelNum; ///< Logical channels shared by groups using group_id % channelNum

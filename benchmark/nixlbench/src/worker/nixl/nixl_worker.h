@@ -90,6 +90,8 @@ class xferBenchNixlWorker: public xferBenchWorker {
         getFileOffset(size_t current_offset, size_t max_offset_in_blocks, size_t block_size);
         void
         releaseMemView(nixlMemViewH &mvh);
+        // With --device_counter_host: the remote counter's own view (DRAM), else nullptr.
+        nixlMemViewH device_counter_mvh = nullptr;
         nixlMemViewH
         prepareGPULocalView(const std::vector<std::vector<xferBenchIOV>> &local_iov_lists);
         nixlMemViewH
