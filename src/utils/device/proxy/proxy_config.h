@@ -70,12 +70,17 @@ struct proxyConfig {
 /**
  * @brief Parse the device proxy backend parameters.
  * @param[out] config Parsed configuration; unchanged on failure.
+ * @param allow_backend_progress_thread Set by backends whose proxy threads use transport
+ *        resources separate from the ones the backend progress thread drives, so both may run.
  * @retval NIXL_ERR_INVALID_PARAM Unknown proxy key, invalid value, or tuning without
  *         device_proxy=true.
- * @retval NIXL_ERR_NOT_ALLOWED device_proxy=true with the backend progress thread.
+ * @retval NIXL_ERR_NOT_ALLOWED device_proxy=true with the backend progress thread, unless
+ *         allowed.
  */
 [[nodiscard]] nixl_status_t
-parseProxyConfig(const nixlBackendInitParams &init_params, proxyConfig &config) noexcept;
+parseProxyConfig(const nixlBackendInitParams &init_params,
+                 proxyConfig &config,
+                 bool allow_backend_progress_thread = false) noexcept;
 
 } // namespace nixl
 
