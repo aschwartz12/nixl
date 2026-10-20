@@ -25,13 +25,16 @@
 namespace {
 
 nixl_status_t
-parse(nixl_b_params_t params, nixl::proxyConfig &config, bool enable_prog_th = false) {
+parse(nixl_b_params_t params,
+      nixl::proxyConfig &config,
+      bool enable_prog_th = false,
+      bool allow_prog_th = false) {
     nixlBackendInitParams init_params;
     init_params.localAgent = "test-agent";
     init_params.type = "UCX";
     init_params.customParams = &params;
     init_params.enableProgTh = enable_prog_th;
-    return nixl::parseProxyConfig(init_params, config);
+    return nixl::parseProxyConfig(init_params, config, allow_prog_th);
 }
 
 TEST(ProxyConfigTest, AcceptsParameters) {
@@ -94,6 +97,12 @@ TEST(ProxyConfigTest, RejectsParameters) {
         EXPECT_EQ(parse(row.params, config, row.enable_prog_th), row.expected) << row.name;
         EXPECT_EQ(config.channel_count, 7u) << row.name << ": config written on failure";
     }
+}
+
+TEST(ProxyConfigTest, BackendMayKeepItsProgressThread) {
+    nixl::proxyConfig config;
+    ASSERT_EQ(parse({{"device_proxy", "true"}}, config, true, true), NIXL_SUCCESS);
+    EXPECT_TRUE(config.enabled);
 }
 
 } // namespace

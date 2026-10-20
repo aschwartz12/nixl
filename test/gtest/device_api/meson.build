@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Device API test utilities and sources
+# Device API test utilities and sources. Built whenever CUDA is available: the
+# backend is a test parameter, cases whose plugin is not loaded skip at runtime,
+# and the UCX direct-mode cases also skip without UCX's GPU device API.
 device_api_inc_dirs = include_directories('.')
 
 device_api_sources = [
+    'proxy_ordering_test.cu',
     'single_write_test.cu',
     'utils.cu'
 ]
