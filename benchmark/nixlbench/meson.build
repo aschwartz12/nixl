@@ -237,28 +237,31 @@ else
         required: false)
 endif
 
-if not ucx_dep.found()
-    message('UCX GPU Device API is unavailable because UCX was not found.')
-elif not cuda_available
-    message('UCX GPU Device API is unavailable because CUDA is unavailable.')
+# The NIXL device API (nixlPut/nixlAtomicAdd) needs CUDA >= 12.8 and nvcc. UCX's GPU-side
+# device API is needed only for UCX direct mode; the CPU proxy (UCX or LIBFABRIC) runs without.
+nixl_device_api_available = false
+if not cuda_available
+    message('NIXL Device API is unavailable because CUDA is unavailable.')
 elif not nvcc_prog.found()
-    message('UCX GPU Device API is unavailable because nvcc was not found.')
+    message('NIXL Device API is unavailable because nvcc was not found.')
 elif nvshmem_available
-    message('UCX GPU Device API is unavailable because the NVSHMEM build path is enabled.')
+    message('NIXL Device API is unavailable because the NVSHMEM build path is enabled.')
 else
     add_languages('cuda', native: false)
     add_project_arguments('-std=c++20', language: 'cuda')
     cuda = meson.get_compiler('cuda')
     if not cuda.version().version_compare('>=12.8')
         message(
-            'UCX GPU Device API is unavailable because CUDA ' +
+            'NIXL Device API is unavailable because CUDA ' +
             cuda.version() + ' is older than 12.8.')
     else
         if cuda.version().version_compare('>=12.9') and cuda.version().version_compare('<12.10')
             ucx_device_cuda_args += ['-D_LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE']
             message('Applying CUDA 12.9 atomic storage flag')
         endif
-        doca_gpunetio_dep = dependency('doca-gpunetio', required: false)
+        if ucx_dep.found()
+            doca_gpunetio_dep = dependency('doca-gpunetio', required: false)
+        endif
         if ucx_device_cuda_arch_list == 'auto'
             ucx_device_cuda_arch_list = '80,86,89,90,100,103,120'
         endif
@@ -283,49 +286,57 @@ else
             selected_cuda_archs += ['sm_' + cuda_arch]
         endforeach
         if selected_cuda_archs.length() == 0
-            error('No CUDA targets selected for UCX device kernels')
+            error('No CUDA targets selected for device kernels')
         endif
         nvcc_ptx_arch = 'compute_' + nvcc_ptx_arch_num.to_string()
         ucx_device_cuda_args += [
             '-gencode=arch=' + nvcc_ptx_arch + ',code=' + nvcc_ptx_arch,
         ]
         message(
-            'UCX device kernel CUDA targets: ' +
+            'Device kernel CUDA targets: ' +
             ', '.join(selected_cuda_archs) + ' + ' + nvcc_ptx_arch)
 
-        have_gpu_side = cuda.compiles(
-            '''
-            #include <ucp/api/device/ucp_device_impl.h>
-            int main() { return 0; }
-            ''',
-            dependencies: [ucx_dep, doca_gpunetio_dep],
-            args: ucx_device_cuda_args,
-            name: 'UCX GPU-side Device API')
-
-        have_nixl_device_api = false
-        if have_gpu_side
-            have_nixl_device_api = cuda.compiles(
+        device_deps = []
+        have_gpu_side = false
+        if ucx_dep.found()
+            device_deps = [ucx_dep, doca_gpunetio_dep]
+            have_gpu_side = cuda.compiles(
                 '''
-                #include <gpu/nixl_device.cuh>
+                #include <ucp/api/device/ucp_device_impl.h>
                 int main() { return 0; }
                 ''',
-                dependencies: [ucx_dep, doca_gpunetio_dep],
-                args: ['-I' + nixl_inc] + ucx_device_cuda_args,
-                name: 'NIXL Device API')
+                dependencies: device_deps,
+                args: ucx_device_cuda_args,
+                name: 'UCX GPU-side Device API')
         endif
 
-        if have_gpu_side and have_nixl_device_api
-            message('UCX Device API is ready for nixlbench.')
-            ucx_gpu_device_api_available = true
-            add_project_arguments(
-                '-DHAVE_UCX_GPU_DEVICE_API',
-                language: ['cpp', 'cuda'])
+        have_nixl_device_api = cuda.compiles(
+            '''
+            #include <gpu/nixl_device.cuh>
+            int main() { return 0; }
+            ''',
+            dependencies: device_deps,
+            args: ['-I' + nixl_inc] + ucx_device_cuda_args,
+            name: 'NIXL Device API')
+
+        if have_nixl_device_api
+            message('NIXL Device API is ready for nixlbench.')
+            nixl_device_api_available = true
+            add_project_arguments('-DNIXLBENCH_DEVICE_API', language: ['cpp', 'cuda'])
+            if have_gpu_side
+                message('UCX Device API (direct mode) is ready for nixlbench.')
+                ucx_gpu_device_api_available = true
+                add_project_arguments(
+                    '-DHAVE_UCX_GPU_DEVICE_API',
+                    language: ['cpp', 'cuda'])
+            endif
         endif
     endif
 endif
 
 summary(
     {
+        'NIXL Device API': nixl_device_api_available,
         'UCX GPU Device API': ucx_gpu_device_api_available,
         'nvcc available': nvcc_prog.found(),
         'DOCA GPUNETIO found': doca_gpunetio_dep.found(),
@@ -368,7 +379,7 @@ if cuda_available
 elif rocm_available
     deps += [rocm_dep]
 endif
-if ucx_gpu_device_api_available
+if nixl_device_api_available
     deps += [nixlbench_kernels_dep]
 endif
 if nvshmem_available
