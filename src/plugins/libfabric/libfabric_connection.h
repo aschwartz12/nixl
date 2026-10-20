@@ -18,6 +18,7 @@
 #ifndef NIXL_SRC_PLUGINS_LIBFABRIC_LIBFABRIC_CONNECTION_H
 #define NIXL_SRC_PLUGINS_LIBFABRIC_LIBFABRIC_CONNECTION_H
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -44,6 +45,20 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     std::unordered_map<size_t, std::vector<fi_addr_t>>
         rail_remote_addr_list_; // Rail libfabric addresses. key=rail id.
     std::vector<char *> src_ep_names_; // Rail endpoint names
+    // Remote engine rail EP names, kept so device-proxy threads can insert
+    // them into their own AVs (puts target any EP in the remote rail's domain).
+    std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> remote_rail_ep_names_;
+    // The peer's device proxy (empty if it published none): its threads' data EPs
+    // on their home rails (acks), the rails it receives puts, atomicAdd records and
+    // ring aborts on with the data EP receiving on each, and the incarnation they
+    // belong to.
+    std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> remote_proxy_ep_names_;
+    std::vector<uint32_t> remote_proxy_data_rails_;
+    std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> remote_proxy_data_ep_names_;
+    uint64_t remote_proxy_incarnation_ = 0;
+    // Our agent index at the peer, from its handshake when it runs the device proxy
+    // (UINT32_MAX otherwise); written under handshake_mutex_ before handshake_received_.
+    uint32_t local_agent_idx_at_remote_ = UINT32_MAX;
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
     // Set once the peer holds our endpoints in its AV, so it can attribute our traffic.

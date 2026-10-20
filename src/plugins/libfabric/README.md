@@ -155,6 +155,26 @@ The following table summarizes briefly the plugin's runtime configuration:
 | split_batch_size | Minimum descriptor count before postXfer uses the posting thread pool | Backend init param | integer | 1024, 4096 | Default 1024; only applies when num_threads is greater than 0 |
 | dmabuf_mapping | Selects the CUDA dmabuf mapping type a VRAM_SEG registration exports for an EFA rail | Backend init param or `NIXL_LIBFABRIC_DMABUF_MAPPING` environment variable | auto, pcie, default, off | auto, off | Default auto takes a per-NIC verdict from the PCIe-path topology; pcie and default force the GPU's PCIe aperture (BAR1) or the platform default mapping on every device; off registers by virtual address. Only applies to CUDA device memory on an EFA provider whose fabric carries libfabric API 1.20 or newer |
 
+## Device API (GPU-initiated transfers through the CPU proxy)
+
+With the `device_proxy=true` backend parameter, the engine owns a device proxy
+runtime, so GPU kernels can call the NIXL device API (`put()`, `atomicAdd()`) on
+memory views prepared by this backend. Requires a CUDA-enabled build.
+
+- **Parameters** (shared with the UCX proxy): `device_proxy`, `proxy_channel_count`,
+  `proxy_thread_count` (default: one per EFA device of the GPU), `proxy_max_peers`,
+  `proxy_ring_depth` (at most 256 here), `proxy_pthr_delay_us`. EFA-specific:
+  `efa_proxy_idle_poll_us` (default 2: how often an idle proxy thread polls its CQs;
+  `0` polls on every pass) and `efa_proxy_rx_flush` = `1`/`0` (force the GPUDirect
+  RDMA flush before target-side adds on/off; default as NCCL).
+- **put():** RDMA writes with remote CQ data (ring key and epoch) to the proxy data
+  EP of the target; completes once placed at the target.
+- **atomicAdd():** sent as a message; the target's proxy applies it only after it
+  counted every earlier put of the ring, then acks. Ordering is per ring and target.
+- **nixlbench:** `--backend=LIBFABRIC --use_device_api=1 --device_mode=proxy`.
+- **Tests:** `NIXL_EFA_PROXY_INJECT` (ignored in `NDEBUG` builds) injects
+  back-pressure, failed posts or completions, or disables GDRCopy.
+
 ## API Reference
 
 ### Core Classes

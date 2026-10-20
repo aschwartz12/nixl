@@ -19,12 +19,31 @@
 #include "serdes/serdes.h"
 #include "common/nixl_log.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <thread>
 
 /****************************************
  * Peer-id handshake protocol
  *****************************************/
+
+namespace {
+// Tests only (ignored in NDEBUG builds): NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS stalls
+// handleHandshake() for an unknown peer after its lookup, before buffering (under the
+// connection lock), where a concurrent createAgentConnection() used to interleave.
+void
+testHandshakeDelay() {
+#ifndef NDEBUG
+    const char *env = std::getenv("NIXL_LIBFABRIC_TEST_HANDSHAKE_DELAY_MS");
+    if (env != nullptr && *env != '\0') {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(env)));
+    }
+#endif
+}
+} // namespace
 
 // Wire format for a handshake message body (serialized via nixlSerDes):
 //   "ver"      : uint16 = NIXL_LIBFABRIC_PROTO_VERSION of the sender
@@ -34,6 +53,9 @@
 //   "conn"     : string = serialized connection info (only if has_conn == 1).
 //                 Included when the peer hasn't sent us a handshake yet,
 //                 meaning they likely don't have our endpoint addresses.
+//   "pidx"     : uint32 = the receiver's agent index here when we run the device proxy
+//                 (UINT32_MAX otherwise): its proxy names itself with it in the ring keys
+//                 of its writes to us. Last, so peers that do not read it are unaffected.
 //
 // Protocol version 1 sent "idx" (the agent index for imm_data) instead of "ver". It is not
 // interoperable with version 2, so the version check rejects it at connection setup.
@@ -65,6 +87,13 @@ nixlLibfabricEngine::sendHandshakeTo(const nixlLibfabricConnection &conn) const 
     if (has_conn) {
         sd.addStr(NIXL_HANDSHAKE_TAG_CONN, piggybacked_conn_info);
     }
+    uint32_t proxy_idx = UINT32_MAX;
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    if (proxy_ != nullptr) {
+        proxy_idx = static_cast<uint32_t>(conn.agent_index_);
+    }
+#endif
+    sd.addBuf(NIXL_HANDSHAKE_TAG_PROXY_IDX, &proxy_idx, sizeof(proxy_idx));
     std::string payload = sd.exportStr();
 
     if (payload.size() > NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE) {
@@ -171,28 +200,42 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
         }
     }
 
+    uint32_t proxy_idx = UINT32_MAX; // UINT32_MAX: the peer runs no device proxy
+    if (sd.getBuf(NIXL_HANDSHAKE_TAG_PROXY_IDX, &proxy_idx, sizeof(proxy_idx)) != NIXL_SUCCESS) {
+        proxy_idx = UINT32_MAX;
+    }
+
     NIXL_DEBUG << "Received handshake from peer '" << peer_agent_name
                << "' proto_ver=" << peer_proto_ver
                << " piggybacked_conn_info_len=" << piggybacked_conn_info.size();
 
-    // Process the decoded handshake.
+    // Process the decoded handshake. Look the peer up and, if it is unknown, buffer
+    // the handshake under the lock createAgentConnection() holds while it drains the
+    // buffer: with separate critical sections, a connection created in between would
+    // never see this handshake, and the first connection to the peer would time out.
     std::shared_ptr<nixlLibfabricConnection> conn;
     {
         std::lock_guard<std::mutex> lock(connection_state_mutex_);
         auto it = connections_.find(peer_agent_name);
         if (it != connections_.end() && it->second) {
             conn = it->second;
+            // Applied under the lock too: a reconnect could otherwise replace the
+            // connection between the lookup and here, and the new one would wait
+            // for a handshake that went to the old one.
+            std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
+            conn->local_agent_idx_at_remote_ = proxy_idx;
+            conn->handshake_received_.store(true, std::memory_order_release);
+        } else {
+            testHandshakeDelay();
+            std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
+            pending_inbound_handshakes_.insert(peer_agent_name);
+            pending_proxy_indexes_[peer_agent_name] = proxy_idx;
+            NIXL_DEBUG << "Buffered handshake from not-yet-known peer '" << peer_agent_name
+                       << "'; will apply on createAgentConnection";
         }
     }
 
     if (!conn) {
-        {
-            std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
-            pending_inbound_handshakes_.insert(peer_agent_name);
-            NIXL_DEBUG << "Buffered handshake from not-yet-known peer '" << peer_agent_name
-                       << "'; will apply on createAgentConnection";
-        }
-
         if (piggybacked_conn_info.empty()) {
             // Code should not reach here. When piggybacked_conn_info is empty, the handshake
             // source should have received a handshake message from this side, which means
@@ -212,10 +255,6 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
                     // buffered handshake as part of connection creation.
         }
     } else {
-        {
-            std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
-            conn->handshake_received_.store(true, std::memory_order_release);
-        }
         conn->handshake_cv_.notify_all();
         NIXL_INFO << "Handshake stored: peer='" << peer_agent_name
                   << "' — it has our endpoints in its address vectors, so it can attribute "

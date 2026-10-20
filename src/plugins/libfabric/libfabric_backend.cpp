@@ -17,6 +17,13 @@
  */
 
 #include "libfabric_backend.h"
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+#include "libfabric_proxy.h"
+#include "device/device_memview.h"
+#include "device/device_ops.h"
+#include "device/proxy/proxy_config.h"
+#include "device/proxy/proxy_runtime.h"
+#endif
 #include "serdes/serdes.h"
 #include "common/configuration.h"
 #include "common/nixl_log.h"
@@ -50,6 +57,23 @@ void
 storeFirstError(std::atomic<int> &status, nixl_status_t new_status) {
     int expected = static_cast<int>(NIXL_SUCCESS);
     status.compare_exchange_strong(expected, static_cast<int>(new_status));
+}
+
+/**
+ * Threading model for the rail domains. Device-proxy threads poll their own CQs
+ * in these domains concurrently with the engine, but the efa provider (at least
+ * through libfabric 2.1) progresses domain-wide queues on every CQ read and
+ * posts on other endpoints from there, locking only in FI_THREAD_SAFE domains.
+ */
+enum fi_threading
+railDomainThreading(const nixlBackendInitParams *init_params) {
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    nixl::proxyConfig config;
+    if (nixl::parseProxyConfig(*init_params, config, true) == NIXL_SUCCESS && config.enabled) {
+        return FI_THREAD_SAFE;
+    }
+#endif
+    return FI_THREAD_COMPLETION;
 }
 
 } // namespace
@@ -480,7 +504,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     : nixlBackendEngine(init_params),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
+      rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, railDomainThreading(init_params)),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
       post_split_batch_size_(NIXL_LIBFABRIC_DEFAULT_POST_SPLIT_BATCH_SIZE),
       runtime_(FI_HMEM_SYSTEM) {
@@ -616,6 +640,24 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
         } else {
             NIXL_DEBUG << "Progress thread disabled, using manual progress in checkXfer/getNotifs";
         }
+
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+        // Engine-owned device proxy (device_proxy=true): started last, once the
+        // rails and the self-connection exist, because its callbacks use them.
+        // Proxy threads own separate EPs and CQs, so the engine progress thread
+        // may keep serving the rails (handshakes, notifications, host transfers).
+        nixl::proxyConfig proxy_config;
+        if (nixl::parseProxyConfig(*init_params, proxy_config, true) != NIXL_SUCCESS) {
+            throw std::runtime_error("invalid device proxy configuration");
+        }
+        if (proxy_config.enabled) {
+            const nixl_status_t proxy_status = setupProxyRuntime(proxy_config);
+            if (proxy_status != NIXL_SUCCESS) {
+                throw std::runtime_error("failed to start device proxy runtime: status=" +
+                                         std::to_string(proxy_status));
+            }
+        }
+#endif
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "Failed to initialize libfabric backend: " << e.what();
@@ -648,6 +690,16 @@ nixlLibfabricEngine::initPostThreadPool() {
 }
 
 nixlLibfabricEngine::~nixlLibfabricEngine() {
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    if (proxyRuntime_) {
+        // Join the proxy threads first; shutdown() closes the proxy EPs, which
+        // live in the rails' domains and must go before the rails do. The runtime
+        // destroys the proxy.
+        proxy_ = nullptr;
+        proxyRuntime_->shutdown();
+        proxyRuntime_.reset();
+    }
+#endif
     NIXL_DEBUG
         << "Destructor starting, stopping all threads FIRST to prevent timing report interruption";
 
@@ -690,6 +742,11 @@ nixlLibfabricEngine::getConnInfo(std::string &str) const {
         NIXL_ERROR << "Rail Manager serializeConnectionInfo failed";
         return status;
     }
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    if (proxy_) {
+        str = nixlLibfabricProxy::joinConnInfo(str, proxy_->serializeConnInfo());
+    }
+#endif
 
     NIXL_DEBUG << "Rail Manager serialized connection info for " << rail_manager_.getNumRails()
                << " rails, total size=" << str.length();
@@ -715,9 +772,15 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
 
     // Use Rail Manager's connection SerDes method with "dest" prefix
     // (remote is sending us their endpoints as "dest")
+    // A peer with the device proxy appends its proxy section after the rail blob.
+    std::string engine_info = remote_conn_info;
+    std::string proxy_info;
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    nixlLibfabricProxy::splitConnInfo(remote_conn_info, engine_info, proxy_info);
+#endif
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints;
     nixl_status_t status =
-        rail_manager_.deserializeConnectionInfo("dest", remote_conn_info, data_endpoints);
+        rail_manager_.deserializeConnectionInfo("dest", engine_info, data_endpoints);
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Rail Manager deserializeConnectionInfo failed with status: " << status;
         return status;
@@ -739,6 +802,14 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
             NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
             return conn_status;
         }
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+        if (!proxy_info.empty() &&
+            nixlLibfabricProxy::parseConnInfo(proxy_info, *connections_[remote_agent]) !=
+                NIXL_SUCCESS) {
+            NIXL_WARN << "Ignoring incompatible or malformed device proxy info from "
+                      << remote_agent << "; atomicAdd to it will be unavailable";
+        }
+#endif
 
         if (remote_agent != localAgent) {
             conn_for_handshake = connections_[remote_agent];
@@ -836,6 +907,7 @@ nixlLibfabricEngine::createAgentConnection(
     agent_names_.push_back(agent_name);
 
     conn->rail_remote_addr_list_.reserve(rail_manager_.getNumRails());
+    conn->remote_rail_ep_names_ = data_rail_endpoints;
 
     // Process all rails in one operation
     // The AV insert must happen before sendHandshakeTo() further down the call chain:
@@ -860,10 +932,16 @@ nixlLibfabricEngine::createAgentConnection(
     // them locally.
     if (agent_name != localAgent) {
         bool buffered = false;
+        uint32_t proxy_idx = UINT32_MAX;
         std::optional<uint16_t> rejected_ver;
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
             buffered = (pending_inbound_handshakes_.erase(agent_name) > 0);
+            if (auto idx = pending_proxy_indexes_.find(agent_name);
+                idx != pending_proxy_indexes_.end()) {
+                proxy_idx = idx->second;
+                pending_proxy_indexes_.erase(idx);
+            }
             auto rejected = pending_rejected_handshakes_.find(agent_name);
             if (rejected != pending_rejected_handshakes_.end()) {
                 rejected_ver = rejected->second;
@@ -878,6 +956,7 @@ nixlLibfabricEngine::createAgentConnection(
         if (buffered) {
             {
                 std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
+                conn->local_agent_idx_at_remote_ = proxy_idx;
                 conn->handshake_received_.store(true, std::memory_order_release);
             }
             conn->handshake_cv_.notify_all();
@@ -1113,6 +1192,11 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     NIXL_DEBUG << "Successfully registered memory on " << priv->selected_rails_.size()
                << " rails for " << (nixl_mem == VRAM_SEG ? "accelerator" : "CPU") << " device "
                << mem.devId;
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    if (proxy_) {
+        proxy_->onRegister(mem.addr, mem.len, nixl_mem == VRAM_SEG, static_cast<int>(mem.devId));
+    }
+#endif
     out = priv.release();
     return NIXL_SUCCESS;
 }
@@ -1120,6 +1204,11 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 nixl_status_t
 nixlLibfabricEngine::deregisterMem(nixlBackendMD *meta) {
     auto *priv = static_cast<nixlLibfabricPrivateMetadata *>(meta);
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    if (proxy_) {
+        proxy_->onDeregister(reinterpret_cast<uintptr_t>(priv->buffer_), priv->length_);
+    }
+#endif
     // Use Rail Manager for centralized memory deregistration
     nixl_status_t status =
         rail_manager_.deregisterMemory(priv->selected_rails_, priv->rail_mr_list_);
@@ -2323,3 +2412,131 @@ nixlLibfabricEngine::cleanup() {
 
     NIXL_DEBUG << "Cleanup all resources complete";
 }
+
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+/****************************************
+ * Device API: engine-owned CPU proxy over EFA
+ *****************************************/
+
+nixl_status_t
+nixlLibfabricEngine::setupProxyRuntime(const nixl::proxyConfig &config) {
+    nixl::deviceOps *ops = nixl::getDeviceOps();
+    if (ops == nullptr) {
+        NIXL_ERROR << "Device proxy needs a device operations implementation; none is loaded";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    // Unless proxy_thread_count is set, run at most one proxy thread per EFA device next to
+    // the GPU: rail domains are FI_THREAD_SAFE, one lock each, and two threads posting on
+    // one rail contend for it. Channels share threads as channel % threads.
+    nixl::proxyConfig effective = config;
+    std::string explicit_threads;
+    if (getInitParam(std::string(nixl::kProxyThreadCountParam), explicit_threads) != NIXL_SUCCESS) {
+        size_t gpu_rails = 0;
+#ifdef HAVE_CUDA
+        int dev = 0;
+        char bus_id[32] = {};
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), dev) == cudaSuccess) {
+            gpu_rails = rail_manager_.railsForAccelerator(bus_id).size();
+        }
+#endif
+        if (gpu_rails > 0 && effective.thread_count > gpu_rails) {
+            NIXL_INFO << "Device proxy: " << gpu_rails << " thread(s) for "
+                      << effective.channel_count << " channel(s), one per EFA device of the GPU";
+            effective.thread_count = static_cast<uint32_t>(gpu_rails);
+        }
+    }
+
+    // The runtime owns the transport; the engine keeps a pointer to it for
+    // registrations and connection info until it shuts the runtime down.
+    auto transport = std::make_unique<nixlLibfabricProxy>(*this);
+    nixlLibfabricProxy *proxy = transport.get();
+    std::unique_ptr<nixl::proxyRuntime> runtime;
+    nixl_status_t status =
+        nixl::proxyRuntime::create(std::move(transport), effective, runtime, *ops);
+    if (status != NIXL_SUCCESS) {
+        NIXL_ERROR << "Device proxy runtime creation failed: " << status;
+        return status;
+    }
+
+    status = runtime->startWorkers();
+    if (status != NIXL_SUCCESS) {
+        NIXL_ERROR << "Device proxy runtime failed to start workers: " << status;
+        runtime->shutdown();
+        return status;
+    }
+    proxyRuntime_ = std::move(runtime);
+    proxy_ = proxy;
+    deviceOps_ = ops;
+
+    // Publish our own proxy endpoints on the self-connection too, so a GPU can
+    // atomicAdd to a counter of its own agent through the same path.
+    {
+        std::lock_guard<std::mutex> lock(connection_state_mutex_);
+        auto it = connections_.find(localAgent);
+        if (it != connections_.end()) {
+            static_cast<void>(
+                nixlLibfabricProxy::parseConnInfo(proxy_->serializeConnInfo(), *it->second));
+        }
+    }
+
+    NIXL_INFO << "Engine-owned device proxy enabled: " << config.channel_count << " channel(s), "
+              << effective.effectiveThreadCount() << " thread(s), max_peers=" << effective.max_peers
+              << ", ring_depth=" << config.ring_depth;
+    return NIXL_SUCCESS;
+}
+
+template<typename DlistT>
+nixl_status_t
+nixlLibfabricEngine::prepMemViewImpl(const DlistT &dlist, nixlMemViewH &mvh) const {
+    if (!proxyRuntime_) {
+        NIXL_ERROR << "The libfabric device API requires the device_proxy=true backend param";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    nixlMemViewH backend_mvh = nullptr;
+    nixl_status_t status = proxyRuntime_->prepMemView(dlist, &backend_mvh);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    status = nixl::deviceMemViewAllocate(
+        *deviceOps_, nixl_device_exec_mode_t::PROXY, backend_mvh, mvh);
+    if (status != NIXL_SUCCESS) {
+        static_cast<void>(proxyRuntime_->releaseMemView(backend_mvh));
+    }
+    return status;
+}
+
+nixl_status_t
+nixlLibfabricEngine::prepMemView(const nixl_remote_meta_dlist_t &dlist,
+                                 nixlMemViewH &mvh,
+                                 const nixl_opt_b_args_t *) const {
+    return prepMemViewImpl(dlist, mvh);
+}
+
+nixl_status_t
+nixlLibfabricEngine::prepMemView(const nixl_meta_dlist_t &dlist,
+                                 nixlMemViewH &mvh,
+                                 const nixl_opt_b_args_t *) const {
+    return prepMemViewImpl(dlist, mvh);
+}
+
+void
+nixlLibfabricEngine::releaseMemView(nixlMemViewH mem_view) const {
+    if (mem_view == nullptr || deviceOps_ == nullptr) {
+        return;
+    }
+    nixlMemViewH backend_mvh = nullptr;
+    if (nixl::deviceMemViewGetBackend(*deviceOps_, mem_view, backend_mvh) != NIXL_SUCCESS) {
+        NIXL_FATAL << "Failed to read proxy memory view before retirement";
+    }
+    if (proxyRuntime_) {
+        const nixl_status_t status = proxyRuntime_->releaseMemView(backend_mvh);
+        if (status != NIXL_SUCCESS) {
+            NIXL_FATAL << "Failed to release proxy memory view " << mem_view << " with status "
+                       << status;
+        }
+    }
+    nixl::deviceMemViewFree(*deviceOps_, mem_view);
+}
+#endif
