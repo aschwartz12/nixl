@@ -54,6 +54,13 @@ typedef hipDevice_t CUdevice;
 // Forward declarations
 class nixlLibfabricEngine;
 class nixlLibfabricPostThreadPool;
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+class nixlLibfabricProxy;
+namespace nixl {
+class deviceOps;
+class proxyRuntime;
+} // namespace nixl
+#endif
 
 #ifdef HAVE_CUDA
 /** CUDA context management for libfabric backend */
@@ -96,6 +103,7 @@ private:
 public:
     nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1) {}
     friend class nixlLibfabricEngine;
+    friend class nixlLibfabricProxy;
 };
 
 /** Public metadata for remote memory access */
@@ -115,6 +123,7 @@ public:
     derive_remote_selected_endpoints();
 
     friend class nixlLibfabricEngine;
+    friend class nixlLibfabricProxy;
 };
 
 /** Request handle for multi-rail transfer operations */
@@ -697,6 +706,33 @@ public:
      */
     void
     checkPendingNotifications();
+
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+    /* Device API: GPU-initiated put/atomicAdd through a CPU proxy on the engine's rails. */
+    nixl_status_t
+    prepMemView(const nixl_remote_meta_dlist_t &dlist,
+                nixlMemViewH &mvh,
+                const nixl_opt_b_args_t *opt_args = nullptr) const override;
+
+    nixl_status_t
+    prepMemView(const nixl_meta_dlist_t &dlist,
+                nixlMemViewH &mvh,
+                const nixl_opt_b_args_t *opt_args = nullptr) const override;
+
+    void
+    releaseMemView(nixlMemViewH mem_view) const override;
+
+private:
+    friend class nixlLibfabricProxy;
+
+    template<typename DlistT>
+    nixl_status_t
+    prepMemViewImpl(const DlistT &dlist, nixlMemViewH &mvh) const;
+
+    std::unique_ptr<nixl::proxyRuntime> proxyRuntime_; // with device_proxy=true; owns proxy_
+    nixlLibfabricProxy *proxy_ = nullptr;
+    nixl::deviceOps *deviceOps_ = nullptr;
+#endif
 };
 
 #endif

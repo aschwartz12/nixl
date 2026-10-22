@@ -193,9 +193,20 @@ private:
     buildNumaDistanceMap();
 };
 
-nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
+namespace {
+/** A WRITE's immediate data: the caller's, or the engine's for a transfer. */
+uint64_t
+writeImmData(uint64_t imm_data, uint16_t xfer_id) {
+    return imm_data != 0 ?
+        imm_data :
+        NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, LibfabricUtils::getNextSeqId());
+}
+} // namespace
+
+nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold, bool allow_shm)
     : striping_threshold_(striping_threshold),
-      runtime_(FI_HMEM_CUDA) {
+      runtime_(FI_HMEM_CUDA),
+      allow_shm_(allow_shm) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
                << " bytes";
 
@@ -380,7 +391,7 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
 
         for (size_t i = 0; i < num_rails_; ++i) {
             rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i), runtime_));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), runtime_, allow_shm_));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -420,7 +431,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     size_t base_offset,
     bool apply_fi_more,
     int device_id,
-    bool is_cuda_vram) {
+    bool is_cuda_vram,
+    uint64_t imm_data) {
     // Initialize output parameter
     submitted_count_out = 0;
 
@@ -484,17 +496,15 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                  device_id,
                                  is_cuda_vram,
                                  rail_id,
-                                 req);
+                                 req,
+                                 imm_data);
             status = NIXL_SUCCESS;
         } else if (op_type == nixlLibfabricReq::WRITE) {
             // Direct post (PT OFF path)
-            // Generate next SEQ_ID for this specific write operation
-            uint8_t seq_id = LibfabricUtils::getNextSeqId();
-            uint64_t imm_data = NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id);
             status = rails_[rail_id]->postWrite(req->local_addr,
                                                 req->chunk_size,
                                                 fi_mr_desc(req->local_mr),
-                                                imm_data,
+                                                writeImmData(imm_data, xfer_id),
                                                 dest_addrs.at(rail_id)[remote_ep_id],
                                                 req->remote_addr,
                                                 req->remote_key,
@@ -579,17 +589,14 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                      device_id,
                                      is_cuda_vram,
                                      rail_id,
-                                     req);
+                                     req,
+                                     imm_data);
                 status = NIXL_SUCCESS;
             } else if (op_type == nixlLibfabricReq::WRITE) {
-                // Generate next SEQ_ID for this specific transfer operation
-                uint8_t seq_id = LibfabricUtils::getNextSeqId();
-                uint64_t imm_data =
-                    NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id);
                 status = rails_[rail_id]->postWrite(req->local_addr,
                                                     req->chunk_size,
                                                     fi_mr_desc(req->local_mr),
-                                                    imm_data,
+                                                    writeImmData(imm_data, xfer_id),
                                                     dest_addrs.at(rail_id)[remote_ep_id],
                                                     req->remote_addr,
                                                     req->remote_key,
@@ -633,11 +640,9 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                int device_id,
                                                bool is_cuda_vram,
                                                size_t rail_id,
-                                               nixlLibfabricReq *req) {
-    uint8_t seq_id = (op_type == nixlLibfabricReq::WRITE) ? LibfabricUtils::getNextSeqId() : 0;
-    uint64_t imm_data = (op_type == nixlLibfabricReq::WRITE) ?
-        NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id) :
-        0;
+                                               nixlLibfabricReq *req,
+                                               uint64_t imm_data) {
+    imm_data = (op_type == nixlLibfabricReq::WRITE) ? writeImmData(imm_data, xfer_id) : 0;
     nixlLibfabricPostRequest pr{};
     pr.type = (op_type == nixlLibfabricReq::WRITE) ? nixlLibfabricPostRequest::WRITE :
                                                      nixlLibfabricPostRequest::READ;

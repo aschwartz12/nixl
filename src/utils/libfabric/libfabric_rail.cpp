@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <stack>
@@ -407,14 +408,16 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
-                                     enum fi_hmem_iface runtime)
+                                     enum fi_hmem_iface runtime,
+                                     bool allow_shm)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
       control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
       data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
       provider_supports_hmem_(false),
-      runtime_(runtime) {
+      runtime_(runtime),
+      allow_shm_(allow_shm) {
     // Initialize all pointers to nullptr
     info = nullptr;
     fabric = nullptr;
@@ -580,9 +583,9 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("fi_ep_bind av failed for rail " + std::to_string(rail_id));
         }
 
-        // On runtimes the shm provider cannot serve, disable it so that intra-node
-        // transfers stay on the EFA path.
-        if (!shmProviderSupportsRuntime(runtime_)) {
+        // On runtimes the shm provider cannot serve, or when asked to, disable it so that
+        // intra-node transfers stay on the EFA path.
+        if (!allow_shm_ || !shmProviderSupportsRuntime(runtime_)) {
             const bool shared_memory_permitted = false;
             ret = fi_setopt(&endpoint->fid,
                             FI_OPT_ENDPOINT,
@@ -596,8 +599,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                     "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED failed for rail " +
                     std::to_string(rail_id));
             }
-            NIXL_INFO << "Disabled shared memory provider for rail " << rail_id
-                      << " (runtime has no shm support)";
+            NIXL_INFO << "Disabled shared memory provider for rail " << rail_id;
         }
 
         if (provider_name == "efa") {
@@ -796,6 +798,11 @@ nixlLibfabricRail::initPostQueue(size_t post_queue_size) {
 void
 nixlLibfabricRail::setXferIdCallback(std::function<void(uint64_t, uint32_t)> callback) {
     xferIdCallback = callback;
+}
+
+void
+nixlLibfabricRail::setProxyCallback(ProxyCallback callback) {
+    proxyCallback = std::move(callback);
 }
 
 void
@@ -1058,8 +1065,9 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
 
     // HANDSHAKE needs no sender: it can arrive before we have inserted the peer into our AV,
     // and it carries the sender's name in its payload.
-    const bool needs_sender =
-        (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION || msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR);
+    const bool needs_sender = (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION ||
+                               msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR ||
+                               msg_type == NIXL_LIBFABRIC_MSG_PROXY);
     const uint32_t agent_idx = needs_sender ? resolveSourceAddress(src_addr) : kUnknownAgentIdx;
 
     if (needs_sender && agent_idx == kUnknownAgentIdx) {
@@ -1101,6 +1109,12 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
             NIXL_ERROR << "No transfer-error callback set on rail " << rail_id;
             result = NIXL_ERR_BACKEND;
         }
+    } else if (msg_type == NIXL_LIBFABRIC_MSG_PROXY) {
+        if (proxyCallback) {
+            proxyCallback(comp->data, req->buffer, comp->len, agent_idx, rail_id);
+        } else {
+            NIXL_WARN << "No proxy callback set on rail " << rail_id << "; dropping message";
+        }
     } else if (msg_type == NIXL_LIBFABRIC_MSG_HANDSHAKE) {
         if (comp->len < 4) {
             NIXL_ERROR << "Handshake message too short on rail " << rail_id << " (len=" << comp->len
@@ -1117,8 +1131,8 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
         result = NIXL_ERR_BACKEND;
     }
 
-    // Clear the receive buffer after processing
-    memset(req->buffer, 0, req->buffer_size);
+    // Clear what arrived in the receive buffer after processing
+    memset(req->buffer, 0, std::min<size_t>(comp->len, req->buffer_size));
 
     releaseRequest(req);
 
@@ -1148,7 +1162,15 @@ nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp,
 
     // For remote write completions, we don't need to post a new receive
     // The write operation doesn't consume a receive buffer
-    if (msg_type == NIXL_LIBFABRIC_MSG_TRANSFER) {
+    if (msg_type == NIXL_LIBFABRIC_MSG_PROXY && proxyCallback) {
+        const uint32_t agent_idx = resolveSourceAddress(src_addr);
+        if (agent_idx == kUnknownAgentIdx) {
+            NIXL_ERROR << "Proxy write on rail " << rail_id << " from unknown src_addr="
+                       << src_addr << "; dropping it";
+            return NIXL_SUCCESS;
+        }
+        proxyCallback(comp->data, nullptr, comp->len, agent_idx, rail_id);
+    } else if (msg_type == NIXL_LIBFABRIC_MSG_TRANSFER) {
         const uint32_t agent_idx = resolveSourceAddress(src_addr);
         if (agent_idx == kUnknownAgentIdx) {
             NIXL_ERROR << "Remote write completion on rail " << rail_id
