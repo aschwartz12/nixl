@@ -78,7 +78,7 @@ public:
      * @param striping_threshold Size threshold for enabling multi-rail striping
      * @throws std::runtime_error if initialization fails
      */
-    nixlLibfabricRailManager(size_t striping_threshold);
+    nixlLibfabricRailManager(size_t striping_threshold, bool allow_shm = true);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
@@ -135,6 +135,10 @@ public:
     getNumRails() const {
         return rails_.size();
     }
+
+    /** Rails of the EFA devices next to the accelerator at @p pci_bus_id (empty if none). */
+    std::vector<size_t>
+    railsForAccelerator(const std::string &pci_bus_id) const;
 
     /** Round-robin index of a descriptor into a selection array of `count` entries.
      * batch_write groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
@@ -221,6 +225,7 @@ public:
      *        Defaults to false so an unmarked descriptor flushes safely.
      * @param device_id Device id when multi-GPU is enabled.
      * @param is_cuda_device Specifies whether this is CUDA-VRAM transfer.
+     * @param imm_data A WRITE's immediate data; 0: the engine's (MSG_TRANSFER, xfer_id).
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
@@ -241,7 +246,8 @@ public:
                              size_t base_offset,
                              bool apply_fi_more = false,
                              int device_id = -1,
-                             bool is_cuda_vram = false);
+                             bool is_cuda_vram = false,
+                             uint64_t imm_data = 0);
 
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
@@ -251,7 +257,8 @@ public:
                          int device_id,
                          bool is_cuda_vram,
                          size_t rail_id,
-                         nixlLibfabricReq *req);
+                         nixlLibfabricReq *req,
+                         uint64_t imm_data);
 
     /** Reserve a base offset for a transfer to ensure stable rail assignment
      *  across all descriptors in the transfer. Call once per postXfer. */
@@ -392,6 +399,7 @@ private:
      * by virtual address. init() sets the mode from the dmabuf_mapping parameter. */
     enum class DmabufMappingMode { Auto, ForcePcie, ForceDefault, Off };
     DmabufMappingMode dmabuf_mapping_mode_ = DmabufMappingMode::Auto;
+    bool allow_shm_; // false: intra-node transfers stay on the EFA path
 
     // System runtime type (determined once at initialization)
     fi_hmem_iface runtime_;

@@ -101,6 +101,9 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // connection setup. Carries assigned agent index, sender name, and optionally
 // connection info. See libfabric_handshake.cpp for wire-format details.
 #define NIXL_LIBFABRIC_MSG_HANDSHAKE 8
+// Device proxy traffic: writes and sends whose immediate data (above the type) and payload
+// the rail hands to its proxy callback.
+#define NIXL_LIBFABRIC_MSG_PROXY 3
 
 // Single-operation immediate data extraction (no intermediate shifts)
 #define NIXL_GET_MSG_TYPE_FROM_IMM(data) ((data) & NIXL_MSG_TYPE_MASK)

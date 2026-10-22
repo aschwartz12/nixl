@@ -406,7 +406,8 @@ public:
     nixlLibfabricRail(const std::string &device,
                       const std::string &provider,
                       uint16_t id,
-                      enum fi_hmem_iface runtime);
+                      enum fi_hmem_iface runtime,
+                      bool allow_shm = true);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -577,6 +578,12 @@ public:
     void
     setXferErrorCallback(std::function<void(uint16_t, uint32_t, uint32_t)> callback);
 
+    /** Callback for device proxy traffic (NIXL_LIBFABRIC_MSG_PROXY): (immediate data, payload
+     *  or nullptr for a write, payload length, sender agent index, rail id). */
+    using ProxyCallback = std::function<void(uint64_t, const void *, size_t, uint32_t, uint16_t)>;
+    void
+    setProxyCallback(ProxyCallback callback);
+
     // Optimized resource management methods
     /** Allocate control request with size validation */
     [[nodiscard]] nixlLibfabricReq *
@@ -633,6 +640,7 @@ private:
     std::function<void(uint64_t, uint32_t)> xferIdCallback;
     std::function<void(const std::string &)> handshakeCallback;
     std::function<void(uint16_t, uint32_t, uint32_t)> xferErrorCallback;
+    ProxyCallback proxyCallback;
 
     // fi_addr_t -> local agent index, indexed directly by fi_addr_t (dense, as the AV is
     // FI_AV_TABLE). Written at connection setup, read on the completion path.
@@ -648,6 +656,7 @@ private:
 
     // System runtime type (CUDA, NEURON, or SYSTEM) this rail was created for
     enum fi_hmem_iface runtime_;
+    bool allow_shm_; // false: intra-node transfers stay on the EFA path
 
     void
     pollForCompletions();
