@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -82,6 +83,7 @@ private:
     struct Ring;
     struct RxStream;
     struct Region;
+    struct PendingAck;
 
     /** The proxy thread that owns the ring (the runtime's proxyConfig::threadShare). */
     Thread &
@@ -107,6 +109,11 @@ private:
     drain(RxStream &rx);
     nixl_status_t
     apply(uint64_t addr, uint64_t value);
+    /** Send an atomicAdd's ack; false if it cannot be sent now. */
+    bool
+    sendAck(const PendingAck &ack);
+    void
+    retryAcks();
 
     nixlLibfabricEngine &engine_;
     nixl::proxyConfig config_;
@@ -118,6 +125,9 @@ private:
 
     std::mutex rx_mutex_;
     std::unordered_map<uint64_t, std::unique_ptr<RxStream>> rx_streams_; // (agent, stream id)
+    std::mutex acks_mutex_; // below
+    std::vector<PendingAck> acks_; // acks to retry from progress()
+    std::atomic<bool> acks_pending_{false};
     std::shared_mutex regions_mutex_; // held shared while an add is applied
     std::map<uintptr_t, Region> regions_; // registrations by base address
     void *gdr_ = nullptr; // gdr_t

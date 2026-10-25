@@ -150,11 +150,23 @@ struct nixlLibfabricProxy::RxStream {
     std::mutex mutex;
     uint64_t applied = 0; // the next seq to apply
     std::map<uint64_t, Add> adds; // by seq
+    // Where its acks go (fixed per stream), looked up on the first ack.
+    std::atomic<bool> ack_routed{false};
+    std::atomic<uint64_t> ack_dest{0};
+};
+
+struct nixlLibfabricProxy::PendingAck {
+    RxStream *rx;
+    uint32_t agent;
+    uint16_t rail; // the ack leaves from where the add arrived
+    uint32_t reply_rail;
+    AckMsg ack;
 };
 
 /** A registration; a GPU one is pinned and mapped with GDRCopy. */
 struct nixlLibfabricProxy::Region {
     size_t len = 0;
+    uint32_t refs = 1; // registrations of this range
     bool vram = false;
     void *bar = nullptr; // nullptr for VRAM: not mapped, adds there fail
     uintptr_t va = 0; // the GPU address bar maps
@@ -177,6 +189,12 @@ nixlLibfabricProxy::nixlLibfabricProxy(nixlLibfabricEngine &engine,
       rings_(std::make_unique<Ring[]>(config.ringCount())) {
     if (rails_.empty()) {
         throw std::runtime_error("Device proxy: no rails");
+    }
+    // A slot's count is reused kEpochs atomicAdds later; a ring holds at most ring_depth
+    // requests, so with ring_depth <= kEpochs the slot's previous add was applied by then.
+    if (config.ring_depth > kEpochs) {
+        throw std::runtime_error("Device proxy: proxy_ring_depth must be at most " +
+                                 std::to_string(kEpochs));
     }
     // Each ring's thread, from the runtime's own split (proxyConfig::threadShare).
     ring_thread_.assign(config.ringCount(), 0);
@@ -240,6 +258,7 @@ nixlLibfabricProxy::~nixlLibfabricProxy() {
         engine_.rail_manager_.getRail(r).setProxyCallback(nullptr);
     }
     while (!regions_.empty()) {
+        regions_.begin()->second.refs = 1;
         onDeregister(regions_.begin()->first, regions_.begin()->second.len);
     }
 #ifdef HAVE_GDRCOPY
@@ -334,6 +353,9 @@ nixlLibfabricProxy::postPut(Thread &th,
                             Stream &stream,
                             Request &req,
                             const nixl::proxyBackendSubmission &sub) {
+    if (sub.size == 0) {
+        return NIXL_SUCCESS; // nothing to write or count
+    }
     auto *local = static_cast<nixlLibfabricPrivateMetadata *>(sub.local.metadataP);
     auto *remote = static_cast<nixlLibfabricPublicMetadata *>(sub.remote.metadataP);
     if (local == nullptr) {
@@ -516,32 +538,67 @@ nixlLibfabricProxy::drain(RxStream &rx) {
         }
     }
     for (const auto &[add, status] : done) {
+        const PendingAck ack{&rx,
+                             add.agent,
+                             add.rail,
+                             static_cast<uint32_t>(add.msg.reply_rail),
+                             AckMsg{kAckMsg, static_cast<int32_t>(status), add.msg.token}};
+        if (!sendAck(ack)) {
+            NIXL_WARN << "Device proxy: cannot ack an atomicAdd of agent " << add.agent
+                      << " now; retrying";
+            std::lock_guard<std::mutex> lock(acks_mutex_);
+            acks_.push_back(ack);
+            acks_pending_.store(true, std::memory_order_release);
+        }
+    }
+}
+
+bool
+nixlLibfabricProxy::sendAck(const PendingAck &ack) {
+    RxStream &rx = *ack.rx;
+    if (!rx.ack_routed.load(std::memory_order_acquire)) {
         std::shared_ptr<nixlLibfabricConnection> conn;
         {
             std::lock_guard<std::mutex> lock(engine_.connection_state_mutex_);
-            if (add.agent < engine_.agent_names_.size()) {
-                auto it = engine_.connections_.find(engine_.agent_names_[add.agent]);
+            if (ack.agent < engine_.agent_names_.size()) {
+                auto it = engine_.connections_.find(engine_.agent_names_[ack.agent]);
                 if (it != engine_.connections_.end()) {
                     conn = it->second;
                 }
             }
         }
-        const std::vector<fi_addr_t> *addrs = nullptr;
-        if (conn) {
-            auto it = conn->rail_remote_addr_list_.find(add.rail);
-            if (it != conn->rail_remote_addr_list_.end() && add.msg.reply_rail < it->second.size()) {
-                addrs = &it->second;
-            }
+        if (!conn) {
+            return false;
         }
-        if (addrs == nullptr) {
-            NIXL_ERROR << "Device proxy: no address to ack an atomicAdd of agent " << add.agent;
-            continue;
+        auto it = conn->rail_remote_addr_list_.find(ack.rail);
+        if (it == conn->rail_remote_addr_list_.end() || ack.reply_rail >= it->second.size()) {
+            return false;
         }
-        const AckMsg ack{kAckMsg, static_cast<int32_t>(status), add.msg.token};
-        if (sendMsg(add.rail, (*addrs)[add.msg.reply_rail], &ack, sizeof(ack)) !=
-            NIXL_SUCCESS) {
-            NIXL_ERROR << "Device proxy: failed to ack an atomicAdd of agent " << add.agent;
+        rx.ack_dest.store(it->second[ack.reply_rail], std::memory_order_relaxed);
+        rx.ack_routed.store(true, std::memory_order_release);
+    }
+    return sendMsg(ack.rail, rx.ack_dest.load(std::memory_order_relaxed), &ack.ack,
+                   sizeof(ack.ack)) == NIXL_SUCCESS;
+}
+
+void
+nixlLibfabricProxy::retryAcks() {
+    std::vector<PendingAck> acks;
+    {
+        std::lock_guard<std::mutex> lock(acks_mutex_);
+        acks.swap(acks_);
+        acks_pending_.store(false, std::memory_order_relaxed);
+    }
+    std::vector<PendingAck> failed;
+    for (const PendingAck &ack : acks) {
+        if (!sendAck(ack)) {
+            failed.push_back(ack);
         }
+    }
+    if (!failed.empty()) {
+        std::lock_guard<std::mutex> lock(acks_mutex_);
+        acks_.insert(acks_.end(), failed.begin(), failed.end());
+        acks_pending_.store(true, std::memory_order_release);
     }
 }
 
@@ -572,17 +629,24 @@ nixlLibfabricProxy::apply(uint64_t addr, uint64_t value) {
             cudaFlushGPUDirectRDMAWritesTargetCurrentDevice, cudaFlushGPUDirectRDMAWritesToOwner));
     }
 #endif
-    char *bar = static_cast<char *>(r.bar) + (addr - r.va);
-    uint64_t v = 0;
-    gdr_copy_from_mapping(r.mh, &v, bar, sizeof(v));
-    v += value;
-    gdr_copy_to_mapping(r.mh, bar, &v, sizeof(v));
+    // One aligned 8-byte load and store, so a polling kernel never sees a torn counter.
+    auto *bar = reinterpret_cast<volatile uint64_t *>(static_cast<char *>(r.bar) + (addr - r.va));
+    *bar = *bar + value;
+    std::atomic_thread_fence(std::memory_order_seq_cst); // flush the write-combined store
 #endif
     return NIXL_SUCCESS;
 }
 
 void
 nixlLibfabricProxy::onRegister(uintptr_t addr, size_t len, bool is_vram) {
+    {
+        std::unique_lock<std::shared_mutex> lock(regions_mutex_);
+        auto it = regions_.find(addr);
+        if (it != regions_.end() && it->second.len == len) {
+            ++it->second.refs; // the same range again: keep its mapping
+            return;
+        }
+    }
     Region r;
     r.len = len;
     r.vram = is_vram;
@@ -607,7 +671,18 @@ nixlLibfabricProxy::onRegister(uintptr_t addr, size_t len, bool is_vram) {
                   << " with GDRCopy; atomicAdds there fail";
     }
     std::unique_lock<std::shared_mutex> lock(regions_mutex_);
-    regions_.emplace(addr, r);
+    if (!regions_.emplace(addr, r).second) {
+        NIXL_WARN << "Device proxy: " << reinterpret_cast<void *>(addr)
+                  << " is already registered with another length; atomicAdds use the first";
+#ifdef HAVE_GDRCOPY
+        if (r.bar != nullptr) {
+            const uintptr_t start = addr & ~uintptr_t(0xffff);
+            const size_t map_len = ((addr + len + 0xffff) & ~uintptr_t(0xffff)) - start;
+            gdr_unmap(static_cast<gdr_t>(gdr_), r.mh, r.bar, map_len);
+            gdr_unpin_buffer(static_cast<gdr_t>(gdr_), r.mh);
+        }
+#endif
+    }
 }
 
 void
@@ -616,6 +691,9 @@ nixlLibfabricProxy::onDeregister(uintptr_t addr, size_t len) {
     std::unique_lock<std::shared_mutex> lock(regions_mutex_);
     auto it = regions_.find(addr);
     if (it == regions_.end() || it->second.len != len) {
+        return;
+    }
+    if (--it->second.refs > 0) {
         return;
     }
 #ifdef HAVE_GDRCOPY
@@ -655,6 +733,9 @@ nixlLibfabricProxy::progress(uint32_t channel, uint32_t peer) noexcept {
             for (size_t rail : th.sweep) {
                 static_cast<void>(engine_.rail_manager_.getRail(rail).progressCompletionQueue());
             }
+        }
+        if (acks_pending_.load(std::memory_order_acquire)) {
+            retryAcks();
         }
     }
     Ring &r = ring(channel, peer);
