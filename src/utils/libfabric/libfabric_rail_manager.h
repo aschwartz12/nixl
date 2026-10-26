@@ -70,6 +70,10 @@ protected:
     nixlLibfabricRailSelectionPolicy() {}
 };
 
+namespace nixl::libfabric {
+class proxyEngine;
+} // namespace nixl::libfabric
+
 /** Central manager for multi-rail RDMA operations with topology awareness */
 class nixlLibfabricRailManager {
 public:
@@ -241,7 +245,8 @@ public:
                              size_t base_offset,
                              bool apply_fi_more = false,
                              int device_id = -1,
-                             bool is_cuda_vram = false);
+                             bool is_cuda_vram = false,
+                             uint64_t imm_data = 0);
 
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
@@ -384,6 +389,7 @@ public:
     getRuntime() const;
 
 private:
+    friend class nixl::libfabric::proxyEngine;
     size_t striping_threshold_;
 
     /** Mapping type that a VRAM registration requests when it exports a CUDA dmabuf. Auto

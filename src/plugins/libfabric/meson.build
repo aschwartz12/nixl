@@ -52,6 +52,15 @@ elif cuda_dep.found()
     libfabric_gpu_abi_deps += [cuda_dep]
 endif
 
+libfabric_plugin_deps += [device_utils_interface, device_proxy_interface]
+libfabric_proxy_srcs = []
+libfabric_gdrcopy = cpp.find_library('gdrapi', required: false)
+if cuda_dep.found() and not rocm_dep.found() and libfabric_gdrcopy.found() and cpp.has_header('gdrapi.h')
+    libfabric_proxy_srcs += ['libfabric_proxy_engine.cpp', 'libfabric_proxy_engine.h']
+    libfabric_plugin_deps += [libfabric_gdrcopy]
+    compile_flags += ['-DNIXL_LIBFABRIC_DEVICE_PROXY']
+endif
+
 # Build as static or shared library based on configuration
 if 'LIBFABRIC' in static_plugins
     libfabric_backend_lib = static_library(
@@ -62,6 +71,7 @@ if 'LIBFABRIC' in static_plugins
         'libfabric_connection.h',
         'libfabric_handshake.cpp',
         'libfabric_plugin.cpp',
+        libfabric_proxy_srcs,
         dependencies: libfabric_plugin_deps,
         include_directories: [nixl_inc_dirs, utils_inc_dirs],
         install: false,
@@ -77,6 +87,7 @@ else
         'libfabric_connection.h',
         'libfabric_handshake.cpp',
         'libfabric_plugin.cpp',
+        libfabric_proxy_srcs,
         dependencies: libfabric_plugin_deps,
         include_directories: [nixl_inc_dirs, utils_inc_dirs],
         install: true,

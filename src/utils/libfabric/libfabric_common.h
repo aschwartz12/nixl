@@ -96,6 +96,7 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // Message type constants
 #define NIXL_LIBFABRIC_MSG_XFER_ERROR 1
 #define NIXL_LIBFABRIC_MSG_NOTIFICTION 2
+#define NIXL_LIBFABRIC_MSG_PROXY 3
 #define NIXL_LIBFABRIC_MSG_TRANSFER 4
 // Peer-id handshake message. Sent when a connection is set up, and as a reply
 // to a peer's fresh handshake. Carries protocol version, sender name, and
