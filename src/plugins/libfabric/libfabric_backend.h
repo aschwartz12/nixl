@@ -96,6 +96,7 @@ private:
 public:
     nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1) {}
     friend class nixlLibfabricEngine;
+    friend class nixl::libfabric::proxyEngine;
 };
 
 /** Public metadata for remote memory access */
@@ -115,6 +116,7 @@ public:
     derive_remote_selected_endpoints();
 
     friend class nixlLibfabricEngine;
+    friend class nixl::libfabric::proxyEngine;
 };
 
 /** Request handle for multi-rail transfer operations */
@@ -184,6 +186,7 @@ public:
 
 class nixlLibfabricEngine : public nixlBackendEngine {
     friend class nixlLibfabricRail; // Allow nixlLibfabricRail to access private members
+    friend class nixl::libfabric::proxyEngine;
 
 private:
     // Store user's original progress thread preference
@@ -405,6 +408,9 @@ private:
 #endif
 
 public:
+    static std::unique_ptr<nixlLibfabricEngine>
+    create(const nixlBackendInitParams &init_params);
+
     /** Initialize multi-rail libfabric backend engine */
     nixlLibfabricEngine(const nixlBackendInitParams *init_params);
     /** Destroy engine and cleanup all resources */

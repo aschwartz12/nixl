@@ -17,6 +17,8 @@
  */
 
 #include "libfabric_backend.h"
+#include "libfabric_proxy_engine.h"
+#include "device/proxy/proxy_config.h"
 #include "serdes/serdes.h"
 #include "common/configuration.h"
 #include "common/nixl_log.h"
@@ -479,6 +481,25 @@ nixlLibfabricBackendH::is_completed() const {
 /****************************************
  * Constructor/Destructor
  *****************************************/
+
+std::unique_ptr<nixlLibfabricEngine>
+nixlLibfabricEngine::create(const nixlBackendInitParams &init_params) {
+    nixl::proxyConfig proxy_config;
+    if (nixl::parseProxyConfig(init_params, proxy_config) != NIXL_SUCCESS) {
+        throw std::runtime_error("invalid device proxy configuration");
+    }
+    if (proxy_config.enabled) {
+#ifdef NIXL_LIBFABRIC_DEVICE_PROXY
+        if (init_params.enableProgTh) {
+            throw std::runtime_error("device_proxy=true does not support the progress thread");
+        }
+        return std::make_unique<nixl::libfabric::proxyEngine>(init_params, proxy_config);
+#else
+        throw std::runtime_error("device_proxy=true needs the LIBFABRIC plugin built with CUDA");
+#endif
+    }
+    return std::make_unique<nixlLibfabricEngine>(&init_params);
+}
 
 nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params),

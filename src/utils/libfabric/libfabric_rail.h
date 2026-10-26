@@ -577,6 +577,10 @@ public:
     void
     setXferErrorCallback(std::function<void(uint16_t, uint32_t, uint32_t)> callback);
 
+    using ProxyCallback = std::function<void(uint64_t, const void *, size_t, uint32_t, fi_addr_t)>;
+    void
+    setProxyCallback(ProxyCallback callback);
+
     // Optimized resource management methods
     /** Allocate control request with size validation */
     [[nodiscard]] nixlLibfabricReq *
@@ -633,6 +637,7 @@ private:
     std::function<void(uint64_t, uint32_t)> xferIdCallback;
     std::function<void(const std::string &)> handshakeCallback;
     std::function<void(uint16_t, uint32_t, uint32_t)> xferErrorCallback;
+    ProxyCallback proxyCallback;
 
     // fi_addr_t -> local agent index, indexed directly by fi_addr_t (dense, as the AV is
     // FI_AV_TABLE). Written at connection setup, read on the completion path.

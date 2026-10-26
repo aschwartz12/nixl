@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <stack>
@@ -799,6 +800,11 @@ nixlLibfabricRail::setXferIdCallback(std::function<void(uint64_t, uint32_t)> cal
 }
 
 void
+nixlLibfabricRail::setProxyCallback(ProxyCallback callback) {
+    proxyCallback = std::move(callback);
+}
+
+void
 nixlLibfabricRail::setXferErrorCallback(
     std::function<void(uint16_t, uint32_t, uint32_t)> callback) {
     xferErrorCallback = callback;
@@ -1059,7 +1065,8 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
     // HANDSHAKE needs no sender: it can arrive before we have inserted the peer into our AV,
     // and it carries the sender's name in its payload.
     const bool needs_sender =
-        (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION || msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR);
+        (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION || msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR ||
+         msg_type == NIXL_LIBFABRIC_MSG_PROXY);
     const uint32_t agent_idx = needs_sender ? resolveSourceAddress(src_addr) : kUnknownAgentIdx;
 
     if (needs_sender && agent_idx == kUnknownAgentIdx) {
@@ -1101,6 +1108,12 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
             NIXL_ERROR << "No transfer-error callback set on rail " << rail_id;
             result = NIXL_ERR_BACKEND;
         }
+    } else if (msg_type == NIXL_LIBFABRIC_MSG_PROXY) {
+        if (proxyCallback) {
+            proxyCallback(comp->data, req->buffer, comp->len, agent_idx, src_addr);
+        } else {
+            NIXL_WARN << "No proxy callback set on rail " << rail_id << "; dropping message";
+        }
     } else if (msg_type == NIXL_LIBFABRIC_MSG_HANDSHAKE) {
         if (comp->len < 4) {
             NIXL_ERROR << "Handshake message too short on rail " << rail_id << " (len=" << comp->len
@@ -1118,7 +1131,7 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
     }
 
     // Clear the receive buffer after processing
-    memset(req->buffer, 0, req->buffer_size);
+    memset(req->buffer, 0, std::min<size_t>(comp->len, req->buffer_size));
 
     releaseRequest(req);
 
@@ -1148,13 +1161,19 @@ nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp,
 
     // For remote write completions, we don't need to post a new receive
     // The write operation doesn't consume a receive buffer
-    if (msg_type == NIXL_LIBFABRIC_MSG_TRANSFER) {
+    if (msg_type == NIXL_LIBFABRIC_MSG_TRANSFER || msg_type == NIXL_LIBFABRIC_MSG_PROXY) {
         const uint32_t agent_idx = resolveSourceAddress(src_addr);
         if (agent_idx == kUnknownAgentIdx) {
             NIXL_ERROR << "Remote write completion on rail " << rail_id
                        << " from unknown src_addr=" << src_addr << " XFER_ID=" << xfer_id
                        << "; cannot credit it to a pending notification";
             // Handled by dropping it; not an error for whichever caller progressed the CQ.
+            return NIXL_SUCCESS;
+        }
+        if (msg_type == NIXL_LIBFABRIC_MSG_PROXY) {
+            if (proxyCallback) {
+                proxyCallback(comp->data, nullptr, comp->len, agent_idx, src_addr);
+            }
             return NIXL_SUCCESS;
         }
 
